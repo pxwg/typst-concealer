@@ -14,10 +14,8 @@ Lazy.nvim:
 ```lua
 {
  'PartyWumpus/typst-concealer',
- config = function()
-  require('typst-concealer').setup{}
- end,
- event = "VeryLazy"
+ opts = {},
+ ft = "typst",
 },
 ```
 
