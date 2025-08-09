@@ -707,7 +707,7 @@ local function get_typst_block_at_cursor()
   local tree = parser:parse()[1]:root()
   local cursor_pos = vim.api.nvim_win_get_cursor(0)
   cursor_pos = { cursor_pos[1] - 1, cursor_pos[2] }
-  local element = tree:named_descendant_for_range(cursor_pos[1], cursor_pos[2], cursor_pos[3], cursor_pos[4])
+  local element = tree:named_descendant_for_range(cursor_pos[1], cursor_pos[2], cursor_pos[1], cursor_pos[2])
   local outermost_block = nil
   while true do
     if element == nil then
