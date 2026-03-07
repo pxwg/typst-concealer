@@ -131,8 +131,6 @@ end
 --- @type { [integer]: integer[] | nil }
 --- Goes from a text-less multiline ns_id mark to a list of one line ns_id2 marks for concealing
 local multiline_marks = {}
---- @type { [integer]: { above_id: integer|nil, below_id: integer|nil, above: integer, below: integer, above_virt_lines: table, below_virt_lines: table } }
-local overflow_marks = {}
 --- @type { [integer]: integer }
 local image_id_to_extmark = {}
 
@@ -258,21 +256,6 @@ local function update_extmark_text(bufnr, extmark_id, string, skip_hide_check)
       --- @diagnostic disable-next-line nvim type is wrong
       conceal = "",
     })
-    -- Restore overflow extmarks if they were deleted while hidden
-    local overflow = overflow_marks[extmark_id]
-    if overflow then
-      if overflow.above > 0 and not overflow.above_id then
-        overflow.above_id = vim.api.nvim_buf_set_extmark(0, ns_id2, row, 0, {
-          virt_lines = overflow.above_virt_lines,
-          virt_lines_above = true,
-        })
-      end
-      if overflow.below > 0 and not overflow.below_id then
-        overflow.below_id = vim.api.nvim_buf_set_extmark(0, ns_id2, row, 0, {
-          virt_lines = overflow.below_virt_lines,
-        })
-      end
-    end
   else
     vim.api.nvim_buf_set_extmark(0, ns_id, row, col, {
       id = extmark_id,
@@ -309,68 +292,8 @@ local function conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows,
     return { line, hl_group }
   end
 
-  if source_rows == 1 and natural_rows > 1 then
-    -- Inline overflow > 1.5 logic triggers this:
-    -- Generates extra lines explicitly opening space to preserve font size without cropping
-    local above = math.floor((natural_rows - 1) / 2)
-    local below = natural_rows - 1 - above
-    local mid = above + 1
-
-    local m = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns_id, extmark_id, { details = true })
-    if #m == 0 then return end
-    local row, col = m[1], m[2]
-
-    -- Build virt_lines for above extmark (image rows 1..above)
-    local above_lines = {}
-    for i = 1, above do
-      above_lines[i] = { make_row(i) }
-    end
-
-    -- Build virt_lines for below extmark (image rows above+2..natural_rows)
-    local below_lines = {}
-    for i = above + 2, natural_rows do
-      below_lines[#below_lines + 1] = { make_row(i) }
-    end
-
-    local existing = overflow_marks[extmark_id]
-    local above_id = existing and existing.above_id
-    local below_id = existing and existing.below_id
-
-    if above > 0 then
-      above_id = vim.api.nvim_buf_set_extmark(bufnr, ns_id2, row, 0, {
-        id = above_id,
-        virt_lines = above_lines,
-        virt_lines_above = true,
-      })
-    elseif above_id then
-      vim.api.nvim_buf_del_extmark(bufnr, ns_id2, above_id)
-      above_id = nil
-    end
-
-    if below > 0 then
-      below_id = vim.api.nvim_buf_set_extmark(bufnr, ns_id2, row, 0, {
-        id = below_id,
-        virt_lines = below_lines,
-      })
-    elseif below_id then
-      vim.api.nvim_buf_del_extmark(bufnr, ns_id2, below_id)
-      below_id = nil
-    end
-
-    overflow_marks[extmark_id] = {
-      above_id = above_id,
-      below_id = below_id,
-      above = above,
-      below = below,
-      above_virt_lines = above_lines,
-      below_virt_lines = below_lines,
-    }
-
-    -- Update main extmark with the middle image row
-    update_extmark_text(bufnr, extmark_id, { make_row(mid) })
-  elseif multiline_extmark_ids == nil then
-    -- Normal single-row case (natural_rows == 1)
-    -- This handles inline math purely on a single line!
+  if multiline_extmark_ids == nil then
+    -- Normal single-row case (natural_rows == 1). Forced to 1 if source_rows == 1.
     update_extmark_text(bufnr, extmark_id, { make_row(1) })
   else
     -- Multiline block case
@@ -476,7 +399,9 @@ local remaining_images = 0
 --- @param extmark_id integer
 --- @param is_live_preview boolean
 local function on_typst_exit(status_code, stderr, original_range, image_id, bufnr, extmark_id, is_live_preview)
-  stderr:shutdown()
+  if not stderr:is_closing() then
+    stderr:shutdown()
+  end
   local err_bucket = {}
   stderr:read_start(function(err, data)
     if err then
@@ -496,8 +421,6 @@ local function on_typst_exit(status_code, stderr, original_range, image_id, bufn
     end
     check:stop()
     check:close()
-
-
 
     local err = table.concat(err_bucket)
     local diagnostic = nil
@@ -535,61 +458,38 @@ local function on_typst_exit(status_code, stderr, original_range, image_id, bufn
           return
         end
 
-        local exact_rows
         local natural_rows, natural_cols
         if _cell_px_w and _cell_px_h then
-          exact_rows = data.height / _cell_px_h
+          -- _render_ppi is calibrated so that a standard math line renders at exactly
+          -- _cell_px_h pixels, giving clean integer natural_rows for all formulas.
+          natural_rows = math.max(1, math.floor(data.height / _cell_px_h + 0.5))
           natural_cols = math.max(1, math.floor(data.width  / _cell_px_w + 0.5))
         else
           -- fallback: old behaviour
-          exact_rows = source_rows
+          natural_rows = source_rows
           natural_cols = math.ceil((data.width / data.height) * 2) * source_rows
         end
 
-        -- Inline math dynamic height handling:
-        -- 如果高度 > 1 且 <= 1.55 行距：强制给 1 行，避免增加 extmark（破坏紧凑性）。
-        -- Kitty 接收到后会平滑等比微缩至这 1 行高，因为导出带了 pad，所以绝不会裁切，只是字体轻微变小。
-        -- 如果高度显著 > 1.55（如复杂分式），则自然开辟新行。
-        if source_rows == 1 then
-          if exact_rows <= 1.55 then
-            natural_rows = 1
+        -- MUST FORCE inline formulas to exactly 1 row to prevent virt_lines tearing
+        -- When a formula has subscripts/superscripts, Typst renders it taller than a single line.
+        -- If we try to split an INLINE formula into multiple lines using Neovim's virt_lines, 
+        -- it shatters the paragraph layout completely. 
+        -- Instead, we force 1 row and proportionally calculate the natural_cols. Kitty will neatly scale it.
+        if source_rows == 1 and natural_rows > 1 then
+          if _cell_px_w and _cell_px_h then
+            local aspect = data.width / data.height
+            local target_px_w = _cell_px_h * aspect
+            natural_cols = math.max(1, math.floor(target_px_w / _cell_px_w + 0.5))
           else
-            natural_rows = math.max(2, math.floor(exact_rows + 0.5))
+            local aspect = data.width / data.height
+            natural_cols = math.max(1, math.floor(aspect * 2))
           end
-        else
-          natural_rows = math.max(1, math.floor(exact_rows + 0.5))
+          natural_rows = 1
         end
 
         if natural_cols >= #(kitty_codes.diacritics) then
+          -- Cap only to prevent index-out-of-bounds in the diacritics table.
           natural_cols = #(kitty_codes.diacritics) - 1
-        end
-
-        -- For single-line math (inline or display), cap natural_cols so the
-        -- placeholder fits on one visual line in every window that has 'wrap'
-        -- set.  Without this, the Kitty unicode-placeholder characters wrap
-        -- mid-image and the render tears (top half / gap / bottom half).
-        if source_rows == 1 then
-          local em = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns_id, extmark_id, {})
-          if #em > 0 then
-            local line = (vim.api.nvim_buf_get_lines(bufnr, em[1], em[1] + 1, false))[1] or ""
-            local visual_start = vim.fn.strdisplaywidth(string.sub(line, 1, em[2]))
-            -- Measure display width of one placeholder cell (base + 2 combining diacritics).
-            -- Non-BMP placeholder U+10EEEE may be 1 or 2 cells depending on the terminal/Neovim build.
-            local one_cell = kitty_codes.placeholder .. kitty_codes.diacritics[1] .. kitty_codes.diacritics[1]
-            local cell_dw = math.max(1, vim.fn.strdisplaywidth(one_cell))
-            for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
-              if vim.wo[win].wrap then
-                -- Subtract gutter width (signcolumn, numberline, foldcolumn) from window width
-                -- to get the actual text area width.
-                local wininfo = vim.fn.getwininfo(win)
-                local textoff = (wininfo and wininfo[1] and wininfo[1].textoff) or 0
-                local text_width = vim.api.nvim_win_get_width(win) - textoff
-                local available = math.max(0, text_width - visual_start)
-                local max_cols = math.floor(available / cell_dw)
-                natural_cols = math.min(natural_cols, math.max(1, max_cols))
-              end
-            end
-          end
         end
 
         create_image(path, image_id, natural_cols, natural_rows)
@@ -616,6 +516,9 @@ local function on_typst_exit(status_code, stderr, original_range, image_id, bufn
   end)
 end
 
+-- Track live preview compiler to prevent process leak and spam during rapid typing
+local live_compiler_handle = nil
+
 --- @param bufnr integer
 --- @param image_id integer
 --- @param orignal_range Range4 range which is safe to use for diagnostics only
@@ -623,65 +526,108 @@ end
 --- @param extmark_id integer
 --- @param prelude_count integer how far into the list of runtime_preludes should we add to the string
 --- @param is_live_preview boolean
---- @param is_inline boolean whether the math is on a single line
-local function compile_image(bufnr, image_id, orignal_range, str, extmark_id, prelude_count, is_live_preview, is_inline)
-  -- TODO: use stdout maybe?
+local function compile_image(bufnr, image_id, orignal_range, str, extmark_id, prelude_count, is_live_preview)
   local path = typst_file_path(image_id, bufnr)
 
   local stdin = vim.uv.new_pipe()
   local stdout = vim.uv.new_pipe()
   local stderr = vim.uv.new_pipe()
 
-  local handle = vim.uv.spawn(M.config.typst_location, {
+  -- Terminate previous live compiler to free resources if we type very quickly
+  if is_live_preview and live_compiler_handle and not live_compiler_handle:is_closing() then
+    live_compiler_handle:kill(15) -- SIGTERM
+  end
+
+  local args = { "compile", "-", path, "--ppi=" .. (_render_ppi or M.config.ppi) }
+  
+  -- Append user custom compiler arguments
+  if M.config.compiler_args then
+    for _, arg in ipairs(M.config.compiler_args) do
+      table.insert(args, arg)
+    end
+  end
+
+  local handle
+  handle = vim.uv.spawn(M.config.typst_location, {
     stdio = { stdin, stdout, stderr },
-    args = { "compile", "-", path, "--ppi=" .. (_render_ppi or M.config.ppi) },
+    args = args,
   }, function(code, signal)
+    -- Important: always close the process handle to prevent fd leak
+    if handle and not handle:is_closing() then
+      handle:close()
+    end
+
+    if is_live_preview and live_compiler_handle == handle then
+      live_compiler_handle = nil
+    end
+
+    -- If this process was superseded by a newer live compilation, gracefully ignore
+    if signal == 15 or signal == 9 then
+      if stderr and not stderr:is_closing() then stderr:close() end
+      return
+    end
+
     on_typst_exit(code, stderr, orignal_range, image_id, bufnr, extmark_id, is_live_preview)
   end)
 
-  -- TODO: is this really the best way of doing this?
+  if is_live_preview then
+    live_compiler_handle = handle
+  end
+
   local final_str = {}
+  
+  -- Inject custom user headers
+  if M.config.header and M.config.header ~= "" then
+    final_str[#final_str + 1] = M.config.header .. "\n"
+  end
+
   for i = 1, prelude_count, 1 do
     final_str[#final_str + 1] = runtime_preludes[i]
   end
   final_str[#final_str + 1] = M._styling_prelude
   
+  local source_rows = orignal_range[3] - orignal_range[1] + 1
+  
   -- Pad image dimensions to integer multiples of the terminal cell size so Kitty never has to
-  -- stretch or squeeze a formula to fit terminal cells.
-  -- 我们主动在 Typst 中给渲染加入 y 轴 padding（0.15em 足够覆盖积分号和 \gamma 这种越界字符），
-  -- 这强制 Typst 扩大渲染画布，彻底阻止了墨水被物理切断（截断）。
+  -- stretch or squeeze a formula to fit terminal cells. Without this width padding, formulas whose widths
+  -- don't align perfectly with cell widths get scaled down by Kitty, causing inconsistent
+  -- font sizes (e.g. `\alpha \beta` appearing smaller than `\alpha`).
+  -- The show rule centers the content vertically and allocates exact integer cell dimensions.
   if _cell_px_h and _cell_px_w then
     local baseline_pt = M.config.math_baseline_pt
     local cell_w_pt = baseline_pt * (_cell_px_w / _cell_px_h)
-    
-    if is_inline then
+    if source_rows == 1 then
       final_str[#final_str + 1] = string.format(
-        '#show: __it => context { let __pad_it = pad(y: 0.15em, __it); let __d = measure(__pad_it); let __mh = %gpt; let __mw = %gpt; let __cols = calc.max(1, calc.ceil(__d.width / __mw - 0.001)); let __tw = __cols * __mw; let __th = calc.max(__mh, __d.height); box(width: __tw, height: __th, align(center + horizon, __pad_it)) }\n',
+        '#show: __it => context { let __d = measure(__it); let __mh = %gpt; let __mw = %gpt; let __rows = __d.height / __mh; let __cols = calc.max(1, calc.ceil(__d.width / __mw - 0.001)); let __tw = __cols * __mw; if __rows <= 1.5 { block(width: __tw, height: __mh, clip: true, align(horizon, __it)) } else { let __r = calc.max(1, calc.ceil(__rows - 0.001)); block(width: __tw, height: __r * __mh, align(horizon, __it)) } }\n',
         baseline_pt, cell_w_pt
       )
     else
       final_str[#final_str + 1] = string.format(
-        '#show: __it => context { let __pad_it = pad(y: 0.15em, __it); let __d = measure(__pad_it); let __mh = %gpt; let __mw = %gpt; let __rows = calc.max(1, calc.ceil(__d.height / __mh - 0.001)); let __cols = calc.max(1, calc.ceil(__d.width / __mw - 0.001)); let __th = __rows * __mh; let __tw = __cols * __mw; block(width: __tw, height: __th, align(horizon, __pad_it)) }\n',
+        '#show: __it => context { let __d = measure(__it); let __mh = %gpt; let __mw = %gpt; let __rows = calc.max(1, calc.ceil(__d.height / __mh - 0.001)); let __cols = calc.max(1, calc.ceil(__d.width / __mw - 0.001)); let __th = __rows * __mh; let __tw = __cols * __mw; block(width: __tw, height: __th, align(horizon, __it)) }\n',
         baseline_pt, cell_w_pt
       )
     end
   elseif _cell_px_h then
-    -- Fallbacks
     local baseline_pt = M.config.math_baseline_pt
-    if is_inline then
+    if source_rows == 1 then
       final_str[#final_str + 1] = string.format(
-        '#show: __it => context { let __pad_it = pad(y: 0.15em, __it); let __d = measure(__pad_it); let __mh = %gpt; let __th = calc.max(__mh, __d.height); box(width: __d.width, height: __th, align(center + horizon, __pad_it)) }\n',
+        '#show: __it => context { let __d = measure(__it); let __mh = %gpt; let __rows = __d.height / __mh; if __rows <= 1.5 { block(width: __d.width, height: __mh, clip: true, align(horizon, __it)) } else { let __r = calc.max(1, calc.ceil(__rows - 0.001)); block(width: __d.width, height: __r * __mh, align(horizon, __it)) } }\n',
         baseline_pt
       )
     else
       final_str[#final_str + 1] = string.format(
-        '#show: __it => context { let __pad_it = pad(y: 0.15em, __it); let __d = measure(__pad_it); let __mh = %gpt; let __rows = calc.max(1, calc.ceil(__d.height / __mh - 0.001)); let __th = __rows * __mh; block(width: __d.width, height: __th, align(horizon, __pad_it)) }\n',
+        '#show: __it => context { let __d = measure(__it); let __mh = %gpt; let __rows = calc.max(1, calc.ceil(__d.height / __mh - 0.001)); let __th = __rows * __mh; block(width: __d.width, height: __th, align(horizon, __it)) }\n',
         baseline_pt
       )
     end
   end
   
-  final_str[#final_str + 1] = str
+  if type(str) == "table" then
+    for _, s in ipairs(str) do final_str[#final_str + 1] = s end
+  else
+    final_str[#final_str + 1] = str
+  end
+  
   stdin:write(final_str)
   stdin:close()
   stdout:close()
@@ -715,7 +661,6 @@ local function reset_buf(bufnr)
   Live_preview_extmark_id = nil
   Currently_hidden_extmark_ids = {}
   multiline_marks = {}
-  overflow_marks = {}
   diagnostics = {}
   runtime_preludes = {}
 
@@ -779,7 +724,7 @@ local function render_buf(bufnr)
       -- #highlight, for looking not terrible
       -- probably more too
       -- Special casing would not be useful for trying to render something as closely to how typst would
-      -- but instead would be useful for touch (me) using typst-concealer as the end goal
+      -- but instead would be useful for those (me) using typst-concealer as the end goal
       -- Would def be toggleable though
       if (not vim.list_contains({ "let", "set", "import", "show" }, code_type)) and (not vim.list_contains({ "pagebreak" }, call_ident)) then
         local image_id = new_image_id(bufnr)
@@ -800,10 +745,8 @@ local function render_buf(bufnr)
     local range, prelude_count = image[1], image[2]
     local extmark_id = place_image_extmark(id, range)
     local str = range_to_string(range, bufnr)
-    local source_rows = range_to_height(range)
-    local is_inline = (source_rows == 1)
     vim.schedule(function()
-      compile_image(bufnr, id, range, str, extmark_id, prelude_count, false, is_inline)
+      compile_image(bufnr, id, range, str, extmark_id, prelude_count, false)
     end)
   end
   hide_extmarks_at_cursor()
@@ -892,18 +835,6 @@ function hide_extmarks_at_cursor()
             virt_text_pos = opts.virt_text_pos,
             invalidate = opts.invalidate,
           })
-          -- Also hide overflow extmarks if any
-          local overflow = overflow_marks[id]
-          if overflow then
-            if overflow.above_id then
-              vim.api.nvim_buf_del_extmark(bufnr, ns_id2, overflow.above_id)
-              overflow.above_id = nil
-            end
-            if overflow.below_id then
-              vim.api.nvim_buf_del_extmark(bufnr, ns_id2, overflow.below_id)
-              overflow.below_id = nil
-            end
-          end
         end
       end
       ::continue::
@@ -949,9 +880,22 @@ end
 --- @type {image_id: integer, extmark_id: integer} | nil
 preview_image = nil
 
+-- Caching for Live Preview 
+local live_preview_timer = nil
+local last_preview_str = nil
+
 ---comment
 ---@param bufnr integer
 local function clear_live_typst_preview(bufnr)
+  if live_preview_timer then
+    if not live_preview_timer:is_closing() then
+      live_preview_timer:stop()
+      live_preview_timer:close()
+    end
+    live_preview_timer = nil
+  end
+  last_preview_str = nil
+
   if preview_image ~= nil then
     clear_image(preview_image.image_id)
     vim.api.nvim_buf_del_extmark(bufnr, ns_id, preview_image.extmark_id)
@@ -973,27 +917,54 @@ local function render_live_typst_preview()
     clear_live_typst_preview(bufnr)
     return
   end
+  
   local range = { start_row, start_col, end_row, end_col }
   local str = range_to_string(range, bufnr)
-  local prev_extmark = nil
-  if preview_image ~= nil then
-    clear_image(preview_image.image_id)
-    prev_extmark = preview_image.extmark_id
-    if multiline_marks[prev_extmark] ~= nil then
-      for _, id in pairs(multiline_marks[prev_extmark]) do
-        vim.api.nvim_buf_del_extmark(bufnr, ns_id2, id)
-      end
-      multiline_marks[prev_extmark] = nil
+
+  -- Performance Cache: No need to rebuild the compiler loop if the text hasn't changed.
+  if last_preview_str == str then
+    return
+  end
+
+  if live_preview_timer then
+    if not live_preview_timer:is_closing() then
+      live_preview_timer:stop()
+      live_preview_timer:close()
     end
   end
-  local new_preview = {}
-  new_preview.image_id = new_image_id(bufnr)
-  new_preview.extmark_id = place_image_extmark(new_preview.image_id, range, prev_extmark, false)
-  local source_rows = range_to_height(range)
-  local is_inline = (source_rows == 1)
-  -- TODO: determine prelude_count somehow?
-  compile_image(bufnr, new_preview.image_id, range, str, new_preview.extmark_id, 0, true, is_inline)
-  preview_image = new_preview
+
+  -- Using debounce technique similar to snacks.image
+  live_preview_timer = vim.uv.new_timer()
+  live_preview_timer:start(M.config.live_preview_debounce, 0, vim.schedule_wrap(function()
+    if live_preview_timer then
+      if not live_preview_timer:is_closing() then
+        live_preview_timer:stop()
+        live_preview_timer:close()
+      end
+      live_preview_timer = nil
+    end
+
+    last_preview_str = str
+
+    local prev_extmark = nil
+    if preview_image ~= nil then
+      clear_image(preview_image.image_id)
+      prev_extmark = preview_image.extmark_id
+      if multiline_marks[prev_extmark] ~= nil then
+        for _, id in pairs(multiline_marks[prev_extmark]) do
+          vim.api.nvim_buf_del_extmark(bufnr, ns_id2, id)
+        end
+        multiline_marks[prev_extmark] = nil
+      end
+    end
+    
+    local new_preview = {}
+    new_preview.image_id = new_image_id(bufnr)
+    new_preview.extmark_id = place_image_extmark(new_preview.image_id, range, prev_extmark, false)
+    -- TODO: determine prelude_count somehow?
+    compile_image(bufnr, new_preview.image_id, range, str, new_preview.extmark_id, 0, true)
+    preview_image = new_preview
+  end))
 end
 
 --- @alias concealcursor_modes '' | 'n' | 'v' | 'nv' | 'i' | 'ni' | 'vi' | 'nvi' | 'c' | 'nc' | 'vc' | 'nvc' | 'ic' | 'nic' | 'vic' | 'nvic'
@@ -1007,6 +978,9 @@ end
 --- @field ppi? integer What PPI should typst render at. Used as fallback when terminal pixel size is unavailable (e.g. tmux).
 --- @field math_baseline_pt? number Expected typst math line height in points for one terminal row. Used to compute 1:1 render DPI. Default 10 pt (Libertine 11 pt with ascender/descender metrics).
 --- @field conceal_in_normal boolean Should typst-concealer still conceal when the normal mode cursor goes over a line.
+--- @field compiler_args? string[] List of extra arguments for the typst CLI (e.g., {"--root", "/my/dir"})
+--- @field header? string Custom typst code to be added at the beginning of the rendered file.
+--- @field live_preview_debounce? number Debounce delay for live preview rendering in milliseconds. Default is 100.
 
 local augroup = vim.api.nvim_create_augroup("typst-concealer", { clear = true })
 
@@ -1077,6 +1051,9 @@ function M.setup(cfg)
     --- @type string | nil
     color = cfg.color,
     conceal_in_normal = default(cfg.conceal_in_normal, false),
+    compiler_args = default(cfg.compiler_args, {}),
+    header = default(cfg.header, ""),
+    live_preview_debounce = default(cfg.live_preview_debounce, 100),
   }
 
   if not vim.list_contains({ "none", "simple", "colorscheme" }, config.styling_type) then
