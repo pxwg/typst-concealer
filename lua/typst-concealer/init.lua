@@ -103,7 +103,7 @@ local ns_id2 = vim.api.nvim_create_namespace("typst-concealer-2")
 --- Escapes a given escape sequence so tmux will pass it through
 --- @param message string
 --- @return string
-local tmux_escape = function(message)
+local function tmux_escape(message)
   -- Thanks image.nvim
   return "\x1bPtmux;" .. message:gsub("\x1b", "\x1b\x1b") .. "\x1b\\"
 end
@@ -628,6 +628,27 @@ local function compile_image(bufnr, image_id, orignal_range, str, extmark_id, pr
     final_str[#final_str + 1] = runtime_preludes[i]
   end
   final_str[#final_str + 1] = M._styling_prelude
+  
+  -- Pad image dimensions to integer multiples of the terminal cell size so Kitty never has to
+  -- stretch or squeeze a formula to fit terminal cells. Without this width padding, formulas whose widths
+  -- don't align perfectly with cell widths get scaled down by Kitty, causing inconsistent
+  -- font sizes (e.g. `\alpha \beta` appearing smaller than `\alpha`).
+  -- The show rule centers the content vertically and allocates exact integer cell dimensions.
+  if _cell_px_h and _cell_px_w then
+    local baseline_pt = M.config.math_baseline_pt
+    local cell_w_pt = baseline_pt * (_cell_px_w / _cell_px_h)
+    final_str[#final_str + 1] = string.format(
+      '#show: __it => context { let __d = measure(__it); let __mh = %gpt; let __mw = %gpt; let __rows = calc.max(1, calc.ceil(__d.height / __mh - 0.001)); let __cols = calc.max(1, calc.ceil(__d.width / __mw - 0.001)); let __th = __rows * __mh; let __tw = __cols * __mw; block(width: __tw, height: __th, align(horizon, __it)) }\n',
+      baseline_pt, cell_w_pt
+    )
+  elseif _cell_px_h then
+    local baseline_pt = M.config.math_baseline_pt
+    final_str[#final_str + 1] = string.format(
+      '#show: __it => context { let __d = measure(__it); let __mh = %gpt; let __rows = calc.max(1, calc.ceil(__d.height / __mh - 0.001)); let __th = __rows * __mh; block(width: __d.width, height: __th, align(horizon, __it)) }\n',
+      baseline_pt
+    )
+  end
+  
   final_str[#final_str + 1] = str
   stdin:write(final_str)
   stdin:close()
@@ -1016,7 +1037,7 @@ function M.setup(cfg)
     enabled_by_default = default(cfg.enabled_by_default, true),
     styling_type = default(cfg.styling_type, "colorscheme"),
     ppi = default(cfg.ppi, 300),
-    math_baseline_pt = default(cfg.math_baseline_pt, 10),
+    math_baseline_pt = default(cfg.math_baseline_pt, 11),
     --- @type string | nil
     color = cfg.color,
     conceal_in_normal = default(cfg.conceal_in_normal, false),
