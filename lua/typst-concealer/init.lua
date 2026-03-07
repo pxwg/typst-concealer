@@ -1439,7 +1439,7 @@ function M.setup(cfg)
 
   local function init_buf(bufnr)
     vim.opt_local.conceallevel = 2
-    vim.opt_local.concealcursor = "nv"
+    vim.opt_local.concealcursor = "nci"
 
     if M.config.enabled_by_default then
       M._enabled_buffers[bufnr] = true
