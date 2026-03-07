@@ -3,20 +3,22 @@
 A neovim plugin that uses the new(ish) kitty unicode rendering protocol to render typst expressions inline.
 Has live previews as you type in insert mode.
 
-Requires nvim >=10.0, and only works properly in ghostty and kitty.
+Requires nvim >=11.0, and only works properly in ghostty and kitty.
 
 Works in tmux (partially, it will break if two instances of the plugin work as they will replace each-other's images), will not work in zellij as they have no way of passing through the escape sequences kitty needs to display images.
 
-https://github.com/user-attachments/assets/94179603-2f41-43ff-9e5f-6dc4f31dc02d
+Forked from [typst-concealer](https://www.github.com/PartyWumpus/typst-concealer), with love and efforts.
+
+![example](./docs/example.png)
 
 ## Installation
 Lazy.nvim:
 ```lua
-{
- 'PartyWumpus/typst-concealer',
- opts = {},
- ft = "typst",
-},
+return {
+  "pxwg/typst-concealer",
+  opts = {},
+  ft = "typst",
+}
 ```
 
 ### Keybinds
@@ -24,20 +26,21 @@ Typst-concealer can be disabled/enabled inside buffers. You can change the defau
 ```lua
 -- example keybinds
 vim.keymap.set("n", "<leader>ts", function()
- require('typst-concealer').enable_buf(vim.fn.bufnr())
+  require("typst-concealer").enable_buf(vim.fn.bufnr())
 end)
 vim.keymap.set("n", "<leader>th", function()
- require('typst-concealer').disable_buf(vim.fn.bufnr())
+  require("typst-concealer").disable_buf(vim.fn.bufnr())
 end)
 ```
 
 ## Features
+- (Maybe) highest resolution typst rendering in neovim community.
+- More configurations aimed for multiple files projects.
 - Live previews when in insert mode (WIP: does not support top level set/let/import)
 - Supports top level set/let/import
 - Renders code blocks
 - Renders math blocks
 - Can automatically match your nvim colorscheme
-- Can provide diagnostics (although they can be disabled if you want to just use tinymist's superior diagnostics)
 
 ## Options
 The options are mostly explained in the types, so either take a look in the code, (look for the `typstconfig` type) or get a good lua LSP and take a look what your autocomplete tells you.
