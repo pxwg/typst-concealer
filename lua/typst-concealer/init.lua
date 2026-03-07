@@ -187,7 +187,11 @@ local watch_sessions = {}
 --- @type { [integer]: { full_items?: table[] } }
 local buffer_render_state = {}
 
-local make_sizing_wrap
+--- @type { [integer]: boolean }
+local flow_block_ids = {}
+
+local make_inline_sizing_wrap
+local make_flow_block_wrap
 local on_page_rendered
 local clear_image
 local hide_extmarks_at_cursor
@@ -288,6 +292,7 @@ local function cleanup_render_item(bufnr, item, clear_image_too)
   end
   image_id_to_extmark[item.image_id] = nil
   block_formula_ids[item.image_id] = nil
+  flow_block_ids[item.image_id] = nil
 end
 
 --- @param bufnr integer
@@ -333,7 +338,7 @@ local function stop_watch_sessions_for_buf(bufnr)
 end
 
 --- Builds the multi-page typst source for a batch render.
---- @param items { image_id: integer, extmark_id: integer, range: Range4, str: string, prelude_count: integer, is_block?: boolean, needs_swap?: boolean }[]
+--- @param items { bufnr: integer, image_id: integer, extmark_id: integer, range: Range4, str: string, prelude_count: integer, node_type?: string, layout_kind?: "inline"|"flow_block", is_block?: boolean, display_as_block?: boolean, needs_swap?: boolean }[]
 --- @return string
 local function build_batch_document(items)
   local doc = {}
@@ -351,7 +356,12 @@ local function build_batch_document(items)
       doc[#doc + 1] = runtime_preludes[i]
     end
     local source_rows = item.range[3] - item.range[1] + 1
-    local wrap_prefix, wrap_suffix = make_sizing_wrap(source_rows)
+    local wrap_prefix, wrap_suffix
+    if item.layout_kind == "flow_block" then
+      wrap_prefix, wrap_suffix = make_flow_block_wrap(item.bufnr)
+    else
+      wrap_prefix, wrap_suffix = make_inline_sizing_wrap(source_rows)
+    end
     if wrap_prefix ~= "" then
       doc[#doc + 1] = wrap_prefix
     end
@@ -566,19 +576,33 @@ end
 --- @return boolean
 local function is_block_formula(range, bufnr, block_type)
   local start_row, start_col, end_row, end_col = range[1], range[2], range[3], range[4]
-  -- Multiline formulas are always block-level
-  if end_row > start_row then
-    return true
-  end
-  -- Single-line code expressions (#tag.idea, #var, etc.) are always inline
+  -- Code nodes are never treated as display formulas. Multi-line code blocks
+  -- may still be rendered as block previews through a separate layout path.
   if block_type == "code" then
     return false
   end
+
+  -- Multiline math formulas are block-level.
+  if end_row > start_row then
+    return true
+  end
+
   -- Single-line math: block-level if the formula occupies the entire (trimmed) line
   local line = vim.api.nvim_buf_get_lines(bufnr, start_row, start_row + 1, false)[1] or ""
   local trimmed = line:match("^%s*(.-)%s*$") or ""
   local formula_text = line:sub(start_col + 1, end_col)
   return trimmed == formula_text
+end
+
+--- @param range Range4
+--- @param node_type string
+--- @return "inline" | "flow_block"
+local function classify_layout_kind(range, node_type)
+  local start_row, _, end_row, _ = range[1], range[2], range[3], range[4]
+  if node_type == "code" and end_row > start_row then
+    return "flow_block"
+  end
+  return "inline"
 end
 
 --- Returns the number of padding columns to center an image of the given width.
@@ -811,7 +835,15 @@ local function conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows,
   vim.api.nvim_set_hl(0, hl_group, { fg = string.format("#%06X", image_id) })
 
   local is_block = block_formula_ids[image_id]
-  local pad = is_block and center_padding(natural_cols) or 0
+  local is_flow_block = flow_block_ids[image_id] == true
+
+  local pad = 0
+  if is_flow_block then
+    pad = M.config.block_padding_cols or 0
+  elseif is_block then
+    pad = center_padding(natural_cols)
+  end
+
   local pad_str = pad > 0 and string.rep(" ", pad) or nil
 
   local function make_row_list(i)
@@ -972,19 +1004,36 @@ local diagnostics = {}
 --- error that the show-rule approach causes in batch (multi-page) documents.
 --- @param source_rows integer
 --- @return string prefix, string suffix   both "" when cell size is unknown
-make_sizing_wrap = function(source_rows)
+local function current_window_width_pt(bufnr)
+  local baseline_pt = M.config.math_baseline_pt or 11
+  local pad_cols = M.config.block_padding_cols or 4
+
+  if _cell_px_w and _cell_px_h then
+    local cell_w_pt = baseline_pt * (_cell_px_w / _cell_px_h)
+    local win_cols = vim.api.nvim_win_get_width(0)
+    local usable_cols = math.max(8, win_cols - 2 * pad_cols)
+    return usable_cols * cell_w_pt
+  end
+
+  local approx_cell_w_pt = baseline_pt * 0.55
+  local win_cols = vim.api.nvim_win_get_width(0)
+  local usable_cols = math.max(8, win_cols - 2 * pad_cols)
+  return usable_cols * approx_cell_w_pt
+end
+
+make_inline_sizing_wrap = function(source_rows)
   if _cell_px_h and _cell_px_w then
     local baseline_pt = M.config.math_baseline_pt
     local cell_w_pt = baseline_pt * (_cell_px_w / _cell_px_h)
     if source_rows == 1 then
-      return string.format("#context { let __it = [", baseline_pt, cell_w_pt),
+      return "#context { let __it = [",
         string.format(
           "]; let __d = measure(__it); let __mh = %gpt; let __mw = %gpt; let __rows = __d.height / __mh; let __cols = calc.max(1, calc.ceil(__d.width / __mw - 0.001)); let __tw = __cols * __mw; if __rows <= 1.5 { block(width: __tw, height: __mh, clip: true, align(horizon, __it)) } else { let __r = calc.max(1, calc.ceil(__rows - 0.001)); block(width: __tw, height: __r * __mh, align(horizon, __it)) } }\n",
           baseline_pt,
           cell_w_pt
         )
     else
-      return string.format("#context { let __it = [", baseline_pt, cell_w_pt),
+      return "#context { let __it = [",
         string.format(
           "]; let __d = measure(__it); let __mh = %gpt; let __mw = %gpt; let __rows = calc.max(1, calc.ceil(__d.height / __mh - 0.001)); let __cols = calc.max(1, calc.ceil(__d.width / __mw - 0.001)); let __th = __rows * __mh; let __tw = __cols * __mw; block(width: __tw, height: __th, align(horizon, __it)) }\n",
           baseline_pt,
@@ -1008,6 +1057,18 @@ make_sizing_wrap = function(source_rows)
     end
   end
   return "", ""
+end
+
+make_flow_block_wrap = function(bufnr)
+  local page_w_pt = current_window_width_pt(bufnr)
+
+  return string.format(
+    "#context {\n"
+      .. "  set page(width: %gpt, height: auto, margin: (x: 0pt, y: 0pt), fill: none)\n"
+      .. "  block(width: 100%%)[\n",
+    page_w_pt
+  ),
+    "  ]\n}\n"
 end
 
 --- Handles one rendered page after a batch compile finishes.
@@ -1052,7 +1113,7 @@ on_page_rendered = function(bufnr, page_path, image_id, extmark_id, original_ran
     for _, item in ipairs(state.full_items) do
       if item.image_id == image_id then
         if item.needs_swap then
-          swap_extmark_to_range(bufnr, image_id, extmark_id, item.range, item.is_block or false)
+          swap_extmark_to_range(bufnr, image_id, extmark_id, item.range, item.display_as_block or false)
           item.needs_swap = false
         end
         break
@@ -1072,9 +1133,32 @@ end
 --- @param extmark_id integer
 --- @param prelude_count integer
 --- @param is_live_preview boolean
-local function compile_image(bufnr, image_id, original_range, str, extmark_id, prelude_count, is_live_preview)
+--- @param node_type? string
+local function compile_image(
+  bufnr,
+  image_id,
+  original_range,
+  str,
+  extmark_id,
+  prelude_count,
+  is_live_preview,
+  node_type
+)
+  local resolved_node_type = node_type or "code"
+  local layout_kind = classify_layout_kind(original_range, resolved_node_type)
+  local display_as_block = (layout_kind == "flow_block") or is_block_formula(original_range, bufnr, resolved_node_type)
   render_items_via_watch(bufnr, {
-    { image_id = image_id, extmark_id = extmark_id, range = original_range, str = str, prelude_count = prelude_count },
+    {
+      bufnr = bufnr,
+      image_id = image_id,
+      extmark_id = extmark_id,
+      range = original_range,
+      str = str,
+      prelude_count = prelude_count,
+      node_type = resolved_node_type,
+      layout_kind = layout_kind,
+      display_as_block = display_as_block,
+    },
   }, is_live_preview and "preview" or "full")
 end
 
@@ -1117,6 +1201,7 @@ local function hard_reset_buf(bufnr)
   diagnostics = {}
   runtime_preludes = {}
   block_formula_ids = {}
+  flow_block_ids = {}
 
   for id, image_bufnr in pairs(image_ids_in_use) do
     if bufnr == image_bufnr then
@@ -1214,28 +1299,34 @@ local function render_buf(bufnr)
   for idx, entry in ipairs(sorted_entries) do
     local range, prelude_count, node_type = entry.range, entry.prelude_count, entry.node_type
     local block = is_block_formula(range, bufnr, node_type)
+    local layout_kind = classify_layout_kind(range, node_type)
+    local display_as_block = block or (layout_kind == "flow_block")
     local str = range_to_string(range, bufnr)
 
     local prev_item = prev_items[idx]
     local image_id, extmark_id
 
     if prev_item ~= nil then
-      -- Reuse existing image_id and extmark_id without rebuilding yet
-      -- The extmark will be swapped to new range in on_page_rendered()
       image_id = prev_item.image_id
       extmark_id = prev_item.extmark_id
     else
       image_id = new_image_id(bufnr)
-      extmark_id = place_image_extmark(image_id, range, nil, nil, block)
+      extmark_id = place_image_extmark(image_id, range, nil, nil, display_as_block)
     end
 
+    flow_block_ids[image_id] = (layout_kind == "flow_block") or nil
+
     batch_items[#batch_items + 1] = {
+      bufnr = bufnr,
       image_id = image_id,
       extmark_id = extmark_id,
       range = range,
       str = str,
       prelude_count = prelude_count,
+      node_type = node_type,
+      layout_kind = layout_kind,
       is_block = block,
+      display_as_block = display_as_block,
       needs_swap = prev_item ~= nil,
     }
   end
@@ -1491,17 +1582,20 @@ local function render_live_typst_preview()
 
       last_preview_str = str
 
+      local layout_kind = classify_layout_kind(range, "code")
+      local display_as_block = (layout_kind == "flow_block")
+
       local image_id, extmark_id
       if preview_image ~= nil then
         image_id = preview_image.image_id
         prepare_extmark_reuse(bufnr, preview_image.extmark_id)
-        extmark_id = place_image_extmark(image_id, range, preview_image.extmark_id, false)
+        extmark_id = place_image_extmark(image_id, range, preview_image.extmark_id, false, display_as_block)
       else
         image_id = new_image_id(bufnr)
-        extmark_id = place_image_extmark(image_id, range, nil, false)
+        extmark_id = place_image_extmark(image_id, range, nil, false, display_as_block)
       end
 
-      compile_image(bufnr, image_id, range, str, extmark_id, 0, true)
+      compile_image(bufnr, image_id, range, str, extmark_id, 0, true, "code")
       preview_image = { image_id = image_id, extmark_id = extmark_id }
     end)
   )
@@ -1520,6 +1614,8 @@ end
 --- @field conceal_in_normal boolean Should typst-concealer still conceal when the normal mode cursor goes over a line.
 --- @field compiler_args? string[] List of extra arguments for the typst CLI (e.g., {"--root", "/my/dir"})
 --- @field header? string Custom typst code to be added at the beginning of the rendered file.
+--- @field block_padding_cols? integer Number of terminal columns to reserve as outer padding for multi-line code previews.
+--- @field block_preview_margin_pt? number Extra Typst-side inner margin for multi-line code previews.
 --- @field live_preview_debounce? number Debounce delay for live preview rendering in milliseconds. Default is 100.
 
 local augroup = vim.api.nvim_create_augroup("typst-concealer", { clear = true })
@@ -1588,6 +1684,8 @@ function M.setup(cfg)
     conceal_in_normal = default(cfg.conceal_in_normal, false),
     compiler_args = default(cfg.compiler_args, {}),
     header = default(cfg.header, ""),
+    block_padding_cols = default(cfg.block_padding_cols, 15),
+    block_preview_margin_pt = default(cfg.block_preview_margin_pt, 6),
     live_preview_debounce = default(cfg.live_preview_debounce, 100),
   }
 
@@ -1768,6 +1866,9 @@ function M.setup(cfg)
     desc = "refresh cell pixel size on terminal resize",
     callback = function()
       refresh_cell_px_size()
+      vim.schedule(function()
+        render_buf(vim.fn.bufnr())
+      end)
     end,
   })
 
