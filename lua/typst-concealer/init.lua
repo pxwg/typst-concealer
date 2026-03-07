@@ -167,6 +167,7 @@ local block_formula_ids = {}
 
 --- @class typst_watch_session
 --- @field kind 'full' | 'preview'
+--- @field bufnr integer
 --- @field handle uv_process_t|nil
 --- @field stdout uv_pipe_t|nil
 --- @field stderr uv_pipe_t|nil
@@ -183,8 +184,13 @@ local block_formula_ids = {}
 --- @type { [integer]: { full?: typst_watch_session, preview?: typst_watch_session } }
 local watch_sessions = {}
 
+--- @type { [integer]: { full_items?: table[] } }
+local buffer_render_state = {}
+
 local make_sizing_wrap
 local on_page_rendered
+local clear_image
+local hide_extmarks_at_cursor
 
 local function get_buf_dir(bufnr)
   local buf_file = vim.api.nvim_buf_get_name(bufnr)
@@ -248,6 +254,43 @@ local function get_watch_session(bufnr, kind)
 end
 
 --- @param bufnr integer
+--- @param extmark_id integer
+local function prepare_extmark_reuse(bufnr, extmark_id)
+  local mm = multiline_marks[extmark_id]
+  if mm ~= nil then
+    if mm.virt_lines then
+      local vl_id = block_virt_lines_marks[extmark_id]
+      if vl_id then
+        pcall(vim.api.nvim_buf_del_extmark, bufnr, ns_id3, vl_id)
+      end
+      block_virt_lines_marks[extmark_id] = nil
+    else
+      for _, id in pairs(mm) do
+        pcall(vim.api.nvim_buf_del_extmark, bufnr, ns_id2, id)
+      end
+    end
+    multiline_marks[extmark_id] = nil
+  end
+  Currently_hidden_extmark_ids[extmark_id] = nil
+end
+
+--- @param bufnr integer
+--- @param item { image_id: integer, extmark_id: integer }|nil
+--- @param clear_image_too boolean?
+local function cleanup_render_item(bufnr, item, clear_image_too)
+  if item == nil then
+    return
+  end
+  prepare_extmark_reuse(bufnr, item.extmark_id)
+  pcall(vim.api.nvim_buf_del_extmark, bufnr, ns_id, item.extmark_id)
+  if clear_image_too ~= false then
+    clear_image(item.image_id)
+  end
+  image_id_to_extmark[item.image_id] = nil
+  block_formula_ids[item.image_id] = nil
+end
+
+--- @param bufnr integer
 --- @param kind 'full' | 'preview'
 local function stop_watch_session(bufnr, kind)
   local bucket = watch_sessions[bufnr]
@@ -290,7 +333,7 @@ local function stop_watch_sessions_for_buf(bufnr)
 end
 
 --- Builds the multi-page typst source for a batch render.
---- @param items { image_id: integer, extmark_id: integer, range: Range4, str: string, prelude_count: integer }[]
+--- @param items { image_id: integer, extmark_id: integer, range: Range4, str: string, prelude_count: integer, is_block?: boolean, needs_swap?: boolean }[]
 --- @return string
 local function build_batch_document(items)
   local doc = {}
@@ -332,7 +375,7 @@ end
 
 --- @param session typst_watch_session
 --- @param i integer
---- @param item { image_id: integer, extmark_id: integer, range: Range4, str: string, prelude_count: integer }
+--- @param item { image_id: integer, extmark_id: integer, range: Range4, str: string, prelude_count: integer, is_block?: boolean, needs_swap?: boolean }
 local function try_render_session_page(session, i, item)
   local page_path = session.output_prefix .. "-" .. i .. ".png"
   local stat = vim.uv.fs_stat(page_path)
@@ -358,11 +401,11 @@ local function try_render_session_page(session, i, item)
   session.page_state[i] = page_state
 
   vim.schedule(function()
-    local current = get_watch_session(vim.fn.bufnr(), session.kind)
+    local current = get_watch_session(session.bufnr, session.kind)
     if current ~= session then
       return
     end
-    on_page_rendered(vim.fn.bufnr(), page_path, item.image_id, item.extmark_id, item.range)
+    on_page_rendered(session.bufnr, page_path, item.image_id, item.extmark_id, item.range)
   end)
 end
 
@@ -419,6 +462,7 @@ local function ensure_watch_session(bufnr, kind)
 
   local session = {
     kind = kind,
+    bufnr = bufnr,
     handle = nil,
     stdout = stdout,
     stderr = stderr,
@@ -484,7 +528,7 @@ local function ensure_watch_session(bufnr, kind)
 end
 
 --- @param bufnr integer
---- @param items { image_id: integer, extmark_id: integer, range: Range4, str: string, prelude_count: integer }[]
+--- @param items { image_id: integer, extmark_id: integer, range: Range4, str: string, prelude_count: integer, is_block?: boolean, needs_swap?: boolean }[]
 --- @param kind 'full' | 'preview'
 local function render_items_via_watch(bufnr, items, kind)
   if #items == 0 then
@@ -564,6 +608,8 @@ local function place_image_extmark(image_id, range, extmark_id, concealing, is_b
 
   if is_block then
     block_formula_ids[image_id] = true
+  else
+    block_formula_ids[image_id] = nil
   end
 
   if height == 1 then
@@ -625,12 +671,6 @@ local function place_image_extmark(image_id, range, extmark_id, concealing, is_b
       })
       -- Place a separate ns_id3 extmark on the line AFTER the concealed range so that
       -- its virt_lines (above = true) appear right where the formula was.
-      -- We cannot place it inside the concealed range because Neovim will not render
-      -- virt_lines on a concealed line.
-      -- If end_row is the last line of the buffer, append a blank line so end_row+1 exists.
-      -- This blank line is hidden by the conceal_lines extmark above (which covers up to end_row)
-      -- so it is invisible to the user; on `o` the new line is inserted after end_row, pushing
-      -- the blank sentinel down, which keeps the virt_lines anchored correctly.
       local line_count = vim.api.nvim_buf_line_count(0)
       local vl_row = end_row + 1
       if vl_row >= line_count then
@@ -661,6 +701,19 @@ local function place_image_extmark(image_id, range, extmark_id, concealing, is_b
 
   image_id_to_extmark[image_id] = new_extmark_id
   return new_extmark_id
+end
+
+--- Rebuild an existing extmark in-place for a new range only when the new image is ready.
+--- This keeps the old rendered image visible until swap time.
+--- @param bufnr integer
+--- @param image_id integer
+--- @param extmark_id integer
+--- @param range Range4
+--- @param is_block boolean
+local function swap_extmark_to_range(bufnr, image_id, extmark_id, range, is_block)
+  prepare_extmark_reuse(bufnr, extmark_id)
+  local new_id = place_image_extmark(image_id, range, extmark_id, nil, is_block)
+  image_id_to_extmark[image_id] = new_id
 end
 
 --- Updates the text for an existing extmark
@@ -698,7 +751,6 @@ local function update_extmark_text(bufnr, extmark_id, string, skip_hide_check)
     multiline_marks[extmark_id] = {}
     for i = 1, height do
       local lines = vim.api.nvim_buf_get_lines(0, row, opts.end_row + 1, false)
-      -- ns_id2!
       local conceal = nil
       if opts.virt_text_pos ~= "right_align" then
         conceal = ""
@@ -748,15 +800,12 @@ local function conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows,
   local multiline_extmark_ids = multiline_marks[extmark_id]
 
   local hl_group = "typst-concealer-image-id-" .. tostring(image_id)
-  -- encode image_id into the foreground color
   vim.api.nvim_set_hl(0, hl_group, { fg = string.format("#%06X", image_id) })
 
-  -- Compute centering padding for block-level formulas
   local is_block = block_formula_ids[image_id]
   local pad = is_block and center_padding(natural_cols) or 0
   local pad_str = pad > 0 and string.rep(" ", pad) or nil
 
-  --- Returns a virt_text chunk list for row i of the image.
   local function make_row_list(i)
     local line = ""
     for j = 0, natural_cols - 1 do
@@ -769,11 +818,8 @@ local function conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows,
   end
 
   if multiline_extmark_ids == nil then
-    -- Normal single-row case (natural_rows == 1). Forced to 1 if source_rows == 1.
     update_extmark_text(bufnr, extmark_id, make_row_list(1))
   elseif multiline_extmark_ids.virt_lines then
-    -- Block-level multi-line: rendered via virt_lines on the parent extmark.
-    -- virt_lines are not affected by 'wrap', so image rows always appear contiguous.
     local render_rows = natural_rows
     local lines = {}
     local above_blank = 0
@@ -798,12 +844,10 @@ local function conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows,
         lines[i] = make_row_list(image_row)
       end
     end
-    -- If this extmark is currently hidden (cursor on it), just update the saved data
     if Currently_hidden_extmark_ids[extmark_id] ~= nil then
       Currently_hidden_extmark_ids[extmark_id] = { block_virt_lines = true, virt_lines_data = lines }
       return
     end
-    -- Write virt_lines onto the separate ns_id3 extmark (not the concealed ns_id one).
     local vl_id = block_virt_lines_marks[extmark_id]
     if vl_id then
       local m = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns_id3, vl_id, { details = true })
@@ -817,10 +861,8 @@ local function conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows,
       end
     end
   else
-    -- Multiline block case (non-block or inline multi-line via ns_id2 overlay)
     local lines = {}
     if natural_rows < source_rows then
-      -- Centre the natural image within the source rows
       local above_blank = math.floor((source_rows - natural_rows) / 2)
       for i = 1, source_rows do
         local image_row = i - above_blank
@@ -840,7 +882,6 @@ local function conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows,
         end
       end
     else
-      -- natural_rows >= source_rows: render source_rows rows of the image
       for i = 1, source_rows do
         if i >= #kitty_codes.diacritics then
           lines[i] = {
@@ -881,8 +922,8 @@ end
 ---@param child_range Range4
 ---@return boolean
 local function range_contains(parent_range, child_range)
-  local start_row1, start_col1, end_row1, end_col1 = parent_range[1], parent_range[2], parent_range[3], parent_range[4]
-  local start_row2, start_col2, end_row2, end_col2 = child_range[1], child_range[2], child_range[3], child_range[4]
+  local _, _, end_row1, end_col1 = parent_range[1], parent_range[2], parent_range[3], parent_range[4]
+  local _, _, end_row2, end_col2 = child_range[1], child_range[2], child_range[3], child_range[4]
   if end_row1 > end_row2 or (end_row1 == end_row2 and end_col1 >= end_col2) then
     return true
   end
@@ -896,15 +937,12 @@ end
 --- @param height integer
 local function create_image(path, image_id, width, height)
   path = vim.base64.encode(path)
-  -- read file
   send_kitty_escape("q=2,f=100,t=t,i=" .. image_id .. ";" .. path)
-  -- render file at size
   send_kitty_escape("q=2,a=p,U=1,i=" .. image_id .. ",c=" .. width .. ",r=" .. height)
 end
 
----comment
 ---@param image_id integer
-local function clear_image(image_id)
+clear_image = function(image_id)
   send_kitty_escape("q=2,a=d,d=i,i=" .. image_id)
   image_ids_in_use[image_id] = nil
 end
@@ -916,9 +954,6 @@ end
 local function typst_file_path(id, bufnr)
   return "/tmp/tty-graphics-protocol-typst-concealer-" .. full_pid .. "-" .. bufnr .. "-" .. id .. ".png"
 end
-
--- batch_output_template / batch_input_path removed:
--- watch sessions now use stable paths via session_output_template/session_input_path
 
 --- @type vim.Diagnostic[]
 local diagnostics = {}
@@ -1003,6 +1038,20 @@ on_page_rendered = function(bufnr, page_path, image_id, extmark_id, original_ran
     natural_cols = #kitty_codes.diacritics - 1
   end
 
+  -- Swap extmark to new range before creating the new image
+  local state = buffer_render_state[bufnr]
+  if state and state.full_items then
+    for _, item in ipairs(state.full_items) do
+      if item.image_id == image_id then
+        if item.needs_swap then
+          swap_extmark_to_range(bufnr, image_id, extmark_id, item.range, item.is_block or false)
+          item.needs_swap = false
+        end
+        break
+      end
+    end
+  end
+
   create_image(page_path, image_id, natural_cols, natural_rows)
   conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, source_rows)
 end
@@ -1033,17 +1082,23 @@ local function new_image_id(bufnr)
     end
   end
 
-  -- Image id table full, overflow it
   print([[
 [typst-concealer] >65536 image ids in use, overflowing. This is probably a bug, you're looking at a very long document or a lot of documents.
 Open an issue if you see this, the cap can be increased if someone actually needs it.
 ]])
   image_ids_in_use = {}
-  -- as stated above, this is bad, i do not like it.
   return new_image_id(bufnr)
 end
 
-local function reset_buf(bufnr)
+local function hard_reset_buf(bufnr)
+  local state = buffer_render_state[bufnr]
+  if state and state.full_items then
+    for _, item in ipairs(state.full_items) do
+      cleanup_render_item(bufnr, item, true)
+    end
+  end
+  buffer_render_state[bufnr] = nil
+
   vim.api.nvim_buf_clear_namespace(bufnr, ns_id, 0, -1)
   vim.api.nvim_buf_clear_namespace(bufnr, ns_id2, 0, -1)
   vim.api.nvim_buf_clear_namespace(bufnr, ns_id3, 0, -1)
@@ -1073,11 +1128,17 @@ runtime_preludes = {}
 --- @param bufnr? integer Which buffer to render, defaulting to current buffer
 local function render_buf(bufnr)
   bufnr = default(bufnr, vim.fn.bufnr())
-  reset_buf(bufnr)
   clear_diagnostics(bufnr)
+
   if M._enabled_buffers[bufnr] ~= true then
+    hard_reset_buf(bufnr)
+    stop_watch_session(bufnr, "full")
     return
   end
+
+  diagnostics = {}
+  runtime_preludes = {}
+
   local parser = vim.treesitter.get_parser(bufnr)
   local tree = parser:parse()[1]:root()
 
@@ -1090,9 +1151,6 @@ local function render_buf(bufnr)
     local block_type = match[3][1]:type()
     local start_row, start_col, end_row, end_col = match[3][1]:range()
 
-    -- If the previous range contains this one, skip it
-    -- This check should maybe have to interate through all the previous (and future) ranges
-    -- but iter_matches goes in order so we're all good
     if prev_range ~= nil and range_contains(prev_range, { start_row, start_col, end_row, end_col }) then
       goto continue
     end
@@ -1108,14 +1166,6 @@ local function render_buf(bufnr)
         local a, b, c, d = match[1][1]:range()
         call_ident = range_to_string({ a, b, c, d }, bufnr)
       end
-      -- TODO: Consider special-casing other function calls, to deal with:
-      -- #image, for larger images
-      -- #link, for working links
-      -- #highlight, for looking not terrible
-      -- probably more too
-      -- Special casing would not be useful for trying to render something as closely to how typst would
-      -- but instead would be useful for those (me) using typst-concealer as the end goal
-      -- Would def be toggleable though
       if
         (not vim.list_contains({ "let", "set", "import", "show" }, code_type))
         and (not vim.list_contains({ "pagebreak" }, call_ident))
@@ -1133,7 +1183,6 @@ local function render_buf(bufnr)
     ::continue::
   end
 
-  -- Collect all items in a stable order (by image_id) for the batch compiler
   local batch_items = {}
   local sorted_entries = {}
   for id, payload in pairs(ranges) do
@@ -1152,20 +1201,43 @@ local function render_buf(bufnr)
     return ar[2] < br[2]
   end)
 
-  for _, entry in ipairs(sorted_entries) do
-    local id = entry.image_id
+  local prev_items = (buffer_render_state[bufnr] and buffer_render_state[bufnr].full_items) or {}
+
+  for idx, entry in ipairs(sorted_entries) do
     local range, prelude_count, node_type = entry.range, entry.prelude_count, entry.node_type
     local block = is_block_formula(range, bufnr, node_type)
-    local extmark_id = place_image_extmark(id, range, nil, nil, block)
     local str = range_to_string(range, bufnr)
+
+    local prev_item = prev_items[idx]
+    local image_id, extmark_id
+
+    if prev_item ~= nil then
+      -- Reuse existing image_id and extmark_id without rebuilding yet
+      -- The extmark will be swapped to new range in on_page_rendered()
+      image_id = prev_item.image_id
+      extmark_id = prev_item.extmark_id
+    else
+      image_id = new_image_id(bufnr)
+      extmark_id = place_image_extmark(image_id, range, nil, nil, block)
+    end
+
     batch_items[#batch_items + 1] = {
-      image_id = id,
+      image_id = image_id,
       extmark_id = extmark_id,
       range = range,
       str = str,
       prelude_count = prelude_count,
+      is_block = block,
+      needs_swap = prev_item ~= nil,
     }
   end
+
+  for i = #batch_items + 1, #prev_items do
+    cleanup_render_item(bufnr, prev_items[i], true)
+  end
+
+  buffer_render_state[bufnr] = buffer_render_state[bufnr] or {}
+  buffer_render_state[bufnr].full_items = batch_items
 
   vim.schedule(function()
     render_items_via_watch(bufnr, batch_items, "full")
@@ -1187,14 +1259,13 @@ Currently_hidden_extmark_ids = {}
 ---@param namespace_id integer
 local function hide_extmark(bufnr, id, row, col, opts, new_hidden, namespace_id) end
 
-function hide_extmarks_at_cursor()
+hide_extmarks_at_cursor = function()
   local bufnr = vim.fn.bufnr()
 
   --- @type {[integer]: virt_text}
   local new_hidden = {}
 
   local mode = vim.api.nvim_get_mode().mode
-  -- If we are not concealing in this mode, then don't do any hiding of extmarks
   if not (M.config.conceal_in_normal and mode:find("n", 1, true) ~= nil) then
     local cursor_line = vim.api.nvim_win_get_cursor(0)[1] - 1
     local range_line = vim.fn.getpos("v")[2] - 1
@@ -1216,22 +1287,18 @@ function hide_extmarks_at_cursor()
       local id = extmark[1]
       if multiline_marks[id] ~= nil then
         local mm = multiline_marks[id]
-        -- virt_lines-based block multiline: remove conceal_lines and clear virt_lines
         if mm.virt_lines then
           if new_hidden[id] ~= nil then
-            -- already queued for hiding this cycle
           elseif Currently_hidden_extmark_ids[id] ~= nil then
             new_hidden[id] = Currently_hidden_extmark_ids[id]
             Currently_hidden_extmark_ids[id] = nil
           else
-            -- Save current virt_lines from ns_id3 so we can restore later
             local vl_id = block_virt_lines_marks[id]
             local saved_vl = nil
             if vl_id then
               local vm = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns_id3, vl_id, { details = true })
               if #vm > 0 and vm[3] then
                 saved_vl = vm[3].virt_lines
-                -- Clear the virt_lines on the ns_id3 extmark
                 vim.api.nvim_buf_set_extmark(bufnr, ns_id3, vm[1], vm[2], {
                   id = vl_id,
                   virt_lines = {},
@@ -1239,7 +1306,6 @@ function hide_extmarks_at_cursor()
                 })
               end
             end
-            -- Remove conceal_lines from the ns_id extmark so the original text is revealed
             local em = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns_id, id, { details = true })
             if #em > 0 then
               local row, col, opts = em[1], em[2], em[3]
@@ -1265,7 +1331,6 @@ function hide_extmarks_at_cursor()
           local text = {}
           for _, new_id in ipairs(mm) do
             local new_mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns_id2, new_id, { details = true })
-            --- @type vim.api.keyset.extmark_details
             local opts = new_mark[3]
 
             text[#text + 1] = opts.virt_text
@@ -1275,18 +1340,16 @@ function hide_extmarks_at_cursor()
           Currently_hidden_extmark_ids[id] = nil
         end
       else
-        --- @type integer, integer, integer, vim.api.keyset.extmark_details
-        local id, row, col, opts = extmark[1], extmark[2], extmark[3], extmark[4]
-        if Currently_hidden_extmark_ids[id] ~= nil then
-          new_hidden[id] = Currently_hidden_extmark_ids[id]
-          Currently_hidden_extmark_ids[id] = nil
+        local id2, row, col, opts = extmark[1], extmark[2], extmark[3], extmark[4]
+        if Currently_hidden_extmark_ids[id2] ~= nil then
+          new_hidden[id2] = Currently_hidden_extmark_ids[id2]
+          Currently_hidden_extmark_ids[id2] = nil
         else
-          new_hidden[id] = opts.virt_text
-          Currently_hidden_extmark_ids[id] = nil
+          new_hidden[id2] = opts.virt_text
+          Currently_hidden_extmark_ids[id2] = nil
           vim.api.nvim_buf_set_extmark(bufnr, ns_id, row, col, {
-            id = id,
+            id = id2,
             virt_text = { { "" } },
-
             end_row = opts.end_row,
             end_col = opts.end_col,
             conceal = nil,
@@ -1299,10 +1362,8 @@ function hide_extmarks_at_cursor()
     end
   end
 
-  -- show remaining extmarks not in selected lines
   for id, text in pairs(Currently_hidden_extmark_ids) do
     if type(text) == "table" and text.block_virt_lines then
-      -- Restore block-level multiline: re-add conceal_lines and virt_lines
       local em = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns_id, id, { details = true })
       if #em > 0 then
         local row, col, opts = em[1], em[2], em[3]
@@ -1350,7 +1411,6 @@ local function get_typst_block_at_cursor()
     if type == "math" or type == "code" then
       outermost_block = element
     elseif type == "ERROR" then
-      -- if code block is contained within any sort of syntax error, just don't
       return nil
     end
     element = element:parent()
@@ -1365,11 +1425,9 @@ end
 --- @type {image_id: integer, extmark_id: integer} | nil
 preview_image = nil
 
--- Caching for Live Preview
 local live_preview_timer = nil
 local last_preview_str = nil
 
----comment
 ---@param bufnr integer
 local function clear_live_typst_preview(bufnr)
   if live_preview_timer then
@@ -1383,15 +1441,7 @@ local function clear_live_typst_preview(bufnr)
   stop_watch_session(bufnr, "preview")
 
   if preview_image ~= nil then
-    clear_image(preview_image.image_id)
-    vim.api.nvim_buf_del_extmark(bufnr, ns_id, preview_image.extmark_id)
-    if multiline_marks[preview_image.extmark_id] ~= nil then
-      for _, id in pairs(multiline_marks[preview_image.extmark_id]) do
-        vim.api.nvim_buf_del_extmark(bufnr, ns_id2, id)
-      end
-      multiline_marks[preview_image.extmark_id] = nil
-    end
-
+    cleanup_render_item(bufnr, preview_image, true)
     preview_image = nil
   end
 end
@@ -1407,7 +1457,6 @@ local function render_live_typst_preview()
   local range = { start_row, start_col, end_row, end_col }
   local str = range_to_string(range, bufnr)
 
-  -- Performance Cache: No need to rebuild the compiler loop if the text hasn't changed.
   if last_preview_str == str then
     return
   end
@@ -1419,7 +1468,6 @@ local function render_live_typst_preview()
     end
   end
 
-  -- Using debounce technique similar to snacks.image
   live_preview_timer = vim.uv.new_timer()
   live_preview_timer:start(
     M.config.live_preview_debounce,
@@ -1435,24 +1483,18 @@ local function render_live_typst_preview()
 
       last_preview_str = str
 
-      local prev_extmark = nil
+      local image_id, extmark_id
       if preview_image ~= nil then
-        clear_image(preview_image.image_id)
-        prev_extmark = preview_image.extmark_id
-        if multiline_marks[prev_extmark] ~= nil then
-          for _, id in pairs(multiline_marks[prev_extmark]) do
-            vim.api.nvim_buf_del_extmark(bufnr, ns_id2, id)
-          end
-          multiline_marks[prev_extmark] = nil
-        end
+        image_id = preview_image.image_id
+        prepare_extmark_reuse(bufnr, preview_image.extmark_id)
+        extmark_id = place_image_extmark(image_id, range, preview_image.extmark_id, false)
+      else
+        image_id = new_image_id(bufnr)
+        extmark_id = place_image_extmark(image_id, range, nil, false)
       end
 
-      local new_preview = {}
-      new_preview.image_id = new_image_id(bufnr)
-      new_preview.extmark_id = place_image_extmark(new_preview.image_id, range, prev_extmark, false)
-      -- TODO: determine prelude_count somehow?
-      compile_image(bufnr, new_preview.image_id, range, str, new_preview.extmark_id, 0, true)
-      preview_image = new_preview
+      compile_image(bufnr, image_id, range, str, extmark_id, 0, true)
+      preview_image = { image_id = image_id, extmark_id = extmark_id }
     end)
   )
 end
@@ -1474,8 +1516,6 @@ end
 
 local augroup = vim.api.nvim_create_augroup("typst-concealer", { clear = true })
 
---- Enable concealing for the given buffer
---- @param bufnr integer | nil
 M.enable_buf = function(bufnr)
   if bufnr == nil then
     bufnr = vim.fn.bufnr()
@@ -1484,8 +1524,6 @@ M.enable_buf = function(bufnr)
   render_buf(bufnr)
 end
 
---- Enable concealing for the given buffer
---- @param bufnr integer | nil
 M.disable_buf = function(bufnr)
   if bufnr == nil then
     bufnr = vim.fn.bufnr()
@@ -1493,25 +1531,26 @@ M.disable_buf = function(bufnr)
   M._enabled_buffers[bufnr] = nil
   stop_watch_session(bufnr, "full")
   stop_watch_session(bufnr, "preview")
-  render_buf(bufnr)
+  clear_live_typst_preview(bufnr)
+  hard_reset_buf(bufnr)
 end
 
---- Toggle concealing for the given buffer
---- @param bufnr integer | nil
 M.toggle_buf = function(bufnr)
   if bufnr == nil then
     bufnr = vim.fn.bufnr()
   end
   if M._enabled_buffers[bufnr] ~= nil then
     M._enabled_buffers[bufnr] = nil
+    stop_watch_session(bufnr, "full")
+    stop_watch_session(bufnr, "preview")
+    clear_live_typst_preview(bufnr)
+    hard_reset_buf(bufnr)
   else
     M._enabled_buffers[bufnr] = true
+    render_buf(bufnr)
   end
-  render_buf(bufnr)
 end
 
---- Re-render the conceals for the given buffer
---- @param bufnr integer | nil
 M.rerender_buf = function(bufnr)
   if bufnr == nil then
     bufnr = vim.fn.bufnr()
@@ -1519,9 +1558,6 @@ M.rerender_buf = function(bufnr)
   render_buf(bufnr)
 end
 
---- Initializes typst-concealer
---- @param cfg typstconfig
---- @see typstconfig
 function M.setup(cfg)
   local version = vim.version()
   if version.major == 0 and version.minor < 10 then
@@ -1540,7 +1576,6 @@ function M.setup(cfg)
     styling_type = default(cfg.styling_type, "colorscheme"),
     ppi = default(cfg.ppi, 300),
     math_baseline_pt = default(cfg.math_baseline_pt, 11),
-    --- @type string | nil
     color = cfg.color,
     conceal_in_normal = default(cfg.conceal_in_normal, false),
     compiler_args = default(cfg.compiler_args, {}),
@@ -1616,7 +1651,6 @@ function M.setup(cfg)
     pattern = "*.typ",
     group = augroup,
     desc = "enable file on creation if the option is set",
-    --- @param ev autocmd_event
     callback = function(ev)
       init_buf(ev.buf)
     end,
@@ -1644,7 +1678,7 @@ function M.setup(cfg)
     end,
   })
 
-  vim.api.nvim_create_autocmd({ "CursorMovedI", "CursorMoved" }, {
+  vim.api.nvim_create_autocmd("CursorMoved", {
     pattern = "*.typ",
     group = augroup,
     desc = "unconceal on line hover",
@@ -1657,7 +1691,6 @@ function M.setup(cfg)
     group = augroup,
     pattern = "v:*",
     desc = "unconceal when exiting visual mode, as this changes cursor pos without CursorMoved event",
-    --- @param ev autocmd_event
     callback = function(ev)
       local str = vim.api.nvim_buf_get_name(ev.buf)
       local match = str:match(".*%.typ$")
@@ -1671,7 +1704,6 @@ function M.setup(cfg)
     group = augroup,
     pattern = "i:*",
     desc = "remove preview when exiting insert mode",
-    --- @param ev autocmd_event
     callback = function(ev)
       local str = vim.api.nvim_buf_get_name(ev.buf)
       local match = str:match(".*%.typ$")
@@ -1685,7 +1717,6 @@ function M.setup(cfg)
     group = augroup,
     desc = "render live preview on insert enter",
     pattern = "*:i",
-    --- @param ev autocmd_event
     callback = function(ev)
       local str = vim.api.nvim_buf_get_name(ev.buf)
       local match = str:match(".*%.typ$")
@@ -1695,10 +1726,10 @@ function M.setup(cfg)
     end,
   })
 
-  vim.api.nvim_create_autocmd("CursorMovedI", {
+  vim.api.nvim_create_autocmd("TextChangedI", {
     pattern = "*.typ",
     group = augroup,
-    desc = "render live preview on cursor move",
+    desc = "render live preview when insert-mode text changes",
     callback = function()
       vim.schedule(function()
         render_live_typst_preview()
@@ -1738,6 +1769,7 @@ function M.setup(cfg)
     desc = "stop typst watch sessions for dead buffers",
     callback = function(ev)
       stop_watch_sessions_for_buf(ev.buf)
+      hard_reset_buf(ev.buf)
     end,
   })
 end
