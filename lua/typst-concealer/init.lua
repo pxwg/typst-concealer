@@ -17,12 +17,20 @@ ffi.cdef[[
 ]]
 local TIOCGWINSZ = vim.fn.has('mac') == 1 and 0x40087468 or 0x5413
 local _cell_px_w, _cell_px_h
+--- PPI computed so that 1 typst text line ≈ 1 terminal cell height (1:1 pixel mapping).
+--- nil until refresh_cell_px_size() is called after M.setup().
+local _render_ppi
 
 local function refresh_cell_px_size()
   local ws = ffi.new('winsize_t')
   if ffi.C.ioctl(1, TIOCGWINSZ, ws) == 0 and ws.ws_xpixel > 0 and ws.ws_col > 0 then
     _cell_px_w = ws.ws_xpixel / ws.ws_col
     _cell_px_h = ws.ws_ypixel / ws.ws_row
+    -- Derive a PPI so "1 line of typst math at math_baseline_pt" == "_cell_px_h px".
+    -- math_baseline_pt ≈ ascender+descender height of the typst font in points.
+    -- Default 10 pt matches Libertine 11 pt with top/bottom-edge ascender/descender metrics.
+    local baseline_pt = (M.config and M.config.math_baseline_pt) or 10
+    _render_ppi = math.max(72, math.floor(_cell_px_h * 72 / baseline_pt))
   end
 end
 
@@ -253,13 +261,13 @@ local function update_extmark_text(bufnr, extmark_id, string, skip_hide_check)
     -- Restore overflow extmarks if they were deleted while hidden
     local overflow = overflow_marks[extmark_id]
     if overflow then
-      if not overflow.above_id then
+      if overflow.above > 0 and not overflow.above_id then
         overflow.above_id = vim.api.nvim_buf_set_extmark(0, ns_id2, row, 0, {
           virt_lines = overflow.above_virt_lines,
           virt_lines_above = true,
         })
       end
-      if not overflow.below_id then
+      if overflow.below > 0 and not overflow.below_id then
         overflow.below_id = vim.api.nvim_buf_set_extmark(0, ns_id2, row, 0, {
           virt_lines = overflow.below_virt_lines,
         })
@@ -327,15 +335,26 @@ local function conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows,
     local above_id = existing and existing.above_id
     local below_id = existing and existing.below_id
 
-    above_id = vim.api.nvim_buf_set_extmark(bufnr, ns_id2, row, 0, {
-      id = above_id,
-      virt_lines = above_lines,
-      virt_lines_above = true,
-    })
-    below_id = vim.api.nvim_buf_set_extmark(bufnr, ns_id2, row, 0, {
-      id = below_id,
-      virt_lines = below_lines,
-    })
+    if above > 0 then
+      above_id = vim.api.nvim_buf_set_extmark(bufnr, ns_id2, row, 0, {
+        id = above_id,
+        virt_lines = above_lines,
+        virt_lines_above = true,
+      })
+    elseif above_id then
+      vim.api.nvim_buf_del_extmark(bufnr, ns_id2, above_id)
+      above_id = nil
+    end
+
+    if below > 0 then
+      below_id = vim.api.nvim_buf_set_extmark(bufnr, ns_id2, row, 0, {
+        id = below_id,
+        virt_lines = below_lines,
+      })
+    elseif below_id then
+      vim.api.nvim_buf_del_extmark(bufnr, ns_id2, below_id)
+      below_id = nil
+    end
 
     overflow_marks[extmark_id] = {
       above_id = above_id,
@@ -516,6 +535,8 @@ local function on_typst_exit(status_code, stderr, original_range, image_id, bufn
 
         local natural_rows, natural_cols
         if _cell_px_w and _cell_px_h then
+          -- _render_ppi is calibrated so that a standard math line renders at exactly
+          -- _cell_px_h pixels, giving clean integer natural_rows for all formulas.
           natural_rows = math.max(1, math.floor(data.height / _cell_px_h + 0.5))
           natural_cols = math.max(1, math.floor(data.width  / _cell_px_w + 0.5))
         else
@@ -525,6 +546,34 @@ local function on_typst_exit(status_code, stderr, original_range, image_id, bufn
         end
         if natural_cols >= #(kitty_codes.diacritics) then
           natural_cols = #(kitty_codes.diacritics) - 1
+        end
+
+        -- For single-line math (inline or display), cap natural_cols so the
+        -- placeholder fits on one visual line in every window that has 'wrap'
+        -- set.  Without this, the Kitty unicode-placeholder characters wrap
+        -- mid-image and the render tears (top half / gap / bottom half).
+        if source_rows == 1 then
+          local em = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns_id, extmark_id, {})
+          if #em > 0 then
+            local line = (vim.api.nvim_buf_get_lines(bufnr, em[1], em[1] + 1, false))[1] or ""
+            local visual_start = vim.fn.strdisplaywidth(string.sub(line, 1, em[2]))
+            -- Measure display width of one placeholder cell (base + 2 combining diacritics).
+            -- Non-BMP placeholder U+10EEEE may be 1 or 2 cells depending on the terminal/Neovim build.
+            local one_cell = kitty_codes.placeholder .. kitty_codes.diacritics[1] .. kitty_codes.diacritics[1]
+            local cell_dw = math.max(1, vim.fn.strdisplaywidth(one_cell))
+            for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
+              if vim.wo[win].wrap then
+                -- Subtract gutter width (signcolumn, numberline, foldcolumn) from window width
+                -- to get the actual text area width.
+                local wininfo = vim.fn.getwininfo(win)
+                local textoff = (wininfo and wininfo[1] and wininfo[1].textoff) or 0
+                local text_width = vim.api.nvim_win_get_width(win) - textoff
+                local available = math.max(0, text_width - visual_start)
+                local max_cols = math.floor(available / cell_dw)
+                natural_cols = math.min(natural_cols, math.max(1, max_cols))
+              end
+            end
+          end
         end
 
         create_image(path, image_id, natural_cols, natural_rows)
@@ -568,7 +617,7 @@ local function compile_image(bufnr, image_id, orignal_range, str, extmark_id, pr
 
   local handle = vim.uv.spawn(M.config.typst_location, {
     stdio = { stdin, stdout, stderr },
-    args = { "compile", "-", path, "--ppi=" .. M.config.ppi },
+    args = { "compile", "-", path, "--ppi=" .. (_render_ppi or M.config.ppi) },
   }, function(code, signal)
     on_typst_exit(code, stderr, orignal_range, image_id, bufnr, extmark_id, is_live_preview)
   end)
@@ -898,7 +947,8 @@ end
 --- @field color? string What color should typst-concealer render text/stroke with? (only applies when styling_type is "colorscheme")
 --- @field enabled_by_default? boolean Should typst-concealer conceal newly opened buffers by default?
 --- @field styling_type? "none" | "simple" | "colorscheme" What kind of styling should typst-concealer apply to your typst?
---- @field ppi? integer What PPI should typst render at. Default is 300, typst's normal default is 144.
+--- @field ppi? integer What PPI should typst render at. Used as fallback when terminal pixel size is unavailable (e.g. tmux).
+--- @field math_baseline_pt? number Expected typst math line height in points for one terminal row. Used to compute 1:1 render DPI. Default 10 pt (Libertine 11 pt with ascender/descender metrics).
 --- @field conceal_in_normal boolean Should typst-concealer still conceal when the normal mode cursor goes over a line.
 
 local augroup = vim.api.nvim_create_augroup("typst-concealer", { clear = true })
@@ -966,6 +1016,7 @@ function M.setup(cfg)
     enabled_by_default = default(cfg.enabled_by_default, true),
     styling_type = default(cfg.styling_type, "colorscheme"),
     ppi = default(cfg.ppi, 300),
+    math_baseline_pt = default(cfg.math_baseline_pt, 10),
     --- @type string | nil
     color = cfg.color,
     conceal_in_normal = default(cfg.conceal_in_normal, false),
