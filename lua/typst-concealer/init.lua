@@ -81,7 +81,7 @@ local function setup_prelude()
       .. "#set line(stroke: "
       .. color
       .. ")\n"
-      .. "#set path(stroke: "
+      .. "#set curve(stroke: "
       .. color
       .. ")\n"
       .. "#set polygon(stroke: "
