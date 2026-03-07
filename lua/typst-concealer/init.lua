@@ -121,6 +121,8 @@ local ns_id = vim.api.nvim_create_namespace("typst-concealer")
 -- used for each line of a multiline image
 -- please tell me if you know of a better way of overlaying mulitline text
 local ns_id2 = vim.api.nvim_create_namespace("typst-concealer-2")
+-- used for virt_lines of block-level multi-line formulas (separate from conceal_lines extmark)
+local ns_id3 = vim.api.nvim_create_namespace("typst-concealer-3")
 
 --- Escapes a given escape sequence so tmux will pass it through
 --- @param message string
@@ -153,6 +155,9 @@ end
 --- @type { [integer]: integer[] | nil }
 --- Goes from a text-less multiline ns_id mark to a list of one line ns_id2 marks for concealing
 local multiline_marks = {}
+--- @type { [integer]: integer }
+--- Maps ns_id extmark_id -> ns_id3 virt_lines extmark_id for block multiline formulas
+local block_virt_lines_marks = {}
 --- @type { [integer]: integer }
 local image_id_to_extmark = {}
 --- @type { [integer]: boolean }
@@ -256,6 +261,31 @@ local function place_image_extmark(image_id, range, extmark_id, concealing, is_b
         end_col = end_col,
         end_row = end_row,
       })
+    elseif is_block then
+      -- Block-level multi-line: use conceal_lines (ns_id) + virt_lines (ns_id3) so that
+      -- 'wrap' does not insert phantom screen lines between image rows.
+      -- conceal_lines and virt_lines must live in separate extmarks/namespaces because
+      -- Neovim does not render virt_lines on a line that is itself concealed.
+      new_extmark_id = vim.api.nvim_buf_set_extmark(0, ns_id, start_row, start_col, {
+        id = extmark_id,
+        invalidate = true,
+        --- @diagnostic disable-next-line: assign-type-mismatch
+        conceal_lines = "",
+        end_col = end_col,
+        end_row = end_row,
+      })
+      -- Place a separate ns_id3 extmark on the line AFTER the concealed range so that
+      -- its virt_lines (above = true) appear right where the formula was.
+      -- We cannot place it inside the concealed range because Neovim will not render
+      -- virt_lines on a concealed line.
+      local vl_row = end_row + 1
+      local vl_id = vim.api.nvim_buf_set_extmark(0, ns_id3, vl_row, 0, {
+        virt_lines = { { { "", "" } } }, -- placeholder, filled in conceal_for_image_id
+        virt_lines_above = true,
+      })
+      block_virt_lines_marks[new_extmark_id] = vl_id
+      -- multiline_marks entry marks this as a virt_lines-based multiline block
+      multiline_marks[new_extmark_id] = { virt_lines = true }
     else
       new_extmark_id = vim.api.nvim_buf_set_extmark(0, ns_id, start_row, start_col, {
         id = extmark_id,
@@ -267,10 +297,9 @@ local function place_image_extmark(image_id, range, extmark_id, concealing, is_b
         end_col = end_col,
         end_row = end_row,
       })
+      -- the extmarks will be added later
+      multiline_marks[new_extmark_id] = {}
     end
-
-    -- the extmarks will be added later
-    multiline_marks[new_extmark_id] = {}
   end
 
   image_id_to_extmark[image_id] = new_extmark_id
@@ -299,8 +328,13 @@ local function update_extmark_text(bufnr, extmark_id, string, skip_hide_check)
 
   local height = range_to_height({ row, col, opts.end_row, opts.end_col })
   if height ~= 1 then
-    if multiline_marks[extmark_id] then
-      for _, id in pairs(multiline_marks[extmark_id]) do
+    local mm = multiline_marks[extmark_id]
+    -- virt_lines-based block multiline: update is handled in conceal_for_image_id, skip here
+    if mm and mm.virt_lines then
+      return
+    end
+    if mm then
+      for _, id in pairs(mm) do
         vim.api.nvim_buf_del_extmark(bufnr, ns_id2, id)
       end
     end
@@ -389,8 +423,53 @@ local function conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows,
   if multiline_extmark_ids == nil then
     -- Normal single-row case (natural_rows == 1). Forced to 1 if source_rows == 1.
     update_extmark_text(bufnr, extmark_id, make_row_list(1))
+  elseif multiline_extmark_ids.virt_lines then
+    -- Block-level multi-line: rendered via virt_lines on the parent extmark.
+    -- virt_lines are not affected by 'wrap', so image rows always appear contiguous.
+    local render_rows = natural_rows
+    local lines = {}
+    local above_blank = 0
+    if natural_rows < source_rows then
+      above_blank = math.floor((source_rows - natural_rows) / 2)
+      render_rows = source_rows
+    end
+    for i = 1, render_rows do
+      local image_row = i - above_blank
+      if image_row < 1 or image_row > natural_rows then
+        lines[i] = { { "", hl_group } }
+      elseif image_row >= #kitty_codes.diacritics then
+        lines[i] = {
+          {
+            "This image attempted to render taller than "
+              .. #kitty_codes.diacritics
+              .. " lines. If you legitimately see this in a real document, open an issue.",
+            hl_group,
+          },
+        }
+      else
+        lines[i] = make_row_list(image_row)
+      end
+    end
+    -- If this extmark is currently hidden (cursor on it), just update the saved data
+    if Currently_hidden_extmark_ids[extmark_id] ~= nil then
+      Currently_hidden_extmark_ids[extmark_id] = { block_virt_lines = true, virt_lines_data = lines }
+      return
+    end
+    -- Write virt_lines onto the separate ns_id3 extmark (not the concealed ns_id one).
+    local vl_id = block_virt_lines_marks[extmark_id]
+    if vl_id then
+      local m = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns_id3, vl_id, { details = true })
+      if #m > 0 then
+        local row, col = m[1], m[2]
+        vim.api.nvim_buf_set_extmark(bufnr, ns_id3, row, col, {
+          id = vl_id,
+          virt_lines = lines,
+          virt_lines_above = true,
+        })
+      end
+    end
   else
-    -- Multiline block case
+    -- Multiline block case (non-block or inline multi-line via ns_id2 overlay)
     local lines = {}
     if natural_rows < source_rows then
       -- Centre the natural image within the source rows
@@ -833,9 +912,11 @@ end
 local function reset_buf(bufnr)
   vim.api.nvim_buf_clear_namespace(bufnr, ns_id, 0, -1)
   vim.api.nvim_buf_clear_namespace(bufnr, ns_id2, 0, -1)
+  vim.api.nvim_buf_clear_namespace(bufnr, ns_id3, 0, -1)
   Live_preview_extmark_id = nil
   Currently_hidden_extmark_ids = {}
   multiline_marks = {}
+  block_virt_lines_marks = {}
   diagnostics = {}
   runtime_preludes = {}
   block_formula_ids = {}
@@ -949,7 +1030,7 @@ end
 
 --- @alias virt_text {[1]: string, [2]: string}[]
 
---- @type {[integer]: virt_text}
+--- @type {[integer]: virt_text | { block_virt_lines: true, virt_lines_data: table }}
 Currently_hidden_extmark_ids = {}
 
 ---@param bufnr integer
@@ -989,6 +1070,45 @@ function hide_extmarks_at_cursor()
     for _, extmark in ipairs(extmarks) do
       local id = extmark[1]
       if multiline_marks[id] ~= nil then
+        local mm = multiline_marks[id]
+        -- virt_lines-based block multiline: remove conceal_lines and clear virt_lines
+        if mm.virt_lines then
+          if new_hidden[id] ~= nil then
+            -- already queued for hiding this cycle
+          elseif Currently_hidden_extmark_ids[id] ~= nil then
+            new_hidden[id] = Currently_hidden_extmark_ids[id]
+            Currently_hidden_extmark_ids[id] = nil
+          else
+            -- Save current virt_lines from ns_id3 so we can restore later
+            local vl_id = block_virt_lines_marks[id]
+            local saved_vl = nil
+            if vl_id then
+              local vm = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns_id3, vl_id, { details = true })
+              if #vm > 0 and vm[3] then
+                saved_vl = vm[3].virt_lines
+                -- Clear the virt_lines on the ns_id3 extmark
+                vim.api.nvim_buf_set_extmark(bufnr, ns_id3, vm[1], vm[2], {
+                  id = vl_id,
+                  virt_lines = {},
+                  virt_lines_above = true,
+                })
+              end
+            end
+            -- Remove conceal_lines from the ns_id extmark so the original text is revealed
+            local em = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns_id, id, { details = true })
+            if #em > 0 then
+              local row, col, opts = em[1], em[2], em[3]
+              vim.api.nvim_buf_set_extmark(bufnr, ns_id, row, col, {
+                id = id,
+                invalidate = true,
+                end_col = opts.end_col,
+                end_row = opts.end_row,
+              })
+            end
+            new_hidden[id] = { block_virt_lines = true, virt_lines_data = saved_vl }
+          end
+          goto continue
+        end
         if new_hidden[id] ~= nil then
         elseif Currently_hidden_extmark_ids[id] ~= nil then
           new_hidden[id] = Currently_hidden_extmark_ids[id]
@@ -998,7 +1118,7 @@ function hide_extmarks_at_cursor()
             goto continue
           end
           local text = {}
-          for _, new_id in ipairs(multiline_marks[id]) do
+          for _, new_id in ipairs(mm) do
             local new_mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns_id2, new_id, { details = true })
             --- @type vim.api.keyset.extmark_details
             local opts = new_mark[3]
@@ -1036,7 +1156,34 @@ function hide_extmarks_at_cursor()
 
   -- show remaining extmarks not in selected lines
   for id, text in pairs(Currently_hidden_extmark_ids) do
-    update_extmark_text(bufnr, id, text, true)
+    if type(text) == "table" and text.block_virt_lines then
+      -- Restore block-level multiline: re-add conceal_lines and virt_lines
+      local em = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns_id, id, { details = true })
+      if #em > 0 then
+        local row, col, opts = em[1], em[2], em[3]
+        vim.api.nvim_buf_set_extmark(bufnr, ns_id, row, col, {
+          id = id,
+          invalidate = true,
+          --- @diagnostic disable-next-line: assign-type-mismatch
+          conceal_lines = "",
+          end_col = opts.end_col,
+          end_row = opts.end_row,
+        })
+      end
+      local vl_id = block_virt_lines_marks[id]
+      if vl_id and text.virt_lines_data then
+        local vm = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns_id3, vl_id, { details = true })
+        if #vm > 0 then
+          vim.api.nvim_buf_set_extmark(bufnr, ns_id3, vm[1], vm[2], {
+            id = vl_id,
+            virt_lines = text.virt_lines_data,
+            virt_lines_above = true,
+          })
+        end
+      end
+    else
+      update_extmark_text(bufnr, id, text, true)
+    end
   end
 
   Currently_hidden_extmark_ids = new_hidden
