@@ -310,7 +310,8 @@ local function conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows,
   end
 
   if source_rows == 1 and natural_rows > 1 then
-    -- Inline overflow: image is taller than one terminal cell; centre it on the source line
+    -- Inline overflow > 1.5 logic triggers this:
+    -- Generates extra lines explicitly opening space to preserve font size without cropping
     local above = math.floor((natural_rows - 1) / 2)
     local below = natural_rows - 1 - above
     local mid = above + 1
@@ -369,6 +370,7 @@ local function conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows,
     update_extmark_text(bufnr, extmark_id, { make_row(mid) })
   elseif multiline_extmark_ids == nil then
     -- Normal single-row case (natural_rows == 1)
+    -- This handles inline math purely on a single line!
     update_extmark_text(bufnr, extmark_id, { make_row(1) })
   else
     -- Multiline block case
@@ -533,17 +535,31 @@ local function on_typst_exit(status_code, stderr, original_range, image_id, bufn
           return
         end
 
+        local exact_rows
         local natural_rows, natural_cols
         if _cell_px_w and _cell_px_h then
-          -- _render_ppi is calibrated so that a standard math line renders at exactly
-          -- _cell_px_h pixels, giving clean integer natural_rows for all formulas.
-          natural_rows = math.max(1, math.floor(data.height / _cell_px_h + 0.5))
+          exact_rows = data.height / _cell_px_h
           natural_cols = math.max(1, math.floor(data.width  / _cell_px_w + 0.5))
         else
           -- fallback: old behaviour
-          natural_rows = source_rows
+          exact_rows = source_rows
           natural_cols = math.ceil((data.width / data.height) * 2) * source_rows
         end
+
+        -- Inline math dynamic height handling:
+        -- 如果高度 > 1 且 <= 1.55 行距：强制给 1 行，避免增加 extmark（破坏紧凑性）。
+        -- Kitty 接收到后会平滑等比微缩至这 1 行高，因为导出带了 pad，所以绝不会裁切，只是字体轻微变小。
+        -- 如果高度显著 > 1.55（如复杂分式），则自然开辟新行。
+        if source_rows == 1 then
+          if exact_rows <= 1.55 then
+            natural_rows = 1
+          else
+            natural_rows = math.max(2, math.floor(exact_rows + 0.5))
+          end
+        else
+          natural_rows = math.max(1, math.floor(exact_rows + 0.5))
+        end
+
         if natural_cols >= #(kitty_codes.diacritics) then
           natural_cols = #(kitty_codes.diacritics) - 1
         end
@@ -607,7 +623,8 @@ end
 --- @param extmark_id integer
 --- @param prelude_count integer how far into the list of runtime_preludes should we add to the string
 --- @param is_live_preview boolean
-local function compile_image(bufnr, image_id, orignal_range, str, extmark_id, prelude_count, is_live_preview)
+--- @param is_inline boolean whether the math is on a single line
+local function compile_image(bufnr, image_id, orignal_range, str, extmark_id, prelude_count, is_live_preview, is_inline)
   -- TODO: use stdout maybe?
   local path = typst_file_path(image_id, bufnr)
 
@@ -630,23 +647,38 @@ local function compile_image(bufnr, image_id, orignal_range, str, extmark_id, pr
   final_str[#final_str + 1] = M._styling_prelude
   
   -- Pad image dimensions to integer multiples of the terminal cell size so Kitty never has to
-  -- stretch or squeeze a formula to fit terminal cells. Without this width padding, formulas whose widths
-  -- don't align perfectly with cell widths get scaled down by Kitty, causing inconsistent
-  -- font sizes (e.g. `\alpha \beta` appearing smaller than `\alpha`).
-  -- The show rule centers the content vertically and allocates exact integer cell dimensions.
+  -- stretch or squeeze a formula to fit terminal cells.
+  -- 我们主动在 Typst 中给渲染加入 y 轴 padding（0.15em 足够覆盖积分号和 \gamma 这种越界字符），
+  -- 这强制 Typst 扩大渲染画布，彻底阻止了墨水被物理切断（截断）。
   if _cell_px_h and _cell_px_w then
     local baseline_pt = M.config.math_baseline_pt
     local cell_w_pt = baseline_pt * (_cell_px_w / _cell_px_h)
-    final_str[#final_str + 1] = string.format(
-      '#show: __it => context { let __d = measure(__it); let __mh = %gpt; let __mw = %gpt; let __rows = calc.max(1, calc.ceil(__d.height / __mh - 0.001)); let __cols = calc.max(1, calc.ceil(__d.width / __mw - 0.001)); let __th = __rows * __mh; let __tw = __cols * __mw; block(width: __tw, height: __th, align(horizon, __it)) }\n',
-      baseline_pt, cell_w_pt
-    )
+    
+    if is_inline then
+      final_str[#final_str + 1] = string.format(
+        '#show: __it => context { let __pad_it = pad(y: 0.15em, __it); let __d = measure(__pad_it); let __mh = %gpt; let __mw = %gpt; let __cols = calc.max(1, calc.ceil(__d.width / __mw - 0.001)); let __tw = __cols * __mw; let __th = calc.max(__mh, __d.height); box(width: __tw, height: __th, align(center + horizon, __pad_it)) }\n',
+        baseline_pt, cell_w_pt
+      )
+    else
+      final_str[#final_str + 1] = string.format(
+        '#show: __it => context { let __pad_it = pad(y: 0.15em, __it); let __d = measure(__pad_it); let __mh = %gpt; let __mw = %gpt; let __rows = calc.max(1, calc.ceil(__d.height / __mh - 0.001)); let __cols = calc.max(1, calc.ceil(__d.width / __mw - 0.001)); let __th = __rows * __mh; let __tw = __cols * __mw; block(width: __tw, height: __th, align(horizon, __pad_it)) }\n',
+        baseline_pt, cell_w_pt
+      )
+    end
   elseif _cell_px_h then
+    -- Fallbacks
     local baseline_pt = M.config.math_baseline_pt
-    final_str[#final_str + 1] = string.format(
-      '#show: __it => context { let __d = measure(__it); let __mh = %gpt; let __rows = calc.max(1, calc.ceil(__d.height / __mh - 0.001)); let __th = __rows * __mh; block(width: __d.width, height: __th, align(horizon, __it)) }\n',
-      baseline_pt
-    )
+    if is_inline then
+      final_str[#final_str + 1] = string.format(
+        '#show: __it => context { let __pad_it = pad(y: 0.15em, __it); let __d = measure(__pad_it); let __mh = %gpt; let __th = calc.max(__mh, __d.height); box(width: __d.width, height: __th, align(center + horizon, __pad_it)) }\n',
+        baseline_pt
+      )
+    else
+      final_str[#final_str + 1] = string.format(
+        '#show: __it => context { let __pad_it = pad(y: 0.15em, __it); let __d = measure(__pad_it); let __mh = %gpt; let __rows = calc.max(1, calc.ceil(__d.height / __mh - 0.001)); let __th = __rows * __mh; block(width: __d.width, height: __th, align(horizon, __pad_it)) }\n',
+        baseline_pt
+      )
+    end
   end
   
   final_str[#final_str + 1] = str
@@ -747,7 +779,7 @@ local function render_buf(bufnr)
       -- #highlight, for looking not terrible
       -- probably more too
       -- Special casing would not be useful for trying to render something as closely to how typst would
-      -- but instead would be useful for those (me) using typst-concealer as the end goal
+      -- but instead would be useful for touch (me) using typst-concealer as the end goal
       -- Would def be toggleable though
       if (not vim.list_contains({ "let", "set", "import", "show" }, code_type)) and (not vim.list_contains({ "pagebreak" }, call_ident)) then
         local image_id = new_image_id(bufnr)
@@ -768,8 +800,10 @@ local function render_buf(bufnr)
     local range, prelude_count = image[1], image[2]
     local extmark_id = place_image_extmark(id, range)
     local str = range_to_string(range, bufnr)
+    local source_rows = range_to_height(range)
+    local is_inline = (source_rows == 1)
     vim.schedule(function()
-      compile_image(bufnr, id, range, str, extmark_id, prelude_count, false)
+      compile_image(bufnr, id, range, str, extmark_id, prelude_count, false, is_inline)
     end)
   end
   hide_extmarks_at_cursor()
@@ -955,8 +989,10 @@ local function render_live_typst_preview()
   local new_preview = {}
   new_preview.image_id = new_image_id(bufnr)
   new_preview.extmark_id = place_image_extmark(new_preview.image_id, range, prev_extmark, false)
+  local source_rows = range_to_height(range)
+  local is_inline = (source_rows == 1)
   -- TODO: determine prelude_count somehow?
-  compile_image(bufnr, new_preview.image_id, range, str, new_preview.extmark_id, 0, true)
+  compile_image(bufnr, new_preview.image_id, range, str, new_preview.extmark_id, 0, true, is_inline)
   preview_image = new_preview
 end
 
