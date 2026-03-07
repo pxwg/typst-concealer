@@ -10,6 +10,22 @@ local truecolor = vim.env.COLORTERM == "truecolor" or vim.env.COLORTERM == "24bi
 local pid = vim.fn.getpid() % 256
 local full_pid = vim.fn.getpid()
 
+local ffi = require('ffi')
+ffi.cdef[[
+  typedef struct { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; } winsize_t;
+  int ioctl(int fd, unsigned long request, ...);
+]]
+local TIOCGWINSZ = vim.fn.has('mac') == 1 and 0x40087468 or 0x5413
+local _cell_px_w, _cell_px_h
+
+local function refresh_cell_px_size()
+  local ws = ffi.new('winsize_t')
+  if ffi.C.ioctl(1, TIOCGWINSZ, ws) == 0 and ws.ws_xpixel > 0 and ws.ws_col > 0 then
+    _cell_px_w = ws.ws_xpixel / ws.ws_col
+    _cell_px_h = ws.ws_ypixel / ws.ws_row
+  end
+end
+
 --- @class autocmd_event
 --- @field id integer
 --- @field event string
@@ -107,6 +123,8 @@ end
 --- @type { [integer]: integer[] | nil }
 --- Goes from a text-less multiline ns_id mark to a list of one line ns_id2 marks for concealing
 local multiline_marks = {}
+--- @type { [integer]: { above_id: integer|nil, below_id: integer|nil, above: integer, below: integer, above_virt_lines: table, below_virt_lines: table } }
+local overflow_marks = {}
 --- @type { [integer]: integer }
 local image_id_to_extmark = {}
 
@@ -232,6 +250,21 @@ local function update_extmark_text(bufnr, extmark_id, string, skip_hide_check)
       --- @diagnostic disable-next-line nvim type is wrong
       conceal = "",
     })
+    -- Restore overflow extmarks if they were deleted while hidden
+    local overflow = overflow_marks[extmark_id]
+    if overflow then
+      if not overflow.above_id then
+        overflow.above_id = vim.api.nvim_buf_set_extmark(0, ns_id2, row, 0, {
+          virt_lines = overflow.above_virt_lines,
+          virt_lines_above = true,
+        })
+      end
+      if not overflow.below_id then
+        overflow.below_id = vim.api.nvim_buf_set_extmark(0, ns_id2, row, 0, {
+          virt_lines = overflow.below_virt_lines,
+        })
+      end
+    end
   else
     vim.api.nvim_buf_set_extmark(0, ns_id, row, col, {
       id = extmark_id,
@@ -249,9 +282,10 @@ end
 --- Adds the concealing unicode characters to the relevant extmark(s) for the given image_id
 --- @param bufnr integer
 --- @param image_id integer
---- @param width integer
---- @param height integer
-local function conceal_for_image_id(bufnr, image_id, width, height)
+--- @param natural_cols integer
+--- @param natural_rows integer
+--- @param source_rows integer
+local function conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, source_rows)
   local extmark_id = image_id_to_extmark[image_id]
   local multiline_extmark_ids = multiline_marks[extmark_id]
 
@@ -259,33 +293,91 @@ local function conceal_for_image_id(bufnr, image_id, width, height)
   -- encode image_id into the foreground color
   vim.api.nvim_set_hl(0, hl_group, { fg = string.format("#%06X", image_id) })
 
-  if multiline_extmark_ids == nil then
+  local function make_row(i)
     local line = ""
-    if width >= #(kitty_codes.diacritics) then
-      line = "This image attempted to render wider than " ..
-          #(kitty_codes.diacritics) .. " characters long. This is likely a bug."
-    else
-      for j = 0, width - 1 do
-        line = line .. kitty_codes.placeholder .. kitty_codes.diacritics[1] .. kitty_codes.diacritics[j + 1]
-      end
+    for j = 0, natural_cols - 1 do
+      line = line .. kitty_codes.placeholder .. kitty_codes.diacritics[i] .. kitty_codes.diacritics[j + 1]
     end
-    update_extmark_text(bufnr, extmark_id, { { line, hl_group } })
+    return { line, hl_group }
+  end
+
+  if source_rows == 1 and natural_rows > 1 then
+    -- Inline overflow: image is taller than one terminal cell; centre it on the source line
+    local above = math.floor((natural_rows - 1) / 2)
+    local below = natural_rows - 1 - above
+    local mid = above + 1
+
+    local m = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns_id, extmark_id, { details = true })
+    if #m == 0 then return end
+    local row, col = m[1], m[2]
+
+    -- Build virt_lines for above extmark (image rows 1..above)
+    local above_lines = {}
+    for i = 1, above do
+      above_lines[i] = { make_row(i) }
+    end
+
+    -- Build virt_lines for below extmark (image rows above+2..natural_rows)
+    local below_lines = {}
+    for i = above + 2, natural_rows do
+      below_lines[#below_lines + 1] = { make_row(i) }
+    end
+
+    local existing = overflow_marks[extmark_id]
+    local above_id = existing and existing.above_id
+    local below_id = existing and existing.below_id
+
+    above_id = vim.api.nvim_buf_set_extmark(bufnr, ns_id2, row, 0, {
+      id = above_id,
+      virt_lines = above_lines,
+      virt_lines_above = true,
+    })
+    below_id = vim.api.nvim_buf_set_extmark(bufnr, ns_id2, row, 0, {
+      id = below_id,
+      virt_lines = below_lines,
+    })
+
+    overflow_marks[extmark_id] = {
+      above_id = above_id,
+      below_id = below_id,
+      above = above,
+      below = below,
+      above_virt_lines = above_lines,
+      below_virt_lines = below_lines,
+    }
+
+    -- Update main extmark with the middle image row
+    update_extmark_text(bufnr, extmark_id, { make_row(mid) })
+  elseif multiline_extmark_ids == nil then
+    -- Normal single-row case (natural_rows == 1)
+    update_extmark_text(bufnr, extmark_id, { make_row(1) })
   else
+    -- Multiline block case
     local lines = {}
-    for i = 1, height do
-      local line = ""
-      if width >= #(kitty_codes.diacritics) then
-        line = "This image attempted to render wider than " ..
-            #(kitty_codes.diacritics) .. " characters long. This is likely a bug."
-      elseif i >= #(kitty_codes.diacritics) then
-        line = "This image attempted to render taller than " ..
-            #(kitty_codes.diacritics) .. " lines. If you legitimately see this in a real document, open an issue."
-      else
-        for j = 0, width - 1 do
-          line = line .. kitty_codes.placeholder .. kitty_codes.diacritics[i] .. kitty_codes.diacritics[j + 1]
+    if natural_rows < source_rows then
+      -- Centre the natural image within the source rows
+      local above_blank = math.floor((source_rows - natural_rows) / 2)
+      for i = 1, source_rows do
+        local image_row = i - above_blank
+        if image_row < 1 or image_row > natural_rows then
+          lines[i] = { { "", hl_group } }
+        elseif image_row >= #(kitty_codes.diacritics) then
+          lines[i] = { { "This image attempted to render taller than " ..
+              #(kitty_codes.diacritics) .. " lines. If you legitimately see this in a real document, open an issue.", hl_group } }
+        else
+          lines[i] = { make_row(image_row) }
         end
       end
-      lines[#lines + 1] = { { line, hl_group } }
+    else
+      -- natural_rows >= source_rows: render source_rows rows of the image
+      for i = 1, source_rows do
+        if i >= #(kitty_codes.diacritics) then
+          lines[i] = { { "This image attempted to render taller than " ..
+              #(kitty_codes.diacritics) .. " lines. If you legitimately see this in a real document, open an issue.", hl_group } }
+        else
+          lines[i] = { make_row(i) }
+        end
+      end
     end
     update_extmark_text(bufnr, extmark_id, lines)
   end
@@ -412,7 +504,7 @@ local function on_typst_exit(status_code, stderr, original_range, image_id, bufn
     else
       local path = typst_file_path(image_id, bufnr)
       vim.schedule(function()
-        local height = range_to_height(original_range)
+        local source_rows = range_to_height(original_range)
         local success, data = pcall(pngData, path)
         if success == false then
           -- the image file doesn't exist (or is invalid in some way)
@@ -422,14 +514,21 @@ local function on_typst_exit(status_code, stderr, original_range, image_id, bufn
           return
         end
 
-        -- Assumes a character has a 1/2 aspect ratio that needs accounting for
-        local width = math.ceil((data.width / data.height) * 2) * height
-        if width >= #(kitty_codes.diacritics) then
-          width = #(kitty_codes.diacritics) - 1
+        local natural_rows, natural_cols
+        if _cell_px_w and _cell_px_h then
+          natural_rows = math.max(1, math.floor(data.height / _cell_px_h + 0.5))
+          natural_cols = math.max(1, math.floor(data.width  / _cell_px_w + 0.5))
+        else
+          -- fallback: old behaviour
+          natural_rows = source_rows
+          natural_cols = math.ceil((data.width / data.height) * 2) * source_rows
+        end
+        if natural_cols >= #(kitty_codes.diacritics) then
+          natural_cols = #(kitty_codes.diacritics) - 1
         end
 
-        create_image(path, image_id, width, height)
-        conceal_for_image_id(bufnr, image_id, width, height)
+        create_image(path, image_id, natural_cols, natural_rows)
+        conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, source_rows)
       end)
     end
     if (M.config.do_diagnostics) then
@@ -514,6 +613,7 @@ local function reset_buf(bufnr)
   Live_preview_extmark_id = nil
   Currently_hidden_extmark_ids = {}
   multiline_marks = {}
+  overflow_marks = {}
   diagnostics = {}
   runtime_preludes = {}
 
@@ -688,6 +788,18 @@ function hide_extmarks_at_cursor()
             virt_text_pos = opts.virt_text_pos,
             invalidate = opts.invalidate,
           })
+          -- Also hide overflow extmarks if any
+          local overflow = overflow_marks[id]
+          if overflow then
+            if overflow.above_id then
+              vim.api.nvim_buf_del_extmark(bufnr, ns_id2, overflow.above_id)
+              overflow.above_id = nil
+            end
+            if overflow.below_id then
+              vim.api.nvim_buf_del_extmark(bufnr, ns_id2, overflow.below_id)
+              overflow.below_id = nil
+            end
+          end
         end
       end
       ::continue::
@@ -866,6 +978,7 @@ function M.setup(cfg)
 
   M.config = config
   setup_prelude()
+  refresh_cell_px_size()
 
   if not config.allow_missing_typst and vim.fn.executable(M.config.typst_location) ~= 1 then
     if M.config.typst_location == "typst" then
@@ -1024,6 +1137,14 @@ function M.setup(cfg)
     pattern = "typst",
     callback = function(ev)
       init_buf(ev.buf)
+    end
+  })
+
+  vim.api.nvim_create_autocmd("VimResized", {
+    group = augroup,
+    desc = "refresh cell pixel size on terminal resize",
+    callback = function()
+      refresh_cell_px_size()
     end
   })
 end
