@@ -165,6 +165,355 @@ local image_id_to_extmark = {}
 --- should be centered and immune to line wrapping.
 local block_formula_ids = {}
 
+--- @class typst_watch_session
+--- @field kind 'full' | 'preview'
+--- @field handle uv_process_t|nil
+--- @field stdout uv_pipe_t|nil
+--- @field stderr uv_pipe_t|nil
+--- @field input_path string
+--- @field output_prefix string
+--- @field output_template string
+--- @field poll_timer uv_timer_t|nil
+--- @field items table[]
+--- @field page_state table
+--- @field last_page_count integer
+--- @field stderr_chunks string[]
+--- @field dead boolean|nil
+
+--- @type { [integer]: { full?: typst_watch_session, preview?: typst_watch_session } }
+local watch_sessions = {}
+
+local make_sizing_wrap
+local on_page_rendered
+
+local function get_buf_dir(bufnr)
+  local buf_file = vim.api.nvim_buf_get_name(bufnr)
+  if buf_file == nil or buf_file == "" then
+    return vim.uv.cwd()
+  end
+  return vim.fn.fnamemodify(buf_file, ":h")
+end
+
+--- Generates the fixed input path for a watch session.
+--- @param bufnr integer
+--- @param kind 'full' | 'preview'
+--- @return string
+local function session_input_path(bufnr, kind)
+  local dir = get_buf_dir(bufnr)
+  local suffix = kind == "preview" and "-preview" or ""
+  return dir .. "/.typst-concealer-" .. full_pid .. "-" .. bufnr .. suffix .. ".typ"
+end
+
+--- Generates the fixed output template/prefix for a watch session.
+--- @param bufnr integer
+--- @param kind 'full' | 'preview'
+--- @return string template, string prefix
+local function session_output_template(bufnr, kind)
+  local suffix = kind == "preview" and "-preview" or ""
+  local prefix = "/tmp/tty-graphics-protocol-typst-concealer-" .. full_pid .. "-" .. bufnr .. suffix
+  return prefix .. "-{p}.png", prefix
+end
+
+--- @param path string
+local function safe_unlink(path)
+  local stat = vim.uv.fs_stat(path)
+  if stat ~= nil then
+    vim.uv.fs_unlink(path)
+  end
+end
+
+--- Overwrite a file in-place so watch sees content changes on a stable path.
+--- @param path string
+--- @param text string
+--- @return boolean, string?
+local function write_file_in_place(path, text)
+  local fd, open_err = vim.uv.fs_open(path, "w", tonumber("644", 8))
+  if not fd then
+    return false, open_err
+  end
+  local _, write_err = vim.uv.fs_write(fd, text, 0)
+  vim.uv.fs_close(fd)
+  if write_err ~= nil then
+    return false, write_err
+  end
+  return true
+end
+
+--- @param bufnr integer
+--- @param kind 'full' | 'preview'
+--- @return typst_watch_session|nil
+local function get_watch_session(bufnr, kind)
+  local bucket = watch_sessions[bufnr]
+  return bucket and bucket[kind] or nil
+end
+
+--- @param bufnr integer
+--- @param kind 'full' | 'preview'
+local function stop_watch_session(bufnr, kind)
+  local bucket = watch_sessions[bufnr]
+  if bucket == nil or bucket[kind] == nil then
+    return
+  end
+  local session = bucket[kind]
+
+  if session.poll_timer and not session.poll_timer:is_closing() then
+    session.poll_timer:stop()
+    session.poll_timer:close()
+  end
+
+  if session.stdout and not session.stdout:is_closing() then
+    session.stdout:close()
+  end
+  if session.stderr and not session.stderr:is_closing() then
+    session.stderr:close()
+  end
+  if session.handle and not session.handle:is_closing() then
+    session.handle:kill(15)
+    session.handle:close()
+  end
+
+  safe_unlink(session.input_path)
+  for i = 1, session.last_page_count or 0 do
+    safe_unlink(session.output_prefix .. "-" .. i .. ".png")
+  end
+
+  bucket[kind] = nil
+  if next(bucket) == nil then
+    watch_sessions[bufnr] = nil
+  end
+end
+
+--- @param bufnr integer
+local function stop_watch_sessions_for_buf(bufnr)
+  stop_watch_session(bufnr, "full")
+  stop_watch_session(bufnr, "preview")
+end
+
+--- Builds the multi-page typst source for a batch render.
+--- @param items { image_id: integer, extmark_id: integer, range: Range4, str: string, prelude_count: integer }[]
+--- @return string
+local function build_batch_document(items)
+  local doc = {}
+
+  if M.config.header and M.config.header ~= "" then
+    doc[#doc + 1] = M.config.header .. "\n"
+  end
+  doc[#doc + 1] = M._styling_prelude
+
+  for idx, item in ipairs(items) do
+    if idx > 1 then
+      doc[#doc + 1] = "#pagebreak()\n"
+    end
+    for i = 1, item.prelude_count do
+      doc[#doc + 1] = runtime_preludes[i]
+    end
+    local source_rows = item.range[3] - item.range[1] + 1
+    local wrap_prefix, wrap_suffix = make_sizing_wrap(source_rows)
+    if wrap_prefix ~= "" then
+      doc[#doc + 1] = wrap_prefix
+    end
+    local str = item.str
+    if type(str) == "table" then
+      for _, s in ipairs(str) do
+        doc[#doc + 1] = s
+      end
+    else
+      doc[#doc + 1] = str
+    end
+    if wrap_suffix ~= "" then
+      doc[#doc + 1] = wrap_suffix
+    else
+      doc[#doc + 1] = "\n"
+    end
+  end
+
+  return table.concat(doc)
+end
+
+--- @param session typst_watch_session
+--- @param i integer
+--- @param item { image_id: integer, extmark_id: integer, range: Range4, str: string, prelude_count: integer }
+local function try_render_session_page(session, i, item)
+  local page_path = session.output_prefix .. "-" .. i .. ".png"
+  local stat = vim.uv.fs_stat(page_path)
+  if stat == nil or stat.size == 0 then
+    return
+  end
+
+  local stamp = tostring(stat.mtime.sec) .. ":" .. tostring(stat.mtime.nsec) .. ":" .. tostring(stat.size)
+  local page_state = session.page_state[i] or {}
+
+  -- first sighting after a change: remember only
+  if page_state.last_seen ~= stamp then
+    page_state.last_seen = stamp
+    session.page_state[i] = page_state
+    return
+  end
+
+  -- second consecutive sighting of same stamp: assume write is stable and render once
+  if page_state.rendered == stamp then
+    return
+  end
+  page_state.rendered = stamp
+  session.page_state[i] = page_state
+
+  vim.schedule(function()
+    local current = get_watch_session(vim.fn.bufnr(), session.kind)
+    if current ~= session then
+      return
+    end
+    on_page_rendered(vim.fn.bufnr(), page_path, item.image_id, item.extmark_id, item.range)
+  end)
+end
+
+--- @param session typst_watch_session
+local function ensure_session_poller(session)
+  if session.poll_timer ~= nil and not session.poll_timer:is_closing() then
+    return
+  end
+
+  session.poll_timer = vim.uv.new_timer()
+  session.poll_timer:start(
+    80,
+    80,
+    vim.schedule_wrap(function()
+      if session.dead then
+        return
+      end
+      for i, item in ipairs(session.items or {}) do
+        try_render_session_page(session, i, item)
+      end
+    end)
+  )
+end
+
+--- @param bufnr integer
+--- @param kind 'full' | 'preview'
+--- @return typst_watch_session|nil
+local function ensure_watch_session(bufnr, kind)
+  local existing = get_watch_session(bufnr, kind)
+  if existing ~= nil and existing.handle ~= nil and not existing.dead then
+    return existing
+  end
+
+  local stdout = vim.uv.new_pipe()
+  local stderr = vim.uv.new_pipe()
+  local input_path = session_input_path(bufnr, kind)
+  local template, prefix = session_output_template(bufnr, kind)
+
+  local args = { "watch", input_path, template, "--ppi=" .. (_render_ppi or M.config.ppi) }
+  if M.config.compiler_args then
+    for _, arg in ipairs(M.config.compiler_args) do
+      table.insert(args, arg)
+    end
+  end
+
+  -- typst watch expects the input file to exist before startup.
+  local ok, err = write_file_in_place(input_path, M._styling_prelude)
+  if not ok then
+    vim.schedule(function()
+      vim.notify("[typst-concealer] failed to create watch input: " .. tostring(err), vim.log.levels.ERROR)
+    end)
+    return nil
+  end
+
+  local session = {
+    kind = kind,
+    handle = nil,
+    stdout = stdout,
+    stderr = stderr,
+    input_path = input_path,
+    output_prefix = prefix,
+    output_template = template,
+    poll_timer = nil,
+    items = {},
+    page_state = {},
+    last_page_count = 0,
+    stderr_chunks = {},
+    dead = false,
+  }
+
+  local handle
+  handle = vim.uv.spawn(M.config.typst_location, {
+    stdio = { nil, stdout, stderr },
+    args = args,
+  }, function()
+    session.dead = true
+    if session.poll_timer and not session.poll_timer:is_closing() then
+      session.poll_timer:stop()
+      session.poll_timer:close()
+      session.poll_timer = nil
+    end
+    if stdout and not stdout:is_closing() then
+      stdout:close()
+    end
+    if stderr and not stderr:is_closing() then
+      stderr:close()
+    end
+    if handle and not handle:is_closing() then
+      handle:close()
+    end
+  end)
+
+  if handle == nil then
+    vim.schedule(function()
+      vim.notify("[typst-concealer] failed to spawn typst watch", vim.log.levels.ERROR)
+    end)
+    return nil
+  end
+
+  session.handle = handle
+
+  stdout:read_start(function() end)
+  stderr:read_start(function(err2, data)
+    if err2 ~= nil then
+      return
+    end
+    if data ~= nil and data ~= "" then
+      session.stderr_chunks[#session.stderr_chunks + 1] = data
+      if #session.stderr_chunks > 32 then
+        table.remove(session.stderr_chunks, 1)
+      end
+    end
+  end)
+
+  watch_sessions[bufnr] = watch_sessions[bufnr] or {}
+  watch_sessions[bufnr][kind] = session
+  ensure_session_poller(session)
+  return session
+end
+
+--- @param bufnr integer
+--- @param items { image_id: integer, extmark_id: integer, range: Range4, str: string, prelude_count: integer }[]
+--- @param kind 'full' | 'preview'
+local function render_items_via_watch(bufnr, items, kind)
+  if #items == 0 then
+    stop_watch_session(bufnr, kind)
+    return
+  end
+
+  local session = ensure_watch_session(bufnr, kind)
+  if session == nil then
+    return
+  end
+
+  for i = #items + 1, session.last_page_count do
+    safe_unlink(session.output_prefix .. "-" .. i .. ".png")
+  end
+
+  session.items = items
+  session.page_state = {}
+  session.last_page_count = #items
+
+  local doc_str = build_batch_document(items)
+  local ok, err = write_file_in_place(session.input_path, doc_str)
+  if not ok then
+    vim.schedule(function()
+      vim.notify("[typst-concealer] failed to update watch input: " .. tostring(err), vim.log.levels.ERROR)
+    end)
+  end
+end
+
 --- Checks whether a math/code range is a block-level (display) formula that
 --- occupies its own line(s), as opposed to inline content within a paragraph.
 --- @param range Range4
@@ -568,26 +917,8 @@ local function typst_file_path(id, bufnr)
   return "/tmp/tty-graphics-protocol-typst-concealer-" .. full_pid .. "-" .. bufnr .. "-" .. id .. ".png"
 end
 
---- Generates the output path template for a batch compile job
---- @param batch_id integer
---- @param bufnr integer
---- @return string template, string prefix
-local function batch_output_template(batch_id, bufnr)
-  local prefix = "/tmp/tty-graphics-protocol-typst-concealer-" .. full_pid .. "-" .. bufnr .. "-batch-" .. batch_id
-  return prefix .. "-{p}.png", prefix
-end
-
---- Generates the path for the temporary typst input file for a batch job.
---- The file is placed in the same directory as the buffer's source file so that
---- relative #import / #include / image paths resolve correctly.
---- @param batch_id integer
---- @param bufnr integer
---- @return string
-local function batch_input_path(batch_id, bufnr)
-  local buf_file = vim.api.nvim_buf_get_name(bufnr)
-  local dir = vim.fn.fnamemodify(buf_file, ":h")
-  return dir .. "/.typst-concealer-" .. full_pid .. "-" .. bufnr .. "-batch-" .. batch_id .. ".typ"
-end
+-- batch_output_template / batch_input_path removed:
+-- watch sessions now use stable paths via session_output_template/session_input_path
 
 --- @type vim.Diagnostic[]
 local diagnostics = {}
@@ -598,7 +929,7 @@ local diagnostics = {}
 --- error that the show-rule approach causes in batch (multi-page) documents.
 --- @param source_rows integer
 --- @return string prefix, string suffix   both "" when cell size is unknown
-local function make_sizing_wrap(source_rows)
+make_sizing_wrap = function(source_rows)
   if _cell_px_h and _cell_px_w then
     local baseline_pt = M.config.math_baseline_pt
     local cell_w_pt = baseline_pt * (_cell_px_w / _cell_px_h)
@@ -642,7 +973,7 @@ end
 --- @param image_id integer
 --- @param extmark_id integer
 --- @param original_range Range4
-local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original_range)
+on_page_rendered = function(bufnr, page_path, image_id, extmark_id, original_range)
   local source_rows = range_to_height(original_range)
   local success, data = pcall(pngData, page_path)
   if not success then
@@ -676,203 +1007,7 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
   conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, source_rows)
 end
 
---- @type integer
-local _batch_id_counter = 0
-
--- Track live preview compiler to prevent process leak and spam during rapid typing
-local live_compiler_handle = nil
-
---- Compile a list of formulas in a single typst process.
---- Each formula becomes one page in the output document.
----
---- @param bufnr integer
---- @param items { image_id: integer, extmark_id: integer, range: Range4, str: string, prelude_count: integer }[]
---- @param is_live_preview boolean
-local function compile_batch(bufnr, items, is_live_preview)
-  if #items == 0 then
-    return
-  end
-
-  _batch_id_counter = _batch_id_counter + 1
-  local batch_id = _batch_id_counter
-  local template, prefix = batch_output_template(batch_id, bufnr)
-
-  local input_path = batch_input_path(batch_id, bufnr)
-
-  local stdout = vim.uv.new_pipe()
-  local stderr = vim.uv.new_pipe()
-
-  -- Terminate previous live compiler to free resources if we type very quickly
-  if is_live_preview and live_compiler_handle and not live_compiler_handle:is_closing() then
-    live_compiler_handle:kill(15) -- SIGTERM
-  end
-
-  local args = { "compile", input_path, template, "--ppi=" .. (_render_ppi or M.config.ppi) }
-  if M.config.compiler_args then
-    for _, arg in ipairs(M.config.compiler_args) do
-      table.insert(args, arg)
-    end
-  end
-
-  local handle
-
-  -- Build the multi-page typst source.
-  -- Each page = one formula, wrapped in a fresh scope to reset show rules.
-  -- The global header and styling prelude appear once at the top.
-  local doc = {}
-
-  if M.config.header and M.config.header ~= "" then
-    doc[#doc + 1] = M.config.header .. "\n"
-  end
-  doc[#doc + 1] = M._styling_prelude
-
-  for idx, item in ipairs(items) do
-    if idx > 1 then
-      doc[#doc + 1] = "#pagebreak()\n"
-    end
-    -- Emit runtime preludes accumulated up to this formula's position
-    -- (re-emitted per page so each page is self-contained).
-    for i = 1, item.prelude_count do
-      doc[#doc + 1] = runtime_preludes[i]
-    end
-    -- Wrap formula in a sizing context block (prefix...content...suffix).
-    -- This avoids `#show:` which would create a container and disallow #pagebreak().
-    local source_rows = item.range[3] - item.range[1] + 1
-    local wrap_prefix, wrap_suffix = make_sizing_wrap(source_rows)
-    if wrap_prefix ~= "" then
-      doc[#doc + 1] = wrap_prefix
-    end
-    -- Formula content
-    local str = item.str
-    if type(str) == "table" then
-      for _, s in ipairs(str) do
-        doc[#doc + 1] = s
-      end
-    else
-      doc[#doc + 1] = str
-    end
-    if wrap_suffix ~= "" then
-      doc[#doc + 1] = wrap_suffix
-    else
-      doc[#doc + 1] = "\n"
-    end
-  end
-
-  -- Write the document to the temporary input file, then spawn typst.
-  -- Writing to a file in the buffer's directory (rather than piping via stdin)
-  -- allows typst to resolve relative #import / #include / image paths correctly.
-  local doc_str = table.concat(doc)
-  vim.uv.fs_open(input_path, "w", tonumber("644", 8), function(err_open, fd)
-    if err_open or not fd then
-      return
-    end
-    vim.uv.fs_write(fd, doc_str, 0, function(err_write)
-      vim.uv.fs_close(fd, function() end)
-      if err_write then
-        return
-      end
-      handle = vim.uv.spawn(M.config.typst_location, {
-        stdio = { nil, stdout, stderr },
-        args = args,
-      }, function(code, signal)
-        if handle and not handle:is_closing() then
-          handle:close()
-        end
-        if is_live_preview and live_compiler_handle == handle then
-          live_compiler_handle = nil
-        end
-        vim.uv.fs_unlink(input_path, function() end)
-        if signal == 15 or signal == 9 then
-          if not stderr:is_closing() then
-            stderr:close()
-          end
-          return
-        end
-
-        -- Drain stderr
-        if not stderr:is_closing() then
-          stderr:shutdown()
-        end
-        local err_bucket = {}
-        stderr:read_start(function(err, data)
-          if err then
-            return
-          end
-          if data then
-            err_bucket[#err_bucket + 1] = data
-          else
-            stderr:close()
-          end
-        end)
-
-        local check = assert(vim.uv.new_check())
-        check:start(function()
-          if not stderr:is_closing() then
-            return
-          end
-          check:stop()
-          check:close()
-
-          local err_str = table.concat(err_bucket)
-
-          if code ~= 0 and err_str ~= "" then
-            local new_diags = {}
-            vim.schedule(function()
-              for _, item in ipairs(items) do
-                vim.api.nvim_buf_del_extmark(bufnr, ns_id, item.extmark_id)
-                local ids = multiline_marks[item.extmark_id]
-                if ids then
-                  for _, mid in ipairs(ids) do
-                    vim.api.nvim_buf_del_extmark(bufnr, ns_id2, mid)
-                  end
-                end
-              end
-            end)
-            if M.config.do_diagnostics then
-              for _, item in ipairs(items) do
-                new_diags[#new_diags + 1] = {
-                  bufnr = bufnr,
-                  lnum = item.range[1],
-                  col = item.range[2],
-                  end_lnum = item.range[3],
-                  end_col = item.range[4],
-                  message = err_str,
-                  severity = "ERROR",
-                  namespace = ns_id,
-                  source = "typst-concealer",
-                }
-              end
-              vim.schedule(function()
-                for _, d in ipairs(new_diags) do
-                  diagnostics[#diagnostics + 1] = d
-                end
-                vim.diagnostic.set(ns_id, bufnr, diagnostics)
-              end)
-            end
-          else
-            vim.schedule(function()
-              for i, item in ipairs(items) do
-                local page_path = prefix .. "-" .. i .. ".png"
-                on_page_rendered(bufnr, page_path, item.image_id, item.extmark_id, item.range)
-              end
-            end)
-            if M.config.do_diagnostics then
-              vim.schedule(function()
-                vim.diagnostic.set(ns_id, bufnr, diagnostics)
-              end)
-            end
-          end
-        end)
-      end)
-      if is_live_preview then
-        live_compiler_handle = handle
-      end
-    end)
-  end)
-  stdout:close()
-end
-
---- Compile a single formula (wraps compile_batch for the live preview path).
+--- Compile a single formula (watch-session backed for the live preview path).
 --- @param bufnr integer
 --- @param image_id integer
 --- @param original_range Range4
@@ -881,9 +1016,9 @@ end
 --- @param prelude_count integer
 --- @param is_live_preview boolean
 local function compile_image(bufnr, image_id, original_range, str, extmark_id, prelude_count, is_live_preview)
-  compile_batch(bufnr, {
+  render_items_via_watch(bufnr, {
     { image_id = image_id, extmark_id = extmark_id, range = original_range, str = str, prelude_count = prelude_count },
-  }, is_live_preview)
+  }, is_live_preview and "preview" or "full")
 end
 
 -- FIXME: this is bad. terrible even. fix it.
@@ -1000,15 +1135,26 @@ local function render_buf(bufnr)
 
   -- Collect all items in a stable order (by image_id) for the batch compiler
   local batch_items = {}
-  -- image_ids_in_use is allocated incrementally so sort by id for page order
-  local sorted_ids = {}
-  for id in pairs(ranges) do
-    sorted_ids[#sorted_ids + 1] = id
+  local sorted_entries = {}
+  for id, payload in pairs(ranges) do
+    sorted_entries[#sorted_entries + 1] = {
+      image_id = id,
+      range = payload[1],
+      prelude_count = payload[2],
+      node_type = payload[3],
+    }
   end
-  table.sort(sorted_ids)
+  table.sort(sorted_entries, function(a, b)
+    local ar, br = a.range, b.range
+    if ar[1] ~= br[1] then
+      return ar[1] < br[1]
+    end
+    return ar[2] < br[2]
+  end)
 
-  for _, id in ipairs(sorted_ids) do
-    local range, prelude_count, node_type = ranges[id][1], ranges[id][2], ranges[id][3]
+  for _, entry in ipairs(sorted_entries) do
+    local id = entry.image_id
+    local range, prelude_count, node_type = entry.range, entry.prelude_count, entry.node_type
     local block = is_block_formula(range, bufnr, node_type)
     local extmark_id = place_image_extmark(id, range, nil, nil, block)
     local str = range_to_string(range, bufnr)
@@ -1022,7 +1168,7 @@ local function render_buf(bufnr)
   end
 
   vim.schedule(function()
-    compile_batch(bufnr, batch_items, false)
+    render_items_via_watch(bufnr, batch_items, "full")
   end)
   hide_extmarks_at_cursor()
 end
@@ -1234,6 +1380,7 @@ local function clear_live_typst_preview(bufnr)
     live_preview_timer = nil
   end
   last_preview_str = nil
+  stop_watch_session(bufnr, "preview")
 
   if preview_image ~= nil then
     clear_image(preview_image.image_id)
@@ -1344,6 +1491,8 @@ M.disable_buf = function(bufnr)
     bufnr = vim.fn.bufnr()
   end
   M._enabled_buffers[bufnr] = nil
+  stop_watch_session(bufnr, "full")
+  stop_watch_session(bufnr, "preview")
   render_buf(bufnr)
 end
 
@@ -1580,6 +1729,15 @@ function M.setup(cfg)
     desc = "refresh cell pixel size on terminal resize",
     callback = function()
       refresh_cell_px_size()
+    end,
+  })
+
+  vim.api.nvim_create_autocmd({ "BufWipeout", "BufUnload" }, {
+    group = augroup,
+    pattern = "*.typ",
+    desc = "stop typst watch sessions for dead buffers",
+    callback = function(ev)
+      stop_watch_sessions_for_buf(ev.buf)
     end,
   })
 end
