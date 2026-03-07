@@ -1,8 +1,8 @@
 --- @class typstconcealer
 local M = {}
 
-local pngData = require('typst-concealer.png-lua')
-local kitty_codes = require('typst-concealer.kitty-codes')
+local kitty_codes = require("typst-concealer.kitty-codes")
+local pngData = require("typst-concealer.png-lua")
 local truecolor = vim.env.COLORTERM == "truecolor" or vim.env.COLORTERM == "24bit"
 -- Just hope there aren't collisions...
 -- This is a poor solution
@@ -10,19 +10,19 @@ local truecolor = vim.env.COLORTERM == "truecolor" or vim.env.COLORTERM == "24bi
 local pid = vim.fn.getpid() % 256
 local full_pid = vim.fn.getpid()
 
-local ffi = require('ffi')
-ffi.cdef[[
+local ffi = require("ffi")
+ffi.cdef([[
   typedef struct { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; } winsize_t;
   int ioctl(int fd, unsigned long request, ...);
-]]
-local TIOCGWINSZ = vim.fn.has('mac') == 1 and 0x40087468 or 0x5413
+]])
+local TIOCGWINSZ = vim.fn.has("mac") == 1 and 0x40087468 or 0x5413
 local _cell_px_w, _cell_px_h
 --- PPI computed so that 1 typst text line ≈ 1 terminal cell height (1:1 pixel mapping).
 --- nil until refresh_cell_px_size() is called after M.setup().
 local _render_ppi
 
 local function refresh_cell_px_size()
-  local ws = ffi.new('winsize_t')
+  local ws = ffi.new("winsize_t")
   if ffi.C.ioctl(1, TIOCGWINSZ, ws) == 0 and ws.ws_xpixel > 0 and ws.ws_col > 0 then
     _cell_px_w = ws.ws_xpixel / ws.ws_col
     _cell_px_h = ws.ws_ypixel / ws.ws_row
@@ -57,30 +57,50 @@ local is_tmux = vim.env.TMUX ~= nil
 local function setup_prelude()
   if M.config.styling_type == "colorscheme" then
     local color = M.config.color
-    if (color == nil) then
+    if color == nil then
       color = string.format('rgb("#%06X")', vim.api.nvim_get_hl(0, { name = "Normal" })["fg"])
     end
     -- FIXME: lists everything. agony. hope https://github.com/typst/typst/issues/3356 is resolved.
-    M._styling_prelude = '' ..
-        '#set page(width: auto, height: auto, margin: (x: 0pt, y: 0pt), fill: none)\n' ..
-        '#set text(' .. color .. ', top-edge: "ascender", bottom-edge: "descender")\n' ..
-        '#set line(stroke: ' .. color .. ')\n' ..
-        '#set table(stroke: ' .. color .. ')\n' ..
-        '#set circle(stroke: ' .. color .. ')\n' ..
-        '#set ellipse(stroke: ' .. color .. ')\n' ..
-        '#set line(stroke: ' .. color .. ')\n' ..
-        '#set path(stroke: ' .. color .. ')\n' ..
-        '#set polygon(stroke: ' .. color .. ')\n' ..
-        '#set rect(stroke: ' .. color .. ')\n' ..
-        '#set square(stroke: ' .. color .. ')\n' ..
-        ''
+    M._styling_prelude = ""
+      .. "#set page(width: auto, height: auto, margin: (x: 0pt, y: 0pt), fill: none)\n"
+      .. "#set text("
+      .. color
+      .. ', top-edge: "ascender", bottom-edge: "descender")\n'
+      .. "#set line(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set table(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set circle(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set ellipse(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set line(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set path(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set polygon(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set rect(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set square(stroke: "
+      .. color
+      .. ")\n"
+      .. ""
   elseif M.config.styling_type == "simple" then
-    M._styling_prelude = '' ..
-        '#set page(width: auto, height: auto, margin: 0.75pt)\n' ..
-        '#set text(top-edge: "ascender", bottom-edge: "descender")\n' ..
-        ''
+    M._styling_prelude = ""
+      .. "#set page(width: auto, height: auto, margin: 0.75pt)\n"
+      .. '#set text(top-edge: "ascender", bottom-edge: "descender")\n'
+      .. ""
   elseif M.config.styling_type == "none" then
-    M._styling_prelude = ''
+    M._styling_prelude = ""
   end
   --M._styling_prelude = M._styling_prelude .. "#let NVIM_TYPST_CONCEALER = true\n"
 end
@@ -91,7 +111,9 @@ end
 --- @param default_val T
 --- @return T
 local function default(val, default_val)
-  if val == nil then return default_val end
+  if val == nil then
+    return default_val
+  end
   return val
 end
 
@@ -133,19 +155,62 @@ end
 local multiline_marks = {}
 --- @type { [integer]: integer }
 local image_id_to_extmark = {}
+--- @type { [integer]: boolean }
+--- Tracks which image_ids correspond to block-level (display) formulas that
+--- should be centered and immune to line wrapping.
+local block_formula_ids = {}
+
+--- Checks whether a math/code range is a block-level (display) formula that
+--- occupies its own line(s), as opposed to inline content within a paragraph.
+--- @param range Range4
+--- @param bufnr integer
+--- @param block_type? string treesitter node type ("math" or "code")
+--- @return boolean
+local function is_block_formula(range, bufnr, block_type)
+  local start_row, start_col, end_row, end_col = range[1], range[2], range[3], range[4]
+  -- Multiline formulas are always block-level
+  if end_row > start_row then
+    return true
+  end
+  -- Single-line code expressions (#tag.idea, #var, etc.) are always inline
+  if block_type == "code" then
+    return false
+  end
+  -- Single-line math: block-level if the formula occupies the entire (trimmed) line
+  local line = vim.api.nvim_buf_get_lines(bufnr, start_row, start_row + 1, false)[1] or ""
+  local trimmed = line:match("^%s*(.-)%s*$") or ""
+  local formula_text = line:sub(start_col + 1, end_col)
+  return trimmed == formula_text
+end
+
+--- Returns the number of padding columns to center an image of the given width.
+--- @param natural_cols integer  image width in terminal cells
+--- @return integer padding  number of leading space characters (0 if image >= window)
+local function center_padding(natural_cols)
+  local win_width = vim.api.nvim_win_get_width(0)
+  if natural_cols >= win_width then
+    return 0
+  end
+  return math.floor((win_width - natural_cols) / 2)
+end
 
 --- Places the unicode characters to render a given image id over a range
 --- @param image_id integer
 --- @param range Range4
 --- @param extmark_id? integer|nil
 --- @param concealing? boolean should the text be concealing or non-concealing
+--- @param is_block? boolean whether this is a block-level (display) formula
 --- @return integer
-local function place_image_extmark(image_id, range, extmark_id, concealing)
+local function place_image_extmark(image_id, range, extmark_id, concealing, is_block)
   -- TODO: take bufnr
   local start_row, start_col, end_row, end_col = range[1], range[2], range[3], range[4]
   local height = range_to_height(range)
   --- @type integer
   local new_extmark_id = nil
+
+  if is_block then
+    block_formula_ids[image_id] = true
+  end
 
   if height == 1 then
     if concealing == false then
@@ -155,7 +220,18 @@ local function place_image_extmark(image_id, range, extmark_id, concealing)
         virt_text_pos = "overlay",
         invalidate = true,
         end_col = end_col,
-        end_row = end_row
+        end_row = end_row,
+      })
+    elseif is_block then
+      -- Block-level single-line: use overlay to avoid line wrapping, will be centered later
+      new_extmark_id = vim.api.nvim_buf_set_extmark(0, ns_id, start_row, start_col, {
+        id = extmark_id,
+        virt_text = { { "" } },
+        virt_text_pos = "overlay",
+        conceal = "",
+        invalidate = true,
+        end_col = end_col,
+        end_row = end_row,
       })
     else
       new_extmark_id = vim.api.nvim_buf_set_extmark(0, ns_id, start_row, start_col, {
@@ -165,7 +241,7 @@ local function place_image_extmark(image_id, range, extmark_id, concealing)
         conceal = "",
         invalidate = true,
         end_col = end_col,
-        end_row = end_row
+        end_row = end_row,
       })
     end
   else
@@ -178,7 +254,7 @@ local function place_image_extmark(image_id, range, extmark_id, concealing)
         -- this extmark will never actually have text
         virt_text_pos = "right_align",
         end_col = end_col,
-        end_row = end_row
+        end_row = end_row,
       })
     else
       new_extmark_id = vim.api.nvim_buf_set_extmark(0, ns_id, start_row, start_col, {
@@ -189,7 +265,7 @@ local function place_image_extmark(image_id, range, extmark_id, concealing)
         -- this extmark will never actually have text
         virt_text_pos = "overlay",
         end_col = end_col,
-        end_row = end_row
+        end_row = end_row,
       })
     end
 
@@ -241,11 +317,11 @@ local function update_extmark_text(bufnr, extmark_id, string, skip_hide_check)
         conceal = conceal,
         virt_text_pos = opts.virt_text_pos,
         end_col = #lines[i],
-        end_row = row + i - 1
+        end_row = row + i - 1,
       })
       table.insert(multiline_marks[extmark_id], new_id)
     end
-  elseif opts.virt_text_pos == "inline" then
+  elseif opts.virt_text_pos == "inline" or (opts.virt_text_pos == "overlay" and opts.conceal == "") then
     vim.api.nvim_buf_set_extmark(0, ns_id, row, col, {
       id = extmark_id,
       virt_text = string,
@@ -265,7 +341,7 @@ local function update_extmark_text(bufnr, extmark_id, string, skip_hide_check)
       end_col = opts.end_col,
       end_row = opts.end_row,
       --- @diagnostic disable-next-line nvim type is wrong
-      conceal = opts.conceal
+      conceal = opts.conceal,
     })
   end
 end
@@ -284,17 +360,35 @@ local function conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows,
   -- encode image_id into the foreground color
   vim.api.nvim_set_hl(0, hl_group, { fg = string.format("#%06X", image_id) })
 
+  -- Compute centering padding for block-level formulas
+  local is_block = block_formula_ids[image_id]
+  local pad = is_block and center_padding(natural_cols) or 0
+  local pad_str = pad > 0 and string.rep(" ", pad) or nil
+
   local function make_row(i)
     local line = ""
     for j = 0, natural_cols - 1 do
       line = line .. kitty_codes.placeholder .. kitty_codes.diacritics[i] .. kitty_codes.diacritics[j + 1]
     end
+    if pad_str then
+      return { pad_str, "" }, { line, hl_group }
+    end
     return { line, hl_group }
+  end
+
+  --- Wraps make_row result into a proper virt_text list (table of chunks).
+  --- make_row returns either 1 chunk (inline) or 2 chunks (padding + image).
+  local function make_row_list(i)
+    local a, b = make_row(i)
+    if b then
+      return { a, b }
+    end
+    return { a }
   end
 
   if multiline_extmark_ids == nil then
     -- Normal single-row case (natural_rows == 1). Forced to 1 if source_rows == 1.
-    update_extmark_text(bufnr, extmark_id, { make_row(1) })
+    update_extmark_text(bufnr, extmark_id, make_row_list(1))
   else
     -- Multiline block case
     local lines = {}
@@ -305,21 +399,33 @@ local function conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows,
         local image_row = i - above_blank
         if image_row < 1 or image_row > natural_rows then
           lines[i] = { { "", hl_group } }
-        elseif image_row >= #(kitty_codes.diacritics) then
-          lines[i] = { { "This image attempted to render taller than " ..
-              #(kitty_codes.diacritics) .. " lines. If you legitimately see this in a real document, open an issue.", hl_group } }
+        elseif image_row >= #kitty_codes.diacritics then
+          lines[i] = {
+            {
+              "This image attempted to render taller than "
+                .. #kitty_codes.diacritics
+                .. " lines. If you legitimately see this in a real document, open an issue.",
+              hl_group,
+            },
+          }
         else
-          lines[i] = { make_row(image_row) }
+          lines[i] = make_row_list(image_row)
         end
       end
     else
       -- natural_rows >= source_rows: render source_rows rows of the image
       for i = 1, source_rows do
-        if i >= #(kitty_codes.diacritics) then
-          lines[i] = { { "This image attempted to render taller than " ..
-              #(kitty_codes.diacritics) .. " lines. If you legitimately see this in a real document, open an issue.", hl_group } }
+        if i >= #kitty_codes.diacritics then
+          lines[i] = {
+            {
+              "This image attempted to render taller than "
+                .. #kitty_codes.diacritics
+                .. " lines. If you legitimately see this in a real document, open an issue.",
+              hl_group,
+            },
+          }
         else
-          lines[i] = { make_row(i) }
+          lines[i] = make_row_list(i)
         end
       end
     end
@@ -376,7 +482,6 @@ local function clear_image(image_id)
   image_ids_in_use[image_id] = nil
 end
 
-
 --- Generates a filename for a given image id and buffer
 --- @param id integer
 --- @param bufnr integer
@@ -385,151 +490,137 @@ local function typst_file_path(id, bufnr)
   return "/tmp/tty-graphics-protocol-typst-concealer-" .. full_pid .. "-" .. bufnr .. "-" .. id .. ".png"
 end
 
+--- Generates the output path template for a batch compile job
+--- @param batch_id integer
+--- @param bufnr integer
+--- @return string template, string prefix
+local function batch_output_template(batch_id, bufnr)
+  local prefix = "/tmp/tty-graphics-protocol-typst-concealer-" .. full_pid .. "-" .. bufnr .. "-batch-" .. batch_id
+  return prefix .. "-{p}.png", prefix
+end
+
+--- Generates the path for the temporary typst input file for a batch job.
+--- The file is placed in the same directory as the buffer's source file so that
+--- relative #import / #include / image paths resolve correctly.
+--- @param batch_id integer
+--- @param bufnr integer
+--- @return string
+local function batch_input_path(batch_id, bufnr)
+  local buf_file = vim.api.nvim_buf_get_name(bufnr)
+  local dir = vim.fn.fnamemodify(buf_file, ":h")
+  return dir .. "/.typst-concealer-" .. full_pid .. "-" .. bufnr .. "-batch-" .. batch_id .. ".typ"
+end
+
 --- @type vim.Diagnostic[]
 local diagnostics = {}
---- @type integer
-local remaining_images = 0
 
-
---- @param status_code integer
---- @param stderr uv_pipe_t
---- @param original_range Range4 This range may be out of date by this point, but it is good enough for diagnostics
---- @param image_id integer
---- @param bufnr integer
---- @param extmark_id integer
---- @param is_live_preview boolean
-local function on_typst_exit(status_code, stderr, original_range, image_id, bufnr, extmark_id, is_live_preview)
-  if not stderr:is_closing() then
-    stderr:shutdown()
+--- Builds a { prefix, suffix } pair that wraps formula content in a sizing context block.
+--- Using an explicit `#context { let __it = ..content..; ... block(...) }` instead of
+--- `#show: __it => context { ... }` avoids the "pagebreaks not allowed inside containers"
+--- error that the show-rule approach causes in batch (multi-page) documents.
+--- @param source_rows integer
+--- @return string prefix, string suffix   both "" when cell size is unknown
+local function make_sizing_wrap(source_rows)
+  if _cell_px_h and _cell_px_w then
+    local baseline_pt = M.config.math_baseline_pt
+    local cell_w_pt = baseline_pt * (_cell_px_w / _cell_px_h)
+    if source_rows == 1 then
+      return string.format("#context { let __it = [", baseline_pt, cell_w_pt),
+        string.format(
+          "]; let __d = measure(__it); let __mh = %gpt; let __mw = %gpt; let __rows = __d.height / __mh; let __cols = calc.max(1, calc.ceil(__d.width / __mw - 0.001)); let __tw = __cols * __mw; if __rows <= 1.5 { block(width: __tw, height: __mh, clip: true, align(horizon, __it)) } else { let __r = calc.max(1, calc.ceil(__rows - 0.001)); block(width: __tw, height: __r * __mh, align(horizon, __it)) } }\n",
+          baseline_pt,
+          cell_w_pt
+        )
+    else
+      return string.format("#context { let __it = [", baseline_pt, cell_w_pt),
+        string.format(
+          "]; let __d = measure(__it); let __mh = %gpt; let __mw = %gpt; let __rows = calc.max(1, calc.ceil(__d.height / __mh - 0.001)); let __cols = calc.max(1, calc.ceil(__d.width / __mw - 0.001)); let __th = __rows * __mh; let __tw = __cols * __mw; block(width: __tw, height: __th, align(horizon, __it)) }\n",
+          baseline_pt,
+          cell_w_pt
+        )
+    end
+  elseif _cell_px_h then
+    local baseline_pt = M.config.math_baseline_pt
+    if source_rows == 1 then
+      return "#context { let __it = [",
+        string.format(
+          "]; let __d = measure(__it); let __mh = %gpt; let __rows = __d.height / __mh; if __rows <= 1.5 { block(width: __d.width, height: __mh, clip: true, align(horizon, __it)) } else { let __r = calc.max(1, calc.ceil(__rows - 0.001)); block(width: __d.width, height: __r * __mh, align(horizon, __it)) } }\n",
+          baseline_pt
+        )
+    else
+      return "#context { let __it = [",
+        string.format(
+          "]; let __d = measure(__it); let __mh = %gpt; let __rows = calc.max(1, calc.ceil(__d.height / __mh - 0.001)); let __th = __rows * __mh; block(width: __d.width, height: __th, align(horizon, __it)) }\n",
+          baseline_pt
+        )
+    end
   end
-  local err_bucket = {}
-  stderr:read_start(function(err, data)
-    if err then
-      error(err)
-    end
-    if data then
-      err_bucket[#err_bucket + 1] = data
-    else
-      stderr:close()
-    end
-  end)
-
-  local check = assert(vim.uv.new_check())
-  check:start(function()
-    if not stderr:is_closing() then
-      return
-    end
-    check:stop()
-    check:close()
-
-    local err = table.concat(err_bucket)
-    local diagnostic = nil
-    if status_code ~= 0 and err ~= "" then
-      diagnostic = {
-        bufnr = bufnr,
-        lnum = original_range[1],
-        col = original_range[2],
-        end_lnum = original_range[3],
-        end_col = original_range[4],
-        message = err,
-        severity = "ERROR",
-        namespace = ns_id,
-        source = "typst-concealer"
-      }
-      vim.schedule(function()
-        vim.api.nvim_buf_del_extmark(bufnr, ns_id, extmark_id)
-        local ids = multiline_marks[extmark_id]
-        if ids then
-          for _, id in ipairs(ids) do
-            vim.api.nvim_buf_del_extmark(bufnr, ns_id2, id)
-          end
-        end
-      end)
-    else
-      local path = typst_file_path(image_id, bufnr)
-      vim.schedule(function()
-        local source_rows = range_to_height(original_range)
-        local success, data = pcall(pngData, path)
-        if success == false then
-          -- the image file doesn't exist (or is invalid in some way)
-          -- this is likely just the tempfile being deleted by kitty
-          -- because we've already deleted this image before it was rendered
-          -- this is okay.
-          return
-        end
-
-        local natural_rows, natural_cols
-        if _cell_px_w and _cell_px_h then
-          -- _render_ppi is calibrated so that a standard math line renders at exactly
-          -- _cell_px_h pixels, giving clean integer natural_rows for all formulas.
-          natural_rows = math.max(1, math.floor(data.height / _cell_px_h + 0.5))
-          natural_cols = math.max(1, math.floor(data.width  / _cell_px_w + 0.5))
-        else
-          -- fallback: old behaviour
-          natural_rows = source_rows
-          natural_cols = math.ceil((data.width / data.height) * 2) * source_rows
-        end
-
-        -- MUST FORCE inline formulas to exactly 1 row to prevent virt_lines tearing
-        -- When a formula has subscripts/superscripts, Typst renders it taller than a single line.
-        -- If we try to split an INLINE formula into multiple lines using Neovim's virt_lines, 
-        -- it shatters the paragraph layout completely. 
-        -- Instead, we force 1 row and proportionally calculate the natural_cols. Kitty will neatly scale it.
-        if source_rows == 1 and natural_rows > 1 then
-          if _cell_px_w and _cell_px_h then
-            local aspect = data.width / data.height
-            local target_px_w = _cell_px_h * aspect
-            natural_cols = math.max(1, math.floor(target_px_w / _cell_px_w + 0.5))
-          else
-            local aspect = data.width / data.height
-            natural_cols = math.max(1, math.floor(aspect * 2))
-          end
-          natural_rows = 1
-        end
-
-        if natural_cols >= #(kitty_codes.diacritics) then
-          -- Cap only to prevent index-out-of-bounds in the diacritics table.
-          natural_cols = #(kitty_codes.diacritics) - 1
-        end
-
-        create_image(path, image_id, natural_cols, natural_rows)
-        conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, source_rows)
-      end)
-    end
-    if (M.config.do_diagnostics) then
-      if not is_live_preview then
-        remaining_images = remaining_images - 1
-        diagnostics[#diagnostics + 1] = diagnostic
-        if remaining_images == 0 then
-          vim.schedule(function()
-            vim.diagnostic.set(ns_id, bufnr, diagnostics)
-          end)
-        end
-      else
-        vim.schedule(function()
-          local temp = vim.deepcopy(diagnostics, true)
-          temp[#temp + 1] = diagnostic
-          vim.diagnostic.set(ns_id, bufnr, temp, { update_in_insert = true })
-        end)
-      end
-    end
-  end)
+  return "", ""
 end
+
+--- Handles one rendered page after a batch compile finishes.
+--- @param bufnr integer
+--- @param page_path string path to the PNG file
+--- @param image_id integer
+--- @param extmark_id integer
+--- @param original_range Range4
+local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original_range)
+  local source_rows = range_to_height(original_range)
+  local success, data = pcall(pngData, page_path)
+  if not success then
+    return
+  end
+
+  local natural_rows, natural_cols
+  if _cell_px_w and _cell_px_h then
+    natural_rows = math.max(1, math.floor(data.height / _cell_px_h + 0.5))
+    natural_cols = math.max(1, math.floor(data.width / _cell_px_w + 0.5))
+  else
+    natural_rows = source_rows
+    natural_cols = math.ceil((data.width / data.height) * 2) * source_rows
+  end
+
+  if source_rows == 1 and natural_rows > 1 then
+    if _cell_px_w and _cell_px_h then
+      local aspect = data.width / data.height
+      natural_cols = math.max(1, math.floor(_cell_px_h * aspect / _cell_px_w + 0.5))
+    else
+      natural_cols = math.max(1, math.floor((data.width / data.height) * 2))
+    end
+    natural_rows = 1
+  end
+
+  if natural_cols >= #kitty_codes.diacritics then
+    natural_cols = #kitty_codes.diacritics - 1
+  end
+
+  create_image(page_path, image_id, natural_cols, natural_rows)
+  conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, source_rows)
+end
+
+--- @type integer
+local _batch_id_counter = 0
 
 -- Track live preview compiler to prevent process leak and spam during rapid typing
 local live_compiler_handle = nil
 
+--- Compile a list of formulas in a single typst process.
+--- Each formula becomes one page in the output document.
+---
 --- @param bufnr integer
---- @param image_id integer
---- @param orignal_range Range4 range which is safe to use for diagnostics only
---- @param str string typst text to render
---- @param extmark_id integer
---- @param prelude_count integer how far into the list of runtime_preludes should we add to the string
+--- @param items { image_id: integer, extmark_id: integer, range: Range4, str: string, prelude_count: integer }[]
 --- @param is_live_preview boolean
-local function compile_image(bufnr, image_id, orignal_range, str, extmark_id, prelude_count, is_live_preview)
-  local path = typst_file_path(image_id, bufnr)
+local function compile_batch(bufnr, items, is_live_preview)
+  if #items == 0 then
+    return
+  end
 
-  local stdin = vim.uv.new_pipe()
+  _batch_id_counter = _batch_id_counter + 1
+  local batch_id = _batch_id_counter
+  local template, prefix = batch_output_template(batch_id, bufnr)
+
+  local input_path = batch_input_path(batch_id, bufnr)
+
   local stdout = vim.uv.new_pipe()
   local stderr = vim.uv.new_pipe()
 
@@ -538,9 +629,7 @@ local function compile_image(bufnr, image_id, orignal_range, str, extmark_id, pr
     live_compiler_handle:kill(15) -- SIGTERM
   end
 
-  local args = { "compile", "-", path, "--ppi=" .. (_render_ppi or M.config.ppi) }
-  
-  -- Append user custom compiler arguments
+  local args = { "compile", input_path, template, "--ppi=" .. (_render_ppi or M.config.ppi) }
   if M.config.compiler_args then
     for _, arg in ipairs(M.config.compiler_args) do
       table.insert(args, arg)
@@ -548,89 +637,175 @@ local function compile_image(bufnr, image_id, orignal_range, str, extmark_id, pr
   end
 
   local handle
-  handle = vim.uv.spawn(M.config.typst_location, {
-    stdio = { stdin, stdout, stderr },
-    args = args,
-  }, function(code, signal)
-    -- Important: always close the process handle to prevent fd leak
-    if handle and not handle:is_closing() then
-      handle:close()
-    end
 
-    if is_live_preview and live_compiler_handle == handle then
-      live_compiler_handle = nil
-    end
+  -- Build the multi-page typst source.
+  -- Each page = one formula, wrapped in a fresh scope to reset show rules.
+  -- The global header and styling prelude appear once at the top.
+  local doc = {}
 
-    -- If this process was superseded by a newer live compilation, gracefully ignore
-    if signal == 15 or signal == 9 then
-      if stderr and not stderr:is_closing() then stderr:close() end
+  if M.config.header and M.config.header ~= "" then
+    doc[#doc + 1] = M.config.header .. "\n"
+  end
+  doc[#doc + 1] = M._styling_prelude
+
+  for idx, item in ipairs(items) do
+    if idx > 1 then
+      doc[#doc + 1] = "#pagebreak()\n"
+    end
+    -- Emit runtime preludes accumulated up to this formula's position
+    -- (re-emitted per page so each page is self-contained).
+    for i = 1, item.prelude_count do
+      doc[#doc + 1] = runtime_preludes[i]
+    end
+    -- Wrap formula in a sizing context block (prefix...content...suffix).
+    -- This avoids `#show:` which would create a container and disallow #pagebreak().
+    local source_rows = item.range[3] - item.range[1] + 1
+    local wrap_prefix, wrap_suffix = make_sizing_wrap(source_rows)
+    if wrap_prefix ~= "" then
+      doc[#doc + 1] = wrap_prefix
+    end
+    -- Formula content
+    local str = item.str
+    if type(str) == "table" then
+      for _, s in ipairs(str) do
+        doc[#doc + 1] = s
+      end
+    else
+      doc[#doc + 1] = str
+    end
+    if wrap_suffix ~= "" then
+      doc[#doc + 1] = wrap_suffix
+    else
+      doc[#doc + 1] = "\n"
+    end
+  end
+
+  -- Write the document to the temporary input file, then spawn typst.
+  -- Writing to a file in the buffer's directory (rather than piping via stdin)
+  -- allows typst to resolve relative #import / #include / image paths correctly.
+  local doc_str = table.concat(doc)
+  vim.uv.fs_open(input_path, "w", tonumber("644", 8), function(err_open, fd)
+    if err_open or not fd then
       return
     end
+    vim.uv.fs_write(fd, doc_str, 0, function(err_write)
+      vim.uv.fs_close(fd, function() end)
+      if err_write then
+        return
+      end
+      handle = vim.uv.spawn(M.config.typst_location, {
+        stdio = { nil, stdout, stderr },
+        args = args,
+      }, function(code, signal)
+        if handle and not handle:is_closing() then
+          handle:close()
+        end
+        if is_live_preview and live_compiler_handle == handle then
+          live_compiler_handle = nil
+        end
+        vim.uv.fs_unlink(input_path, function() end)
+        if signal == 15 or signal == 9 then
+          if not stderr:is_closing() then
+            stderr:close()
+          end
+          return
+        end
 
-    on_typst_exit(code, stderr, orignal_range, image_id, bufnr, extmark_id, is_live_preview)
+        -- Drain stderr
+        if not stderr:is_closing() then
+          stderr:shutdown()
+        end
+        local err_bucket = {}
+        stderr:read_start(function(err, data)
+          if err then
+            return
+          end
+          if data then
+            err_bucket[#err_bucket + 1] = data
+          else
+            stderr:close()
+          end
+        end)
+
+        local check = assert(vim.uv.new_check())
+        check:start(function()
+          if not stderr:is_closing() then
+            return
+          end
+          check:stop()
+          check:close()
+
+          local err_str = table.concat(err_bucket)
+
+          if code ~= 0 and err_str ~= "" then
+            local new_diags = {}
+            vim.schedule(function()
+              for _, item in ipairs(items) do
+                vim.api.nvim_buf_del_extmark(bufnr, ns_id, item.extmark_id)
+                local ids = multiline_marks[item.extmark_id]
+                if ids then
+                  for _, mid in ipairs(ids) do
+                    vim.api.nvim_buf_del_extmark(bufnr, ns_id2, mid)
+                  end
+                end
+              end
+            end)
+            if M.config.do_diagnostics then
+              for _, item in ipairs(items) do
+                new_diags[#new_diags + 1] = {
+                  bufnr = bufnr,
+                  lnum = item.range[1],
+                  col = item.range[2],
+                  end_lnum = item.range[3],
+                  end_col = item.range[4],
+                  message = err_str,
+                  severity = "ERROR",
+                  namespace = ns_id,
+                  source = "typst-concealer",
+                }
+              end
+              vim.schedule(function()
+                for _, d in ipairs(new_diags) do
+                  diagnostics[#diagnostics + 1] = d
+                end
+                vim.diagnostic.set(ns_id, bufnr, diagnostics)
+              end)
+            end
+          else
+            vim.schedule(function()
+              for i, item in ipairs(items) do
+                local page_path = prefix .. "-" .. i .. ".png"
+                on_page_rendered(bufnr, page_path, item.image_id, item.extmark_id, item.range)
+              end
+            end)
+            if M.config.do_diagnostics then
+              vim.schedule(function()
+                vim.diagnostic.set(ns_id, bufnr, diagnostics)
+              end)
+            end
+          end
+        end)
+      end)
+      if is_live_preview then
+        live_compiler_handle = handle
+      end
+    end)
   end)
-
-  if is_live_preview then
-    live_compiler_handle = handle
-  end
-
-  local final_str = {}
-  
-  -- Inject custom user headers
-  if M.config.header and M.config.header ~= "" then
-    final_str[#final_str + 1] = M.config.header .. "\n"
-  end
-
-  for i = 1, prelude_count, 1 do
-    final_str[#final_str + 1] = runtime_preludes[i]
-  end
-  final_str[#final_str + 1] = M._styling_prelude
-  
-  local source_rows = orignal_range[3] - orignal_range[1] + 1
-  
-  -- Pad image dimensions to integer multiples of the terminal cell size so Kitty never has to
-  -- stretch or squeeze a formula to fit terminal cells. Without this width padding, formulas whose widths
-  -- don't align perfectly with cell widths get scaled down by Kitty, causing inconsistent
-  -- font sizes (e.g. `\alpha \beta` appearing smaller than `\alpha`).
-  -- The show rule centers the content vertically and allocates exact integer cell dimensions.
-  if _cell_px_h and _cell_px_w then
-    local baseline_pt = M.config.math_baseline_pt
-    local cell_w_pt = baseline_pt * (_cell_px_w / _cell_px_h)
-    if source_rows == 1 then
-      final_str[#final_str + 1] = string.format(
-        '#show: __it => context { let __d = measure(__it); let __mh = %gpt; let __mw = %gpt; let __rows = __d.height / __mh; let __cols = calc.max(1, calc.ceil(__d.width / __mw - 0.001)); let __tw = __cols * __mw; if __rows <= 1.5 { block(width: __tw, height: __mh, clip: true, align(horizon, __it)) } else { let __r = calc.max(1, calc.ceil(__rows - 0.001)); block(width: __tw, height: __r * __mh, align(horizon, __it)) } }\n',
-        baseline_pt, cell_w_pt
-      )
-    else
-      final_str[#final_str + 1] = string.format(
-        '#show: __it => context { let __d = measure(__it); let __mh = %gpt; let __mw = %gpt; let __rows = calc.max(1, calc.ceil(__d.height / __mh - 0.001)); let __cols = calc.max(1, calc.ceil(__d.width / __mw - 0.001)); let __th = __rows * __mh; let __tw = __cols * __mw; block(width: __tw, height: __th, align(horizon, __it)) }\n',
-        baseline_pt, cell_w_pt
-      )
-    end
-  elseif _cell_px_h then
-    local baseline_pt = M.config.math_baseline_pt
-    if source_rows == 1 then
-      final_str[#final_str + 1] = string.format(
-        '#show: __it => context { let __d = measure(__it); let __mh = %gpt; let __rows = __d.height / __mh; if __rows <= 1.5 { block(width: __d.width, height: __mh, clip: true, align(horizon, __it)) } else { let __r = calc.max(1, calc.ceil(__rows - 0.001)); block(width: __d.width, height: __r * __mh, align(horizon, __it)) } }\n',
-        baseline_pt
-      )
-    else
-      final_str[#final_str + 1] = string.format(
-        '#show: __it => context { let __d = measure(__it); let __mh = %gpt; let __rows = calc.max(1, calc.ceil(__d.height / __mh - 0.001)); let __th = __rows * __mh; block(width: __d.width, height: __th, align(horizon, __it)) }\n',
-        baseline_pt
-      )
-    end
-  end
-  
-  if type(str) == "table" then
-    for _, s in ipairs(str) do final_str[#final_str + 1] = s end
-  else
-    final_str[#final_str + 1] = str
-  end
-  
-  stdin:write(final_str)
-  stdin:close()
   stdout:close()
+end
+
+--- Compile a single formula (wraps compile_batch for the live preview path).
+--- @param bufnr integer
+--- @param image_id integer
+--- @param original_range Range4
+--- @param str string
+--- @param extmark_id integer
+--- @param prelude_count integer
+--- @param is_live_preview boolean
+local function compile_image(bufnr, image_id, original_range, str, extmark_id, prelude_count, is_live_preview)
+  compile_batch(bufnr, {
+    { image_id = image_id, extmark_id = extmark_id, range = original_range, str = str, prelude_count = prelude_count },
+  }, is_live_preview)
 end
 
 -- FIXME: this is bad. terrible even. fix it.
@@ -663,9 +838,10 @@ local function reset_buf(bufnr)
   multiline_marks = {}
   diagnostics = {}
   runtime_preludes = {}
+  block_formula_ids = {}
 
   for id, image_bufnr in pairs(image_ids_in_use) do
-    if (bufnr == image_bufnr) then
+    if bufnr == image_bufnr then
       clear_image(id)
     end
   end
@@ -690,7 +866,7 @@ local function render_buf(bufnr)
   local parser = vim.treesitter.get_parser(bufnr)
   local tree = parser:parse()[1]:root()
 
-  --- @type { [integer]: { [1]: Range4, [2]: integer } }
+  --- @type { [integer]: { [1]: Range4, [2]: integer, [3]: string } }
   local ranges = {}
   local prev_range = nil
 
@@ -706,12 +882,11 @@ local function render_buf(bufnr)
       goto continue
     end
 
-    if (block_type == "math") then
+    if block_type == "math" then
       local image_id = new_image_id(bufnr)
-      remaining_images = remaining_images + 1
-      ranges[image_id] = { { start_row, start_col, end_row, end_col }, #runtime_preludes }
+      ranges[image_id] = { { start_row, start_col, end_row, end_col }, #runtime_preludes, "math" }
       prev_range = { start_row, start_col, end_row, end_col }
-    elseif (block_type == "code") then
+    elseif block_type == "code" then
       local code_type = match[2][1]:type()
       local call_ident = ""
       if match[1] ~= nil then
@@ -726,29 +901,49 @@ local function render_buf(bufnr)
       -- Special casing would not be useful for trying to render something as closely to how typst would
       -- but instead would be useful for those (me) using typst-concealer as the end goal
       -- Would def be toggleable though
-      if (not vim.list_contains({ "let", "set", "import", "show" }, code_type)) and (not vim.list_contains({ "pagebreak" }, call_ident)) then
+      if
+        (not vim.list_contains({ "let", "set", "import", "show" }, code_type))
+        and (not vim.list_contains({ "pagebreak" }, call_ident))
+      then
         local image_id = new_image_id(bufnr)
-        remaining_images = remaining_images + 1
-        ranges[image_id] = { { start_row, start_col, end_row, end_col }, #runtime_preludes }
+        ranges[image_id] = { { start_row, start_col, end_row, end_col }, #runtime_preludes, "code" }
         prev_range = { start_row, start_col, end_row, end_col }
       end
 
-      if (vim.list_contains({ "let", "set", "import", "show" }, code_type)) then
-        runtime_preludes[#runtime_preludes + 1] = range_to_string({ start_row, start_col, end_row, end_col }, bufnr) ..
-            "\n"
+      if vim.list_contains({ "let", "set", "import", "show" }, code_type) then
+        runtime_preludes[#runtime_preludes + 1] = range_to_string({ start_row, start_col, end_row, end_col }, bufnr)
+          .. "\n"
       end
     end
     ::continue::
   end
 
-  for id, image in pairs(ranges) do
-    local range, prelude_count = image[1], image[2]
-    local extmark_id = place_image_extmark(id, range)
-    local str = range_to_string(range, bufnr)
-    vim.schedule(function()
-      compile_image(bufnr, id, range, str, extmark_id, prelude_count, false)
-    end)
+  -- Collect all items in a stable order (by image_id) for the batch compiler
+  local batch_items = {}
+  -- image_ids_in_use is allocated incrementally so sort by id for page order
+  local sorted_ids = {}
+  for id in pairs(ranges) do
+    sorted_ids[#sorted_ids + 1] = id
   end
+  table.sort(sorted_ids)
+
+  for _, id in ipairs(sorted_ids) do
+    local range, prelude_count, node_type = ranges[id][1], ranges[id][2], ranges[id][3]
+    local block = is_block_formula(range, bufnr, node_type)
+    local extmark_id = place_image_extmark(id, range, nil, nil, block)
+    local str = range_to_string(range, bufnr)
+    batch_items[#batch_items + 1] = {
+      image_id = id,
+      extmark_id = extmark_id,
+      range = range,
+      str = str,
+      prelude_count = prelude_count,
+    }
+  end
+
+  vim.schedule(function()
+    compile_batch(bufnr, batch_items, false)
+  end)
   hide_extmarks_at_cursor()
 end
 
@@ -764,8 +959,7 @@ Currently_hidden_extmark_ids = {}
 ---@param opts vim.api.keyset.extmark_details
 ---@param new_hidden table
 ---@param namespace_id integer
-local function hide_extmark(bufnr, id, row, col, opts, new_hidden, namespace_id)
-end
+local function hide_extmark(bufnr, id, row, col, opts, new_hidden, namespace_id) end
 
 function hide_extmarks_at_cursor()
   local bufnr = vim.fn.bufnr()
@@ -775,20 +969,20 @@ function hide_extmarks_at_cursor()
 
   local mode = vim.api.nvim_get_mode().mode
   -- If we are not concealing in this mode, then don't do any hiding of extmarks
-  if not (M.config.conceal_in_normal and mode:find('n', 1, true) ~= nil) then
+  if not (M.config.conceal_in_normal and mode:find("n", 1, true) ~= nil) then
     local cursor_line = vim.api.nvim_win_get_cursor(0)[1] - 1
-    local range_line = vim.fn.getpos('v')[2] - 1
+    local range_line = vim.fn.getpos("v")[2] - 1
 
     local extmarks
     if range_line > cursor_line then
       extmarks = vim.api.nvim_buf_get_extmarks(bufnr, ns_id, { cursor_line, 0 }, { range_line, -1 }, {
         overlap = true,
-        details = true
+        details = true,
       })
     else
-      extmarks = vim.api.nvim_buf_get_extmarks(bufnr, ns_id, { range_line, 0, }, { cursor_line, -1 }, {
+      extmarks = vim.api.nvim_buf_get_extmarks(bufnr, ns_id, { range_line, 0 }, { cursor_line, -1 }, {
         overlap = true,
-        details = true
+        details = true,
       })
     end
 
@@ -796,7 +990,6 @@ function hide_extmarks_at_cursor()
       local id = extmark[1]
       if multiline_marks[id] ~= nil then
         if new_hidden[id] ~= nil then
-
         elseif Currently_hidden_extmark_ids[id] ~= nil then
           new_hidden[id] = Currently_hidden_extmark_ids[id]
           Currently_hidden_extmark_ids[id] = nil
@@ -880,7 +1073,7 @@ end
 --- @type {image_id: integer, extmark_id: integer} | nil
 preview_image = nil
 
--- Caching for Live Preview 
+-- Caching for Live Preview
 local live_preview_timer = nil
 local last_preview_str = nil
 
@@ -917,7 +1110,7 @@ local function render_live_typst_preview()
     clear_live_typst_preview(bufnr)
     return
   end
-  
+
   local range = { start_row, start_col, end_row, end_col }
   local str = range_to_string(range, bufnr)
 
@@ -935,36 +1128,40 @@ local function render_live_typst_preview()
 
   -- Using debounce technique similar to snacks.image
   live_preview_timer = vim.uv.new_timer()
-  live_preview_timer:start(M.config.live_preview_debounce, 0, vim.schedule_wrap(function()
-    if live_preview_timer then
-      if not live_preview_timer:is_closing() then
-        live_preview_timer:stop()
-        live_preview_timer:close()
-      end
-      live_preview_timer = nil
-    end
-
-    last_preview_str = str
-
-    local prev_extmark = nil
-    if preview_image ~= nil then
-      clear_image(preview_image.image_id)
-      prev_extmark = preview_image.extmark_id
-      if multiline_marks[prev_extmark] ~= nil then
-        for _, id in pairs(multiline_marks[prev_extmark]) do
-          vim.api.nvim_buf_del_extmark(bufnr, ns_id2, id)
+  live_preview_timer:start(
+    M.config.live_preview_debounce,
+    0,
+    vim.schedule_wrap(function()
+      if live_preview_timer then
+        if not live_preview_timer:is_closing() then
+          live_preview_timer:stop()
+          live_preview_timer:close()
         end
-        multiline_marks[prev_extmark] = nil
+        live_preview_timer = nil
       end
-    end
-    
-    local new_preview = {}
-    new_preview.image_id = new_image_id(bufnr)
-    new_preview.extmark_id = place_image_extmark(new_preview.image_id, range, prev_extmark, false)
-    -- TODO: determine prelude_count somehow?
-    compile_image(bufnr, new_preview.image_id, range, str, new_preview.extmark_id, 0, true)
-    preview_image = new_preview
-  end))
+
+      last_preview_str = str
+
+      local prev_extmark = nil
+      if preview_image ~= nil then
+        clear_image(preview_image.image_id)
+        prev_extmark = preview_image.extmark_id
+        if multiline_marks[prev_extmark] ~= nil then
+          for _, id in pairs(multiline_marks[prev_extmark]) do
+            vim.api.nvim_buf_del_extmark(bufnr, ns_id2, id)
+          end
+          multiline_marks[prev_extmark] = nil
+        end
+      end
+
+      local new_preview = {}
+      new_preview.image_id = new_image_id(bufnr)
+      new_preview.extmark_id = place_image_extmark(new_preview.image_id, range, prev_extmark, false)
+      -- TODO: determine prelude_count somehow?
+      compile_image(bufnr, new_preview.image_id, range, str, new_preview.extmark_id, 0, true)
+      preview_image = new_preview
+    end)
+  )
 end
 
 --- @alias concealcursor_modes '' | 'n' | 'v' | 'nv' | 'i' | 'ni' | 'vi' | 'nvi' | 'c' | 'nc' | 'vc' | 'nvc' | 'ic' | 'nic' | 'vic' | 'nvic'
@@ -1042,7 +1239,7 @@ function M.setup(cfg)
   M._setup_ran = true
 
   local config = {
-    typst_location = default(cfg.typst_location, 'typst'),
+    typst_location = default(cfg.typst_location, "typst"),
     do_diagnostics = default(cfg.do_diagnostics, true),
     enabled_by_default = default(cfg.enabled_by_default, true),
     styling_type = default(cfg.styling_type, "colorscheme"),
@@ -1057,8 +1254,11 @@ function M.setup(cfg)
   }
 
   if not vim.list_contains({ "none", "simple", "colorscheme" }, config.styling_type) then
-    error("typst styling_type" ..
-      config.styling_type .. "is not a valid option. Please use 'none', 'simple' or 'colorscheme'")
+    error(
+      "typst styling_type"
+        .. config.styling_type
+        .. "is not a valid option. Please use 'none', 'simple' or 'colorscheme'"
+    )
   end
 
   M.config = config
@@ -1078,14 +1278,17 @@ function M.setup(cfg)
     error("Typst treesitter parser not found, typst-concealer will not work")
   end
 
-  M._typst_query = vim.treesitter.query.parse("typst", [[
+  M._typst_query = vim.treesitter.query.parse(
+    "typst",
+    [[
 [
  (code
   [(_) (call item: (ident) @call_ident)] @code
  )
  (math)
 ] @block
-]])
+]]
+  )
 
   local function init_buf(bufnr)
     vim.opt_local.conceallevel = 2
@@ -1096,7 +1299,6 @@ function M.setup(cfg)
     end
   end
 
-
   if vim.v.vim_did_enter then
     local bufnr = vim.fn.bufnr()
     local str = vim.api.nvim_buf_get_name(bufnr)
@@ -1106,79 +1308,72 @@ function M.setup(cfg)
     end
   end
 
+  vim.api.nvim_create_autocmd("BufEnter", {
+    pattern = "*.typ",
+    group = augroup,
+    desc = "render file on enter",
+    callback = function()
+      render_buf()
+    end,
+  })
 
-  vim.api.nvim_create_autocmd("BufEnter",
-    {
-      pattern = "*.typ",
-      group = augroup,
-      desc = "render file on enter",
-      callback = function()
+  vim.api.nvim_create_autocmd({ "BufNew", "VimEnter" }, {
+    pattern = "*.typ",
+    group = augroup,
+    desc = "enable file on creation if the option is set",
+    --- @param ev autocmd_event
+    callback = function(ev)
+      init_buf(ev.buf)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("BufWritePost", {
+    pattern = "*.typ",
+    group = augroup,
+    desc = "render file on write",
+    callback = function()
+      vim.schedule(function()
         render_buf()
-      end
-    })
+      end)
+    end,
+  })
 
-  vim.api.nvim_create_autocmd({ "BufNew", "VimEnter" },
-    {
-      pattern = "*.typ",
-      group = augroup,
-      desc = "enable file on creation if the option is set",
-      --- @param ev autocmd_event
-      callback = function(ev)
-        init_buf(ev.buf)
-      end
-    })
+  vim.api.nvim_create_autocmd({ "CursorMovedI", "CursorMoved" }, {
+    pattern = "*.typ",
+    group = augroup,
+    desc = "unconceal on line hover",
+    callback = function()
+      hide_extmarks_at_cursor()
+    end,
+  })
 
-  vim.api.nvim_create_autocmd("BufWritePost",
-    {
-      pattern = "*.typ",
-      group = augroup,
-      desc = "render file on write",
-      callback = function()
-        vim.schedule(function()
-          render_buf()
-        end)
-      end
-    })
-
-  vim.api.nvim_create_autocmd({ "CursorMovedI", "CursorMoved" },
-    {
-      pattern = "*.typ",
-      group = augroup,
-      desc = "unconceal on line hover",
-      callback = function()
+  vim.api.nvim_create_autocmd({ "ModeChanged" }, {
+    group = augroup,
+    pattern = "v:*",
+    desc = "unconceal when exiting visual mode, as this changes cursor pos without CursorMoved event",
+    --- @param ev autocmd_event
+    callback = function(ev)
+      local str = vim.api.nvim_buf_get_name(ev.buf)
+      local match = str:match(".*%.typ$")
+      if match ~= nil then
         hide_extmarks_at_cursor()
       end
-    })
+    end,
+  })
 
-  vim.api.nvim_create_autocmd({ "ModeChanged" },
-    {
-      group = augroup,
-      pattern = "v:*",
-      desc = "unconceal when exiting visual mode, as this changes cursor pos without CursorMoved event",
-      --- @param ev autocmd_event
-      callback = function(ev)
-        local str = vim.api.nvim_buf_get_name(ev.buf)
-        local match = str:match(".*%.typ$")
-        if match ~= nil then
-          hide_extmarks_at_cursor()
-        end
+  vim.api.nvim_create_autocmd({ "ModeChanged" }, {
+    group = augroup,
+    pattern = "i:*",
+    desc = "remove preview when exiting insert mode",
+    --- @param ev autocmd_event
+    callback = function(ev)
+      local str = vim.api.nvim_buf_get_name(ev.buf)
+      local match = str:match(".*%.typ$")
+      if match ~= nil then
+        clear_live_typst_preview(ev.buf)
       end
-    })
-
-  vim.api.nvim_create_autocmd({ "ModeChanged" },
-    {
-      group = augroup,
-      pattern = "i:*",
-      desc = "remove preview when exiting insert mode",
-      --- @param ev autocmd_event
-      callback = function(ev)
-        local str = vim.api.nvim_buf_get_name(ev.buf)
-        local match = str:match(".*%.typ$")
-        if match ~= nil then
-          clear_live_typst_preview(ev.buf)
-        end
-      end
-    })
+    end,
+  })
 
   vim.api.nvim_create_autocmd("ModeChanged", {
     group = augroup,
@@ -1191,38 +1386,36 @@ function M.setup(cfg)
       if match ~= nil then
         render_live_typst_preview()
       end
-    end
+    end,
   })
 
-  vim.api.nvim_create_autocmd("CursorMovedI",
-    {
-      pattern = "*.typ",
-      group = augroup,
-      desc = "render live preview on cursor move",
-      callback = function()
-        vim.schedule(function()
-          render_live_typst_preview()
-        end)
-      end
-    })
+  vim.api.nvim_create_autocmd("CursorMovedI", {
+    pattern = "*.typ",
+    group = augroup,
+    desc = "render live preview on cursor move",
+    callback = function()
+      vim.schedule(function()
+        render_live_typst_preview()
+      end)
+    end,
+  })
 
-  if (cfg.color == nil) then
-    vim.api.nvim_create_autocmd("ColorScheme",
-      {
-        group = augroup,
-        desc = "update colour scheme",
-        callback = function()
-          setup_prelude()
-          render_buf(vim.fn.bufnr())
-        end
-      })
+  if cfg.color == nil then
+    vim.api.nvim_create_autocmd("ColorScheme", {
+      group = augroup,
+      desc = "update colour scheme",
+      callback = function()
+        setup_prelude()
+        render_buf(vim.fn.bufnr())
+      end,
+    })
   end
 
   vim.api.nvim_create_autocmd("FileType", {
     pattern = "typst",
     callback = function(ev)
       init_buf(ev.buf)
-    end
+    end,
   })
 
   vim.api.nvim_create_autocmd("VimResized", {
@@ -1230,7 +1423,7 @@ function M.setup(cfg)
     desc = "refresh cell pixel size on terminal resize",
     callback = function()
       refresh_cell_px_size()
-    end
+    end,
   })
 end
 
