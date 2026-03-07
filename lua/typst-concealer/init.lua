@@ -278,7 +278,15 @@ local function place_image_extmark(image_id, range, extmark_id, concealing, is_b
       -- its virt_lines (above = true) appear right where the formula was.
       -- We cannot place it inside the concealed range because Neovim will not render
       -- virt_lines on a concealed line.
+      -- If end_row is the last line of the buffer, append a blank line so end_row+1 exists.
+      -- This blank line is hidden by the conceal_lines extmark above (which covers up to end_row)
+      -- so it is invisible to the user; on `o` the new line is inserted after end_row, pushing
+      -- the blank sentinel down, which keeps the virt_lines anchored correctly.
+      local line_count = vim.api.nvim_buf_line_count(0)
       local vl_row = end_row + 1
+      if vl_row >= line_count then
+        vim.api.nvim_buf_set_lines(0, line_count, line_count, false, { "" })
+      end
       local vl_id = vim.api.nvim_buf_set_extmark(0, ns_id3, vl_row, 0, {
         virt_lines = { { { "", "" } } }, -- placeholder, filled in conceal_for_image_id
         virt_lines_above = true,
@@ -399,25 +407,16 @@ local function conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows,
   local pad = is_block and center_padding(natural_cols) or 0
   local pad_str = pad > 0 and string.rep(" ", pad) or nil
 
-  local function make_row(i)
+  --- Returns a virt_text chunk list for row i of the image.
+  local function make_row_list(i)
     local line = ""
     for j = 0, natural_cols - 1 do
       line = line .. kitty_codes.placeholder .. kitty_codes.diacritics[i] .. kitty_codes.diacritics[j + 1]
     end
     if pad_str then
-      return { pad_str, "" }, { line, hl_group }
+      return { { pad_str, "" }, { line, hl_group } }
     end
-    return { line, hl_group }
-  end
-
-  --- Wraps make_row result into a proper virt_text list (table of chunks).
-  --- make_row returns either 1 chunk (inline) or 2 chunks (padding + image).
-  local function make_row_list(i)
-    local a, b = make_row(i)
-    if b then
-      return { a, b }
-    end
-    return { a }
+    return { { line, hl_group } }
   end
 
   if multiline_extmark_ids == nil then
@@ -1478,6 +1477,17 @@ function M.setup(cfg)
     pattern = "*.typ",
     group = augroup,
     desc = "render file on write",
+    callback = function()
+      vim.schedule(function()
+        render_buf()
+      end)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("TextChanged", {
+    pattern = "*.typ",
+    group = augroup,
+    desc = "re-render on normal-mode text changes (e.g. `o`, `dd`) so block formula anchors stay correct",
     callback = function()
       vim.schedule(function()
         render_buf()
