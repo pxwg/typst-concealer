@@ -719,11 +719,11 @@ end
 --- Updates the text for an existing extmark
 --- @param bufnr integer
 --- @param extmark_id integer
---- @param string any
+--- @param virt_text_data table  virt_text format: { {text, hl_group}, ... } or table of such for multiline
 --- @param skip_hide_check? boolean | nil
-local function update_extmark_text(bufnr, extmark_id, string, skip_hide_check)
+local function update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_check)
   if (skip_hide_check ~= true) and Currently_hidden_extmark_ids[extmark_id] ~= nil then
-    Currently_hidden_extmark_ids[extmark_id] = string
+    Currently_hidden_extmark_ids[extmark_id] = virt_text_data
     return
   end
   local m = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns_id, extmark_id, { details = true })
@@ -755,8 +755,14 @@ local function update_extmark_text(bufnr, extmark_id, string, skip_hide_check)
       if opts.virt_text_pos ~= "right_align" then
         conceal = ""
       end
+      local virt_text_line = virt_text_data[i]
+      -- Ensure virt_text_line is in the correct format: { {text, hl}, ... }
+      if type(virt_text_line) == "string" or (type(virt_text_line) == "table" and type(virt_text_line[1]) == "string") then
+        -- If it's a string or {string, hl}, wrap it
+        virt_text_line = { virt_text_line }
+      end
       local new_id = vim.api.nvim_buf_set_extmark(0, ns_id2, row + i - 1, 0, {
-        virt_text = string[i],
+        virt_text = virt_text_line,
         conceal = conceal,
         virt_text_pos = opts.virt_text_pos,
         end_col = #lines[i],
@@ -767,7 +773,7 @@ local function update_extmark_text(bufnr, extmark_id, string, skip_hide_check)
   elseif opts.virt_text_pos == "inline" or (opts.virt_text_pos == "overlay" and opts.conceal == "") then
     vim.api.nvim_buf_set_extmark(0, ns_id, row, col, {
       id = extmark_id,
-      virt_text = string,
+      virt_text = virt_text_data,
       virt_text_pos = opts.virt_text_pos,
       invalidate = opts.invalidate,
       end_col = opts.end_col,
@@ -778,7 +784,7 @@ local function update_extmark_text(bufnr, extmark_id, string, skip_hide_check)
   else
     vim.api.nvim_buf_set_extmark(0, ns_id, row, col, {
       id = extmark_id,
-      virt_lines = { string },
+      virt_lines = { virt_text_data },
       virt_text_pos = opts.virt_text_pos,
       invalidate = opts.invalidate,
       end_col = opts.end_col,
