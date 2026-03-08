@@ -56,6 +56,7 @@ function M.get_buf_state(bufnr)
         last_mode = nil,
         last_lo = nil,
         last_hi = nil,
+        invalidated = false,
         throttle_timer = nil,
       },
     }

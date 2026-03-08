@@ -259,6 +259,7 @@ function M.render_buf(bufnr)
   state.get_buf_state(bufnr).hover.last_mode = nil
   state.get_buf_state(bufnr).hover.last_lo = nil
   state.get_buf_state(bufnr).hover.last_hi = nil
+  state.get_buf_state(bufnr).hover.invalidated = true
   M.hide_extmarks_at_cursor(bufnr)
 end
 
@@ -356,6 +357,7 @@ function M.hide_extmarks_at_cursor(bufnr)
     bs.hover.last_mode = mode
     bs.hover.last_lo = nil
     bs.hover.last_hi = nil
+    bs.hover.invalidated = false
     return
   end
 
@@ -369,7 +371,7 @@ function M.hide_extmarks_at_cursor(bufnr)
     lo, hi = math.min(cursor_row, vrow), math.max(cursor_row, vrow)
   end
 
-  if bs.hover.last_mode == mode and bs.hover.last_lo == lo and bs.hover.last_hi == hi then
+  if bs.hover.last_mode == mode and bs.hover.last_lo == lo and bs.hover.last_hi == hi and bs.hover.invalidated then
     return
   end
 
@@ -413,6 +415,7 @@ function M.hide_extmarks_at_cursor(bufnr)
   bs.hover.last_mode = mode
   bs.hover.last_lo = lo
   bs.hover.last_hi = hi
+  bs.hover.invalidated = false
 end
 
 --- Find the outermost math/code block under the cursor.
