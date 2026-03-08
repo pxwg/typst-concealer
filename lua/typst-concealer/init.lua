@@ -117,6 +117,7 @@ end
 M.disable_buf = function(bufnr)
   bufnr = bufnr or vim.fn.bufnr()
   M._enabled_buffers[bufnr] = nil
+  require("typst-concealer.state").clear_hover_timer(bufnr)
   local session = require("typst-concealer.session")
   session.stop_watch_session(bufnr, "full")
   session.stop_watch_session(bufnr, "preview")

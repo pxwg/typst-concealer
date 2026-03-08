@@ -87,6 +87,25 @@ function M.get_item_by_image_id(image_id)
   return M.item_by_image_id[image_id]
 end
 
+--- Stop and release the per-buffer hover throttle timer if it exists.
+--- Safe to call repeatedly.
+--- @param bufnr integer
+function M.clear_hover_timer(bufnr)
+  local bs = M.buffers[bufnr]
+  if bs == nil or bs.hover == nil then
+    return
+  end
+  local timer = bs.hover.throttle_timer
+  if timer == nil then
+    return
+  end
+  if not timer:is_closing() then
+    timer:stop()
+    timer:close()
+  end
+  bs.hover.throttle_timer = nil
+end
+
 --- Release sub-extmarks (ns_id2) attached to extmark_id before reuse or deletion.
 --- @param bufnr integer
 --- @param extmark_id integer

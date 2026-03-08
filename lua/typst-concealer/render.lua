@@ -81,6 +81,7 @@ end
 --- @param bufnr integer
 function M.hard_reset_buf(bufnr)
   local extmark = require("typst-concealer.extmark")
+  state.clear_hover_timer(bufnr)
   local bstate = state.buffer_render_state[bufnr]
   if bstate and bstate.full_items then
     for _, item in ipairs(bstate.full_items) do
@@ -255,6 +256,7 @@ function M.render_buf(bufnr)
   end)
   -- Reset hover guard so hide_extmarks_at_cursor re-evaluates after render
   state.get_buf_state(bufnr).hover.last_cursor_row = nil
+  state.get_buf_state(bufnr).hover.last_mode = nil
   M.hide_extmarks_at_cursor(bufnr)
 end
 

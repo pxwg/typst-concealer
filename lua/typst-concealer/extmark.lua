@@ -247,8 +247,8 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
         end
       end
       bs.multiline_marks[extmark_id] = {}
+      local lines = vim.api.nvim_buf_get_lines(bufnr, row, opts.end_row + 1, false)
       for i = 1, height do
-        local lines = vim.api.nvim_buf_get_lines(bufnr, row, opts.end_row + 1, false)
         local conceal = nil
         if opts.virt_text_pos ~= "right_align" then
           conceal = ""
@@ -264,7 +264,7 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
           virt_text = virt_text_line,
           conceal = conceal,
           virt_text_pos = opts.virt_text_pos,
-          end_col = #lines[i],
+          end_col = #(lines[i] or ""),
           end_row = row + i - 1,
         })
         table.insert(bs.multiline_marks[extmark_id], new_id)
