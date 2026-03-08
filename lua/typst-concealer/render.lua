@@ -257,6 +257,8 @@ function M.render_buf(bufnr)
   -- Reset hover guard so hide_extmarks_at_cursor re-evaluates after render
   state.get_buf_state(bufnr).hover.last_cursor_row = nil
   state.get_buf_state(bufnr).hover.last_mode = nil
+  state.get_buf_state(bufnr).hover.last_lo = nil
+  state.get_buf_state(bufnr).hover.last_hi = nil
   M.hide_extmarks_at_cursor(bufnr)
 end
 
@@ -352,13 +354,12 @@ function M.hide_extmarks_at_cursor(bufnr)
     bs.currently_hidden_extmark_ids = {}
     bs.hover.last_cursor_row = nil -- force re-process on next call
     bs.hover.last_mode = mode
+    bs.hover.last_lo = nil
+    bs.hover.last_hi = nil
     return
   end
 
   local cursor_row = vim.api.nvim_win_get_cursor(0)[1] - 1
-
-  bs.hover.last_cursor_row = cursor_row
-  bs.hover.last_mode = mode
 
   -- Determine row range to unconceal
   local is_visual = mode == "v" or mode == "V" or mode == "\22"
@@ -366,6 +367,10 @@ function M.hide_extmarks_at_cursor(bufnr)
   if is_visual then
     local vrow = vim.fn.getpos("v")[2] - 1
     lo, hi = math.min(cursor_row, vrow), math.max(cursor_row, vrow)
+  end
+
+  if bs.hover.last_mode == mode and bs.hover.last_lo == lo and bs.hover.last_hi == hi then
+    return
   end
 
   -- Collect items to hide from line index (no nvim_buf_get_extmarks call)
@@ -404,6 +409,10 @@ function M.hide_extmarks_at_cursor(bufnr)
   end
 
   bs.currently_hidden_extmark_ids = new_hidden
+  bs.hover.last_cursor_row = cursor_row
+  bs.hover.last_mode = mode
+  bs.hover.last_lo = lo
+  bs.hover.last_hi = hi
 end
 
 --- Find the outermost math/code block under the cursor.

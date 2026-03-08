@@ -276,20 +276,16 @@ function M.setup(cfg)
         require("typst-concealer.render").hide_extmarks_at_cursor(ev.buf)
         return
       end
-      -- Per-buffer throttle: skip if timer already running
+      -- Per-buffer trailing throttle: always process latest cursor position
       local bs = require("typst-concealer.state").get_buf_state(ev.buf)
-      if bs.hover.throttle_timer then
-        return
+      if bs.hover.throttle_timer == nil then
+        bs.hover.throttle_timer = vim.uv.new_timer()
       end
-      bs.hover.throttle_timer = vim.uv.new_timer()
+      bs.hover.throttle_timer:stop()
       bs.hover.throttle_timer:start(
         throttle,
         0,
         vim.schedule_wrap(function()
-          if bs.hover.throttle_timer then
-            bs.hover.throttle_timer:close()
-            bs.hover.throttle_timer = nil
-          end
           require("typst-concealer.render").hide_extmarks_at_cursor(ev.buf)
         end)
       )

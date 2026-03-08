@@ -54,6 +54,8 @@ function M.get_buf_state(bufnr)
       hover = {
         last_cursor_row = nil,
         last_mode = nil,
+        last_lo = nil,
+        last_hi = nil,
         throttle_timer = nil,
       },
     }
