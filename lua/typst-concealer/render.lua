@@ -77,6 +77,7 @@ local function cleanup_item(bufnr, item)
   pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id, item.extmark_id)
   extmark.clear_image(item.image_id)
   state.image_id_to_extmark[item.image_id] = nil
+  state.item_by_image_id[item.image_id]    = nil
 end
 
 --- Full reset of all concealer state for a buffer (called on disable or wipeout).
@@ -99,8 +100,17 @@ function M.hard_reset_buf(bufnr)
   state.Currently_hidden_extmark_ids = {}
   state.multiline_marks              = {}
   state.block_virt_lines_marks       = {}
-  state.extra_items                  = {}
   diagnostics                        = {}
+  -- Remove only entries belonging to this buffer from the shared O(1) index
+  local to_remove = {}
+  for image_id, item in pairs(state.item_by_image_id) do
+    if item.bufnr == bufnr then
+      to_remove[#to_remove + 1] = image_id
+    end
+  end
+  for _, image_id in ipairs(to_remove) do
+    state.item_by_image_id[image_id] = nil
+  end
   state.runtime_preludes             = {}
 
   for id, image_bufnr in pairs(state.image_ids_in_use) do
@@ -209,7 +219,7 @@ function M.render_buf(bufnr)
       ext_id   = extmark.place_render_extmark(image_id, range, nil, nil, sem)
     end
 
-    batch_items[#batch_items + 1] = {
+    local item = {
       bufnr         = bufnr,
       image_id      = image_id,
       extmark_id    = ext_id,
@@ -220,6 +230,8 @@ function M.render_buf(bufnr)
       semantics     = sem,          -- unified: replaces layout_kind/is_block/display_as_block
       needs_swap    = prev_item ~= nil,
     }
+    batch_items[#batch_items + 1]        = item
+    state.item_by_image_id[image_id]     = item
   end
 
   -- Release extmarks/images for items that no longer exist
@@ -423,7 +435,7 @@ function M.clear_live_typst_preview(bufnr)
     pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id, preview_image.extmark_id)
     extmark.clear_image(preview_image.image_id)
     state.image_id_to_extmark[preview_image.image_id] = nil
-    state.extra_items[preview_image.image_id] = nil
+    state.item_by_image_id[preview_image.image_id]    = nil
     preview_image = nil
   end
 end
@@ -483,9 +495,9 @@ function M.render_live_typst_preview()
         ext_id   = extmark.place_render_extmark(image_id, range, nil, false, sem)
       end
 
-      -- Remove old preview item from the extra_items lookup
+      -- Remove old preview item from the O(1) lookup index
       if preview_image then
-        state.extra_items[preview_image.image_id] = nil
+        state.item_by_image_id[preview_image.image_id] = nil
       end
 
       local item = {
@@ -498,8 +510,8 @@ function M.render_live_typst_preview()
         node_type     = "code",
         semantics     = sem,
       }
-      -- Register in extra_items so conceal_for_image_id can find the semantics
-      state.extra_items[image_id] = item
+      -- Register in the O(1) index so conceal_for_image_id can find the semantics
+      state.item_by_image_id[image_id] = item
       session.render_items_via_watch(bufnr, { item }, "preview")
       preview_image = { image_id = image_id, extmark_id = ext_id }
     end)

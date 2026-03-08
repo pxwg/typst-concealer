@@ -12,6 +12,14 @@
 local state = require("typst-concealer.state")
 local M = {}
 
+--- Returns the column width of the window displaying bufnr (falls back to current window).
+--- @param bufnr integer
+--- @return integer
+local function get_win_cols(bufnr)
+  local winid = vim.fn.bufwinid(bufnr)
+  return vim.api.nvim_win_get_width(winid ~= -1 and winid or 0)
+end
+
 --- Returns available window width in Typst points.
 --- Typst page width = 可用宽度（不含终端 padding）; terminal padding is added by extmark layer.
 --- @param bufnr integer
@@ -21,7 +29,7 @@ local function current_window_width_pt(bufnr)
   local baseline_pt = config.math_baseline_pt or 11
   local pad_cols    = config.block_padding_cols or 4
 
-  local win_cols    = vim.api.nvim_win_get_width(0)
+  local win_cols    = get_win_cols(bufnr)
   local usable_cols = math.max(8, win_cols - 2 * pad_cols)
 
   if state._cell_px_w and state._cell_px_h then
@@ -92,15 +100,18 @@ end
 
 --- Flow-block wrapper: Typst page width = available column width (no terminal padding).
 --- Terminal display padding (block_padding_cols) is added separately in the extmark layer.
+--- block_preview_margin_pt is Typst-side inset inside the rendered image (orthogonal to terminal padding).
 --- @param bufnr integer
 --- @return string prefix, string suffix
 function M.make_flow_block_wrap(bufnr)
-  local page_w_pt = current_window_width_pt(bufnr)
+  local config     = require("typst-concealer").config
+  local page_w_pt  = current_window_width_pt(bufnr)
+  local margin_pt  = config.block_preview_margin_pt or 0
   return string.format(
     "#context {\n"
       .. "  set page(width: %gpt, height: auto, margin: (x: 0pt, y: 0pt), fill: none)\n"
-      .. "  block(width: 100%%)[\n",
-    page_w_pt
+      .. "  block(width: 100%%, inset: (x: %gpt, y: 0pt))[\n",
+    page_w_pt, margin_pt
   ), "  ]\n}\n"
 end
 

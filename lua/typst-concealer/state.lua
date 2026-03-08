@@ -47,10 +47,10 @@ M.watch_sessions = {}
 --- @type { [integer]: { full_items?: table[] } }
 M.buffer_render_state = {}
 
---- Items not in full_items (e.g., live-preview items) keyed by image_id.
---- Maintained by render.lua so that get_item_by_image_id can find them.
+--- O(1) flat index: image_id -> item.  Covers both full-render and live-preview items.
+--- Maintained by render.lua (insert on create, delete on cleanup/reset).
 --- @type { [integer]: table }
-M.extra_items = {}
+M.item_by_image_id = {}
 
 --- Prelude strings accumulated during the current render_buf pass
 --- @type string[]
@@ -66,27 +66,11 @@ M._render_ppi = nil
 M.pid = vim.fn.getpid() % 256
 M.full_pid = vim.fn.getpid()
 
---- Scan buffer_render_state (and extra_items) for the item owning image_id.
---- Used to retrieve semantics without separate global tables.
+--- O(1) lookup: return the item owning image_id, or nil.
 --- @param image_id integer
 --- @return table|nil
 function M.get_item_by_image_id(image_id)
-  -- Check extra_items first (covers live-preview items)
-  if M.extra_items[image_id] then
-    return M.extra_items[image_id]
-  end
-  for _, bstate in pairs(M.buffer_render_state) do
-    for _, items in pairs(bstate) do
-      if type(items) == "table" then
-        for _, item in ipairs(items) do
-          if type(item) == "table" and item.image_id == image_id then
-            return item
-          end
-        end
-      end
-    end
-  end
-  return nil
+  return M.item_by_image_id[image_id]
 end
 
 --- Release sub-extmarks (ns_id2 / ns_id3) attached to extmark_id before reuse or deletion.

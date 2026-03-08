@@ -40,11 +40,20 @@ function M.clear_image(image_id)
   state.image_ids_in_use[image_id] = nil
 end
 
+--- Returns the column width of the window displaying bufnr (falls back to current window).
+--- @param bufnr integer
+--- @return integer
+local function get_win_cols(bufnr)
+  local winid = vim.fn.bufwinid(bufnr)
+  return vim.api.nvim_win_get_width(winid ~= -1 and winid or 0)
+end
+
 --- Returns leading spaces needed to centre an image of natural_cols width.
 --- @param natural_cols integer
+--- @param bufnr        integer
 --- @return integer
-local function center_padding(natural_cols)
-  local win_width = vim.api.nvim_win_get_width(0)
+local function center_padding(natural_cols, bufnr)
+  local win_width = get_win_cols(bufnr)
   if natural_cols >= win_width then
     return 0
   end
@@ -279,8 +288,8 @@ function M.conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, sou
       -- block_padding_cols = 终端显示留白（Neovim display 层）
       pad = config.block_padding_cols or 0
     elseif item.semantics.display_kind == "block" then
-      -- Math display (single- or multi-line): centre in window
-      pad = center_padding(natural_cols)
+      -- Math display (single- or multi-line): centre in the buffer's own window
+      pad = center_padding(natural_cols, bufnr)
     end
   end
 
