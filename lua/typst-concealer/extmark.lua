@@ -3,11 +3,11 @@
 --- All display decisions come from semantics.display_kind.
 --- block_padding_cols = 终端显示留白（Neovim display 层，与 Typst page width 正交）
 
-local state      = require("typst-concealer.state")
+local state = require("typst-concealer.state")
 local kitty_codes = require("typst-concealer.kitty-codes")
 local M = {}
 
-local is_tmux    = vim.env.TMUX ~= nil
+local is_tmux = vim.env.TMUX ~= nil
 local vim_stdout = assert(vim.loop.new_tty(1, false))
 
 local function tmux_escape(message)
@@ -205,7 +205,7 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
       end
       mm.tail_ids = {}
 
-      local lines_buf    = vim.api.nvim_buf_get_lines(bufnr, row, opts.end_row + 1, false)
+      local lines_buf = vim.api.nvim_buf_get_lines(bufnr, row, opts.end_row + 1, false)
       local natural_rows = #virt_text_data
 
       local function norm(r)
@@ -222,12 +222,12 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
       end
 
       mm.carrier_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, row, 0, {
-        virt_text     = norm(virt_text_data[1]),
+        virt_text = norm(virt_text_data[1]),
         virt_text_pos = "overlay",
-        conceal       = "",
-        end_col       = #(lines_buf[1] or ""),
-        end_row       = row,
-        virt_lines    = carrier_vl,
+        conceal = "",
+        end_col = #(lines_buf[1] or ""),
+        end_row = row,
+        virt_lines = carrier_vl,
       })
 
       -- Tail conceal: fully hide source rows start_row+1 .. end_row (0 screen lines each)
@@ -235,7 +235,7 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
       for i = 2, source_rows do
         local tid = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, row + i - 1, 0, {
           conceal_lines = "",
-          end_row       = row + i - 1,
+          end_row = row + i - 1,
         })
         table.insert(mm.tail_ids, tid)
       end
@@ -250,46 +250,47 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
       for i = 1, height do
         local lines = vim.api.nvim_buf_get_lines(bufnr, row, opts.end_row + 1, false)
         local conceal = nil
-        if opts.virt_text_pos ~= "right_align" then conceal = "" end
+        if opts.virt_text_pos ~= "right_align" then
+          conceal = ""
+        end
         local virt_text_line = virt_text_data[i]
-        if type(virt_text_line) == "string"
+        if
+          type(virt_text_line) == "string"
           or (type(virt_text_line) == "table" and type(virt_text_line[1]) == "string")
         then
           virt_text_line = { virt_text_line }
         end
         local new_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, row + i - 1, 0, {
-          virt_text     = virt_text_line,
-          conceal       = conceal,
+          virt_text = virt_text_line,
+          conceal = conceal,
           virt_text_pos = opts.virt_text_pos,
-          end_col       = #lines[i],
-          end_row       = row + i - 1,
+          end_col = #lines[i],
+          end_row = row + i - 1,
         })
         table.insert(bs.multiline_marks[extmark_id], new_id)
       end
     end
-  elseif opts.virt_text_pos == "inline"
-    or (opts.virt_text_pos == "overlay" and opts.conceal == "")
-  then
+  elseif opts.virt_text_pos == "inline" or (opts.virt_text_pos == "overlay" and opts.conceal == "") then
     vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
-      id            = extmark_id,
-      virt_text     = virt_text_data,
+      id = extmark_id,
+      virt_text = virt_text_data,
       virt_text_pos = opts.virt_text_pos,
-      invalidate    = opts.invalidate,
-      end_col       = opts.end_col,
-      end_row       = opts.end_row,
+      invalidate = opts.invalidate,
+      end_col = opts.end_col,
+      end_row = opts.end_row,
       --- @diagnostic disable-next-line nvim type is wrong
-      conceal       = "",
+      conceal = "",
     })
   else
     vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
-      id            = extmark_id,
-      virt_lines    = { virt_text_data },
+      id = extmark_id,
+      virt_lines = { virt_text_data },
       virt_text_pos = opts.virt_text_pos,
-      invalidate    = opts.invalidate,
-      end_col       = opts.end_col,
-      end_row       = opts.end_row,
+      invalidate = opts.invalidate,
+      end_col = opts.end_col,
+      end_row = opts.end_row,
       --- @diagnostic disable-next-line nvim type is wrong
-      conceal       = opts.conceal,
+      conceal = opts.conceal,
     })
   end
 end
@@ -305,17 +306,17 @@ end
 --- @param natural_rows integer
 --- @param source_rows  integer
 function M.conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, source_rows)
-  local bs                  = state.get_buf_state(bufnr)
-  local extmark_id          = state.image_id_to_extmark[image_id]
+  local bs = state.get_buf_state(bufnr)
+  local extmark_id = state.image_id_to_extmark[image_id]
   local multiline_extmark_ids = bs.multiline_marks[extmark_id]
 
   local hl_group = "typst-concealer-image-id-" .. tostring(image_id)
   vim.api.nvim_set_hl(0, hl_group, { fg = string.format("#%06X", image_id) })
 
   -- Retrieve semantics from the owning item (replaces block_formula_ids / flow_block_ids)
-  local item   = state.get_item_by_image_id(image_id)
+  local item = state.get_item_by_image_id(image_id)
   local config = require("typst-concealer").config
-  local pad    = 0
+  local pad = 0
   if item and item.semantics then
     if item.semantics.constraint_kind == "flow" then
       -- Multiline code: left padding = terminal display padding
@@ -332,10 +333,7 @@ function M.conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, sou
   local function make_row_list(i)
     local line = ""
     for j = 0, natural_cols - 1 do
-      line = line
-        .. kitty_codes.placeholder
-        .. kitty_codes.diacritics[i]
-        .. kitty_codes.diacritics[j + 1]
+      line = line .. kitty_codes.placeholder .. kitty_codes.diacritics[i] .. kitty_codes.diacritics[j + 1]
     end
     if pad_str then
       return { { pad_str, "" }, { line, hl_group } }

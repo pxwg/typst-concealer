@@ -48,8 +48,8 @@ function M.classify(range, bufnr, node_type)
 
   return {
     constraint_kind = constraint_kind,
-    display_kind    = display_kind,
-    source_kind     = node_type,
+    display_kind = display_kind,
+    source_kind = node_type,
   }
 end
 

@@ -46,15 +46,15 @@ M.buffers = {}
 function M.get_buf_state(bufnr)
   if not M.buffers[bufnr] then
     M.buffers[bufnr] = {
-      preview_image                = nil,
-      live_preview_timer           = nil,
-      last_preview_str             = nil,
+      preview_image = nil,
+      live_preview_timer = nil,
+      last_preview_str = nil,
       currently_hidden_extmark_ids = {},
-      multiline_marks              = {},
+      multiline_marks = {},
       hover = {
         last_cursor_row = nil,
-        last_mode       = nil,
-        throttle_timer  = nil,
+        last_mode = nil,
+        throttle_timer = nil,
       },
     }
   end

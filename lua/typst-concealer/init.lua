@@ -45,15 +45,33 @@ local function setup_prelude()
       .. "#set text("
       .. color
       .. ', top-edge: "ascender", bottom-edge: "descender")\n'
-      .. "#set line(stroke: "   .. color .. ")\n"
-      .. "#set table(stroke: "  .. color .. ")\n"
-      .. "#set circle(stroke: " .. color .. ")\n"
-      .. "#set ellipse(stroke: " .. color .. ")\n"
-      .. "#set line(stroke: "   .. color .. ")\n"
-      .. "#set curve(stroke: "  .. color .. ")\n"
-      .. "#set polygon(stroke: " .. color .. ")\n"
-      .. "#set rect(stroke: "   .. color .. ")\n"
-      .. "#set square(stroke: " .. color .. ")\n"
+      .. "#set line(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set table(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set circle(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set ellipse(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set line(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set curve(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set polygon(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set rect(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set square(stroke: "
+      .. color
+      .. ")\n"
   elseif M.config.styling_type == "simple" then
     M._styling_prelude = ""
       .. "#set page(width: auto, height: auto, margin: 0.75pt)\n"
@@ -82,7 +100,9 @@ end
 --- @field cursor_hover_throttle_ms? number  Throttle delay for CursorMoved hover in ms. Default 0 (disabled).
 
 local function default(val, default_val)
-  if val == nil then return default_val end
+  if val == nil then
+    return default_val
+  end
   return val
 end
 
@@ -133,25 +153,26 @@ function M.setup(cfg)
   M._setup_ran = true
 
   M.config = {
-    typst_location          = default(cfg.typst_location,          "typst"),
-    do_diagnostics          = default(cfg.do_diagnostics,          true),
-    enabled_by_default      = default(cfg.enabled_by_default,      true),
-    styling_type            = default(cfg.styling_type,            "colorscheme"),
-    ppi                     = default(cfg.ppi,                     300),
-    math_baseline_pt        = default(cfg.math_baseline_pt,        11),
-    color                   = cfg.color,
-    conceal_in_normal       = default(cfg.conceal_in_normal,       false),
-    compiler_args           = default(cfg.compiler_args,           {}),
-    header                  = default(cfg.header,                  ""),
-    block_padding_cols      = default(cfg.block_padding_cols,      15),
-    block_preview_margin_pt     = default(cfg.block_preview_margin_pt,     6),
-    live_preview_debounce       = default(cfg.live_preview_debounce,       100),
-    cursor_hover_throttle_ms    = default(cfg.cursor_hover_throttle_ms,    0),
+    typst_location = default(cfg.typst_location, "typst"),
+    do_diagnostics = default(cfg.do_diagnostics, true),
+    enabled_by_default = default(cfg.enabled_by_default, true),
+    styling_type = default(cfg.styling_type, "colorscheme"),
+    ppi = default(cfg.ppi, 300),
+    math_baseline_pt = default(cfg.math_baseline_pt, 11),
+    color = cfg.color,
+    conceal_in_normal = default(cfg.conceal_in_normal, false),
+    compiler_args = default(cfg.compiler_args, {}),
+    header = default(cfg.header, ""),
+    block_padding_cols = default(cfg.block_padding_cols, 15),
+    block_preview_margin_pt = default(cfg.block_preview_margin_pt, 6),
+    live_preview_debounce = default(cfg.live_preview_debounce, 100),
+    cursor_hover_throttle_ms = default(cfg.cursor_hover_throttle_ms, 0),
   }
 
   if not vim.list_contains({ "none", "simple", "colorscheme" }, M.config.styling_type) then
     error(
-      "typst styling_type " .. M.config.styling_type
+      "typst styling_type "
+        .. M.config.styling_type
         .. " is not a valid option. Please use 'none', 'simple' or 'colorscheme'"
     )
   end
@@ -205,24 +226,26 @@ function M.setup(cfg)
 
   vim.api.nvim_create_autocmd("BufEnter", {
     pattern = "*.typ",
-    group   = augroup,
-    desc    = "render file on enter",
+    group = augroup,
+    desc = "render file on enter",
     callback = function(ev)
       require("typst-concealer.render").render_buf(ev.buf)
     end,
   })
 
   vim.api.nvim_create_autocmd({ "BufNew", "VimEnter" }, {
-    pattern  = "*.typ",
-    group    = augroup,
-    desc     = "enable file on creation if the option is set",
-    callback = function(ev) init_buf(ev.buf) end,
+    pattern = "*.typ",
+    group = augroup,
+    desc = "enable file on creation if the option is set",
+    callback = function(ev)
+      init_buf(ev.buf)
+    end,
   })
 
   vim.api.nvim_create_autocmd("BufWritePost", {
-    pattern  = "*.typ",
-    group    = augroup,
-    desc     = "render file on write",
+    pattern = "*.typ",
+    group = augroup,
+    desc = "render file on write",
     callback = function(ev)
       vim.schedule(function()
         require("typst-concealer.render").render_buf(ev.buf)
@@ -231,9 +254,9 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd("TextChanged", {
-    pattern  = "*.typ",
-    group    = augroup,
-    desc     = "re-render on normal-mode text changes so block anchors stay correct",
+    pattern = "*.typ",
+    group = augroup,
+    desc = "re-render on normal-mode text changes so block anchors stay correct",
     callback = function(ev)
       vim.schedule(function()
         require("typst-concealer.render").render_buf(ev.buf)
@@ -242,9 +265,9 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd("CursorMoved", {
-    pattern  = "*.typ",
-    group    = augroup,
-    desc     = "unconceal on line hover",
+    pattern = "*.typ",
+    group = augroup,
+    desc = "unconceal on line hover",
     callback = function(ev)
       local throttle = require("typst-concealer").config.cursor_hover_throttle_ms
       if throttle <= 0 then
@@ -258,20 +281,24 @@ function M.setup(cfg)
         return
       end
       bs.hover.throttle_timer = vim.uv.new_timer()
-      bs.hover.throttle_timer:start(throttle, 0, vim.schedule_wrap(function()
-        if bs.hover.throttle_timer then
-          bs.hover.throttle_timer:close()
-          bs.hover.throttle_timer = nil
-        end
-        require("typst-concealer.render").hide_extmarks_at_cursor(ev.buf)
-      end))
+      bs.hover.throttle_timer:start(
+        throttle,
+        0,
+        vim.schedule_wrap(function()
+          if bs.hover.throttle_timer then
+            bs.hover.throttle_timer:close()
+            bs.hover.throttle_timer = nil
+          end
+          require("typst-concealer.render").hide_extmarks_at_cursor(ev.buf)
+        end)
+      )
     end,
   })
 
   vim.api.nvim_create_autocmd({ "ModeChanged" }, {
-    group    = augroup,
-    pattern  = "v:*",
-    desc     = "unconceal when exiting visual mode (no CursorMoved event fires)",
+    group = augroup,
+    pattern = "v:*",
+    desc = "unconceal when exiting visual mode (no CursorMoved event fires)",
     callback = function(ev)
       if vim.api.nvim_buf_get_name(ev.buf):match(".*%.typ$") then
         require("typst-concealer.render").hide_extmarks_at_cursor(ev.buf)
@@ -280,9 +307,9 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd({ "ModeChanged" }, {
-    group    = augroup,
-    pattern  = "i:*",
-    desc     = "remove preview when exiting insert mode",
+    group = augroup,
+    pattern = "i:*",
+    desc = "remove preview when exiting insert mode",
     callback = function(ev)
       if vim.api.nvim_buf_get_name(ev.buf):match(".*%.typ$") then
         require("typst-concealer.render").clear_live_typst_preview(ev.buf)
@@ -291,9 +318,9 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd("ModeChanged", {
-    group    = augroup,
-    desc     = "render live preview on insert enter",
-    pattern  = "*:i",
+    group = augroup,
+    desc = "render live preview on insert enter",
+    pattern = "*:i",
     callback = function(ev)
       if vim.api.nvim_buf_get_name(ev.buf):match(".*%.typ$") then
         require("typst-concealer.render").render_live_typst_preview(ev.buf)
@@ -302,9 +329,9 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd("TextChangedI", {
-    pattern  = "*.typ",
-    group    = augroup,
-    desc     = "render live preview when insert-mode text changes",
+    pattern = "*.typ",
+    group = augroup,
+    desc = "render live preview when insert-mode text changes",
     callback = function(ev)
       vim.schedule(function()
         require("typst-concealer.render").render_live_typst_preview(ev.buf)
@@ -314,8 +341,8 @@ function M.setup(cfg)
 
   if cfg.color == nil then
     vim.api.nvim_create_autocmd("ColorScheme", {
-      group    = augroup,
-      desc     = "update colour scheme",
+      group = augroup,
+      desc = "update colour scheme",
       callback = function()
         setup_prelude()
         local render = require("typst-concealer.render")
@@ -327,35 +354,39 @@ function M.setup(cfg)
   end
 
   vim.api.nvim_create_autocmd("FileType", {
-    pattern  = "typst",
-    callback = function(ev) init_buf(ev.buf) end,
+    pattern = "typst",
+    callback = function(ev)
+      init_buf(ev.buf)
+    end,
   })
 
   vim.api.nvim_create_autocmd("VimResized", {
-    group    = augroup,
-    desc     = "refresh cell pixel size on terminal resize",
+    group = augroup,
+    desc = "refresh cell pixel size on terminal resize",
     callback = function()
       refresh_cell_px_size()
       local render = require("typst-concealer.render")
       for bufnr in pairs(M._enabled_buffers) do
-        vim.schedule(function() render.render_buf(bufnr) end)
+        vim.schedule(function()
+          render.render_buf(bufnr)
+        end)
       end
     end,
   })
 
   vim.api.nvim_create_autocmd({ "BufLeave" }, {
-    pattern  = "*.typ",
-    group    = augroup,
-    desc     = "clear live preview when leaving a typst buffer",
+    pattern = "*.typ",
+    group = augroup,
+    desc = "clear live preview when leaving a typst buffer",
     callback = function(ev)
       require("typst-concealer.render").clear_live_typst_preview(ev.buf)
     end,
   })
 
   vim.api.nvim_create_autocmd({ "BufWipeout", "BufUnload" }, {
-    group    = augroup,
-    pattern  = "*.typ",
-    desc     = "stop typst watch sessions for dead buffers",
+    group = augroup,
+    pattern = "*.typ",
+    desc = "stop typst watch sessions for dead buffers",
     callback = function(ev)
       local session = require("typst-concealer.session")
       session.stop_watch_sessions_for_buf(ev.buf)

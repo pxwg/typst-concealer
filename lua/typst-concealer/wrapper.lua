@@ -27,9 +27,9 @@ end
 local function current_window_width_pt(bufnr)
   local config = require("typst-concealer").config
   local baseline_pt = config.math_baseline_pt or 11
-  local pad_cols    = config.block_padding_cols or 4
+  local pad_cols = config.block_padding_cols or 4
 
-  local win_cols    = get_win_cols(bufnr)
+  local win_cols = get_win_cols(bufnr)
   local usable_cols = math.max(8, win_cols - 2 * pad_cols)
 
   if state._cell_px_w and state._cell_px_h then
@@ -48,7 +48,7 @@ function M.make_inline_sizing_wrap(source_rows)
   local config = require("typst-concealer").config
   if state._cell_px_h and state._cell_px_w then
     local baseline_pt = config.math_baseline_pt
-    local cell_w_pt   = baseline_pt * (state._cell_px_w / state._cell_px_h)
+    local cell_w_pt = baseline_pt * (state._cell_px_w / state._cell_px_h)
     if source_rows == 1 then
       return "#context { let __it = [",
         string.format(
@@ -59,7 +59,8 @@ function M.make_inline_sizing_wrap(source_rows)
             .. " if __rows <= 1.5 { block(width: __tw, height: __mh, clip: true, align(horizon, __it)) }"
             .. " else { let __r = calc.max(1, calc.ceil(__rows - 0.001));"
             .. " block(width: __tw, height: __r * __mh, align(horizon, __it)) } }\n",
-          baseline_pt, cell_w_pt
+          baseline_pt,
+          cell_w_pt
         )
     else
       return "#context { let __it = [",
@@ -69,7 +70,8 @@ function M.make_inline_sizing_wrap(source_rows)
             .. " let __cols = calc.max(1, calc.ceil(__d.width / __mw - 0.001));"
             .. " let __th = __rows * __mh; let __tw = __cols * __mw;"
             .. " block(width: __tw, height: __th, align(horizon, __it)) }\n",
-          baseline_pt, cell_w_pt
+          baseline_pt,
+          cell_w_pt
         )
     end
   elseif state._cell_px_h then
@@ -104,15 +106,17 @@ end
 --- @param bufnr integer
 --- @return string prefix, string suffix
 function M.make_flow_block_wrap(bufnr)
-  local config     = require("typst-concealer").config
-  local page_w_pt  = current_window_width_pt(bufnr)
-  local margin_pt  = config.block_preview_margin_pt or 0
+  local config = require("typst-concealer").config
+  local page_w_pt = current_window_width_pt(bufnr)
+  local margin_pt = config.block_preview_margin_pt or 0
   return string.format(
     "#context {\n"
       .. "  set page(width: %gpt, height: auto, margin: (x: 0pt, y: 0pt), fill: none)\n"
       .. "  block(width: 100%%, inset: (x: %gpt, y: 0pt))[\n",
-    page_w_pt, margin_pt
-  ), "  ]\n}\n"
+    page_w_pt,
+    margin_pt
+  ),
+    "  ]\n}\n"
 end
 
 --- Wrapper dispatch: wrapper choice comes only from semantics.constraint_kind.
@@ -131,9 +135,9 @@ end
 --- @param items table[]
 --- @return string
 function M.build_batch_document(items)
-  local main   = require("typst-concealer")
-  local config  = main.config
-  local doc     = {}
+  local main = require("typst-concealer")
+  local config = main.config
+  local doc = {}
 
   if config.header and config.header ~= "" then
     doc[#doc + 1] = config.header .. "\n"

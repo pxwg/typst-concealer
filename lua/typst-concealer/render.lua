@@ -3,9 +3,9 @@
 --- (render_live_typst_preview).  Both paths share semantics.classify() and the
 --- same extmark/session infrastructure.
 
-local state        = require("typst-concealer.state")
+local state = require("typst-concealer.state")
 local semantics_mod = require("typst-concealer.semantics")
-local M            = {}
+local M = {}
 
 local diagnostics = {}
 
@@ -31,7 +31,7 @@ end
 --- @return boolean
 local function range_contains(parent_range, child_range)
   local _, _, end_row1, end_col1 = parent_range[1], parent_range[2], parent_range[3], parent_range[4]
-  local _, _, end_row2, end_col2 = child_range[1],  child_range[2],  child_range[3],  child_range[4]
+  local _, _, end_row2, end_col2 = child_range[1], child_range[2], child_range[3], child_range[4]
   return end_row1 > end_row2 or (end_row1 == end_row2 and end_col1 >= end_col2)
 end
 
@@ -66,20 +66,22 @@ end
 --- @param bufnr   integer
 --- @param item    table|nil
 local function cleanup_item(bufnr, item)
-  if item == nil then return end
+  if item == nil then
+    return
+  end
   local extmark = require("typst-concealer.extmark")
   state.prepare_extmark_reuse(bufnr, item.extmark_id)
   pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id, item.extmark_id)
   extmark.clear_image(item.image_id)
   state.image_id_to_extmark[item.image_id] = nil
-  state.item_by_image_id[item.image_id]    = nil
+  state.item_by_image_id[item.image_id] = nil
 end
 
 --- Full reset of all concealer state for a buffer (called on disable or wipeout).
 --- @param bufnr integer
 function M.hard_reset_buf(bufnr)
   local extmark = require("typst-concealer.extmark")
-  local bstate  = state.buffer_render_state[bufnr]
+  local bstate = state.buffer_render_state[bufnr]
   if bstate and bstate.full_items then
     for _, item in ipairs(bstate.full_items) do
       cleanup_item(bufnr, item)
@@ -87,11 +89,11 @@ function M.hard_reset_buf(bufnr)
   end
   state.buffer_render_state[bufnr] = nil
 
-  vim.api.nvim_buf_clear_namespace(bufnr, state.ns_id,  0, -1)
+  vim.api.nvim_buf_clear_namespace(bufnr, state.ns_id, 0, -1)
   vim.api.nvim_buf_clear_namespace(bufnr, state.ns_id2, 0, -1)
 
   state.buffers[bufnr] = nil
-  diagnostics          = {}
+  diagnostics = {}
   -- Remove only entries belonging to this buffer from the shared O(1) index
   local to_remove = {}
   for image_id, item in pairs(state.item_by_image_id) do
@@ -102,7 +104,7 @@ function M.hard_reset_buf(bufnr)
   for _, image_id in ipairs(to_remove) do
     state.item_by_image_id[image_id] = nil
   end
-  state.runtime_preludes             = {}
+  state.runtime_preludes = {}
 
   for id, image_bufnr in pairs(state.image_ids_in_use) do
     if bufnr == image_bufnr then
@@ -125,26 +127,24 @@ function M.render_buf(bufnr)
     return
   end
 
-  diagnostics            = {}
+  diagnostics = {}
   state.runtime_preludes = {}
 
   local extmark = require("typst-concealer.extmark")
   local session = require("typst-concealer.session")
 
   local parser = vim.treesitter.get_parser(bufnr)
-  local tree   = parser:parse()[1]:root()
+  local tree = parser:parse()[1]:root()
 
   --- @type { [integer]: { [1]: Range4, [2]: integer, [3]: string } }
-  local ranges     = {}
+  local ranges = {}
   local prev_range = nil
 
   for _, match, _ in main._typst_query:iter_matches(tree, bufnr, nil, nil, { all = true }) do
     local block_type = match[3][1]:type()
     local start_row, start_col, end_row, end_col = match[3][1]:range()
 
-    if prev_range ~= nil
-      and range_contains(prev_range, { start_row, start_col, end_row, end_col })
-    then
+    if prev_range ~= nil and range_contains(prev_range, { start_row, start_col, end_row, end_col }) then
       goto continue
     end
 
@@ -153,13 +153,14 @@ function M.render_buf(bufnr)
       ranges[image_id] = { { start_row, start_col, end_row, end_col }, #state.runtime_preludes, "math" }
       prev_range = { start_row, start_col, end_row, end_col }
     elseif block_type == "code" then
-      local code_type  = match[2][1]:type()
+      local code_type = match[2][1]:type()
       local call_ident = ""
       if match[1] ~= nil then
         local a, b, c, d = match[1][1]:range()
         call_ident = range_to_string({ a, b, c, d }, bufnr)
       end
-      if (not vim.list_contains({ "let", "set", "import", "show" }, code_type))
+      if
+        (not vim.list_contains({ "let", "set", "import", "show" }, code_type))
         and (not vim.list_contains({ "pagebreak" }, call_ident))
       then
         local image_id = new_image_id(bufnr)
@@ -167,8 +168,10 @@ function M.render_buf(bufnr)
         prev_range = { start_row, start_col, end_row, end_col }
       end
       if vim.list_contains({ "let", "set", "import", "show" }, code_type) then
-        state.runtime_preludes[#state.runtime_preludes + 1] =
-          range_to_string({ start_row, start_col, end_row, end_col }, bufnr) .. "\n"
+        state.runtime_preludes[#state.runtime_preludes + 1] = range_to_string(
+          { start_row, start_col, end_row, end_col },
+          bufnr
+        ) .. "\n"
       end
     end
     ::continue::
@@ -178,19 +181,21 @@ function M.render_buf(bufnr)
   local sorted_entries = {}
   for id, payload in pairs(ranges) do
     sorted_entries[#sorted_entries + 1] = {
-      image_id      = id,
-      range         = payload[1],
+      image_id = id,
+      range = payload[1],
       prelude_count = payload[2],
-      node_type     = payload[3],
+      node_type = payload[3],
     }
   end
   table.sort(sorted_entries, function(a, b)
     local ar, br = a.range, b.range
-    if ar[1] ~= br[1] then return ar[1] < br[1] end
+    if ar[1] ~= br[1] then
+      return ar[1] < br[1]
+    end
     return ar[2] < br[2]
   end)
 
-  local prev_items  = (state.buffer_render_state[bufnr] and state.buffer_render_state[bufnr].full_items) or {}
+  local prev_items = (state.buffer_render_state[bufnr] and state.buffer_render_state[bufnr].full_items) or {}
   local batch_items = {}
 
   for idx, entry in ipairs(sorted_entries) do
@@ -204,25 +209,25 @@ function M.render_buf(bufnr)
 
     if prev_item ~= nil then
       image_id = prev_item.image_id
-      ext_id   = prev_item.extmark_id
+      ext_id = prev_item.extmark_id
     else
       image_id = new_image_id(bufnr)
-      ext_id   = extmark.place_render_extmark(bufnr, image_id, range, nil, nil, sem)
+      ext_id = extmark.place_render_extmark(bufnr, image_id, range, nil, nil, sem)
     end
 
     local item = {
-      bufnr         = bufnr,
-      image_id      = image_id,
-      extmark_id    = ext_id,
-      range         = range,
-      str           = str,
+      bufnr = bufnr,
+      image_id = image_id,
+      extmark_id = ext_id,
+      range = range,
+      str = str,
       prelude_count = prelude_count,
-      node_type     = node_type,
-      semantics     = sem,          -- unified: replaces layout_kind/is_block/display_as_block
-      needs_swap    = prev_item ~= nil,
+      node_type = node_type,
+      semantics = sem, -- unified: replaces layout_kind/is_block/display_as_block
+      needs_swap = prev_item ~= nil,
     }
-    batch_items[#batch_items + 1]        = item
-    state.item_by_image_id[image_id]     = item
+    batch_items[#batch_items + 1] = item
+    state.item_by_image_id[image_id] = item
   end
 
   -- Release extmarks/images for items that no longer exist
@@ -230,14 +235,16 @@ function M.render_buf(bufnr)
     cleanup_item(bufnr, prev_items[i])
   end
 
-  state.buffer_render_state[bufnr]            = state.buffer_render_state[bufnr] or {}
+  state.buffer_render_state[bufnr] = state.buffer_render_state[bufnr] or {}
   state.buffer_render_state[bufnr].full_items = batch_items
 
   -- Rebuild per-line item index for O(1) hover lookup
   local line_to_items = {}
   for _, item in ipairs(batch_items) do
     for row = item.range[1], item.range[3] do
-      if not line_to_items[row] then line_to_items[row] = {} end
+      if not line_to_items[row] then
+        line_to_items[row] = {}
+      end
       line_to_items[row][#line_to_items[row] + 1] = item
     end
   end
@@ -297,17 +304,19 @@ local function hide_one_extmark(bufnr, bs, extmark_id)
   else
     -- Single-line extmark
     local mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, extmark_id, { details = true })
-    if #mark == 0 then return nil end
+    if #mark == 0 then
+      return nil
+    end
     local row, col, opts = mark[1], mark[2], mark[3]
     local saved = opts.virt_text
     vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
-      id            = extmark_id,
-      virt_text     = { { "" } },
-      end_row       = opts.end_row,
-      end_col       = opts.end_col,
-      conceal       = nil,
+      id = extmark_id,
+      virt_text = { { "" } },
+      end_row = opts.end_row,
+      end_col = opts.end_col,
+      conceal = nil,
       virt_text_pos = opts.virt_text_pos,
-      invalidate    = opts.invalidate,
+      invalidate = opts.invalidate,
     })
     return saved
   end
@@ -327,8 +336,8 @@ end
 --- Called on CursorMoved and ModeChanged.
 --- @param bufnr integer
 function M.hide_extmarks_at_cursor(bufnr)
-  local main        = require("typst-concealer")
-  local bs          = state.get_buf_state(bufnr)
+  local main = require("typst-concealer")
+  local bs = state.get_buf_state(bufnr)
   local extmark_mod = require("typst-concealer.extmark")
 
   local mode = vim.api.nvim_get_mode().mode
@@ -339,7 +348,7 @@ function M.hide_extmarks_at_cursor(bufnr)
       restore_one_extmark(bufnr, bs, id, saved, extmark_mod)
     end
     bs.currently_hidden_extmark_ids = {}
-    bs.hover.last_cursor_row = nil  -- force re-process on next call
+    bs.hover.last_cursor_row = nil -- force re-process on next call
     bs.hover.last_mode = mode
     return
   end
@@ -351,7 +360,7 @@ function M.hide_extmarks_at_cursor(bufnr)
     return
   end
   bs.hover.last_cursor_row = cursor_row
-  bs.hover.last_mode       = mode
+  bs.hover.last_mode = mode
 
   -- Determine row range to unconceal
   local is_visual = mode == "v" or mode == "V" or mode == "\22"
@@ -362,9 +371,9 @@ function M.hide_extmarks_at_cursor(bufnr)
   end
 
   -- Collect items to hide from line index (no nvim_buf_get_extmarks call)
-  local brs           = state.buffer_render_state[bufnr]
+  local brs = state.buffer_render_state[bufnr]
   local line_to_items = (brs and brs.line_to_items) or {}
-  local should_hide   = {}  -- extmark_id -> item
+  local should_hide = {} -- extmark_id -> item
   for row = lo, hi do
     local row_items = line_to_items[row]
     if row_items then
@@ -380,7 +389,7 @@ function M.hide_extmarks_at_cursor(bufnr)
   -- Restore extmarks no longer under cursor
   for extmark_id, saved in pairs(bs.currently_hidden_extmark_ids) do
     if should_hide[extmark_id] then
-      new_hidden[extmark_id] = saved  -- still under cursor, keep hidden
+      new_hidden[extmark_id] = saved -- still under cursor, keep hidden
     else
       restore_one_extmark(bufnr, bs, extmark_id, saved, extmark_mod)
     end
@@ -403,13 +412,15 @@ end
 --- @return integer|nil start_row, integer start_col, integer end_row, integer end_col
 local function get_typst_block_at_cursor()
   local parser = vim.treesitter.get_parser(0, "typst")
-  local tree   = parser:parse()[1]:root()
+  local tree = parser:parse()[1]:root()
   local cursor = vim.api.nvim_win_get_cursor(0)
   local crow, ccol = cursor[1] - 1, cursor[2]
   local element = tree:named_descendant_for_range(crow, ccol, crow, ccol)
   local outermost = nil
   while true do
-    if element == nil then break end
+    if element == nil then
+      break
+    end
     local t = element:type()
     if t == "math" or t == "code" then
       outermost = element
@@ -446,7 +457,7 @@ function M.clear_live_typst_preview(bufnr)
     pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id, bs.preview_image.extmark_id)
     extmark.clear_image(bs.preview_image.image_id)
     state.image_id_to_extmark[bs.preview_image.image_id] = nil
-    state.item_by_image_id[bs.preview_image.image_id]    = nil
+    state.item_by_image_id[bs.preview_image.image_id] = nil
     bs.preview_image = nil
   end
 end
@@ -463,7 +474,7 @@ function M.render_live_typst_preview(bufnr)
   end
 
   local range = { start_row, start_col, end_row, end_col }
-  local str   = range_to_string(range, bufnr)
+  local str = range_to_string(range, bufnr)
 
   if bs.last_preview_str == str then
     return
@@ -493,7 +504,7 @@ function M.render_live_typst_preview(bufnr)
       bs.last_preview_str = str
 
       -- Classify as "code" for live preview (same path the batch render uses for code blocks)
-      local sem     = semantics_mod.classify(range, bufnr, "code")
+      local sem = semantics_mod.classify(range, bufnr, "code")
       local extmark = require("typst-concealer.extmark")
       local session = require("typst-concealer.session")
 
@@ -504,7 +515,7 @@ function M.render_live_typst_preview(bufnr)
         ext_id = extmark.place_render_extmark(bufnr, image_id, range, bs.preview_image.extmark_id, false, sem)
       else
         image_id = new_image_id(bufnr)
-        ext_id   = extmark.place_render_extmark(bufnr, image_id, range, nil, false, sem)
+        ext_id = extmark.place_render_extmark(bufnr, image_id, range, nil, false, sem)
       end
 
       -- Remove old preview item from the O(1) lookup index
@@ -513,14 +524,14 @@ function M.render_live_typst_preview(bufnr)
       end
 
       local item = {
-        bufnr         = bufnr,
-        image_id      = image_id,
-        extmark_id    = ext_id,
-        range         = range,
-        str           = str,
+        bufnr = bufnr,
+        image_id = image_id,
+        extmark_id = ext_id,
+        range = range,
+        str = str,
         prelude_count = 0,
-        node_type     = "code",
-        semantics     = sem,
+        node_type = "code",
+        semantics = sem,
       }
       -- Register in the O(1) index so conceal_for_image_id can find the semantics
       state.item_by_image_id[image_id] = item

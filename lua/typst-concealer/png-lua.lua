@@ -31,7 +31,7 @@ local function bytesToNum(bytes)
   for k, v in ipairs(bytes) do
     n = bsLeft(n, 8) + v
   end
-  if (n > 2147483647) then
+  if n > 2147483647 then
     return (n - 4294967296)
   else
     return n
@@ -101,7 +101,7 @@ local function extractChunkData(stream)
   while type ~= "IEND" do
     length = readInt(stream)
     type = readChar(stream, 4)
-    if (type == "IHDR") then
+    if type == "IHDR" then
       -- We have the data we want, free to return
       return getDataIHDR(stream, length)
     else

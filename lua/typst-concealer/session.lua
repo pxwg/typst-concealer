@@ -9,7 +9,7 @@
 ---   M.stop_watch_sessions_for_buf(bufnr)            kill both sessions for a buffer
 
 local state = require("typst-concealer.state")
-local M     = {}
+local M = {}
 
 --- @param path string
 local function safe_unlink(path)
@@ -48,7 +48,7 @@ end
 --- @param kind  'full' | 'preview'
 --- @return string
 local function session_input_path(bufnr, kind)
-  local dir    = get_buf_dir(bufnr)
+  local dir = get_buf_dir(bufnr)
   local suffix = kind == "preview" and "-preview" or ""
   return dir .. "/.typst-concealer-" .. state.full_pid .. "-" .. bufnr .. suffix .. ".typ"
 end
@@ -59,8 +59,7 @@ end
 --- @return string template, string prefix
 local function session_output_template(bufnr, kind)
   local suffix = kind == "preview" and "-preview" or ""
-  local prefix = "/tmp/tty-graphics-protocol-typst-concealer-"
-    .. state.full_pid .. "-" .. bufnr .. suffix
+  local prefix = "/tmp/tty-graphics-protocol-typst-concealer-" .. state.full_pid .. "-" .. bufnr .. suffix
   return prefix .. "-{p}.png", prefix
 end
 
@@ -119,12 +118,12 @@ end
 --- @param extmark_id     integer
 --- @param original_range table    Range4
 local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original_range)
-  local pngData    = require("typst-concealer.png-lua")
-  local extmark    = require("typst-concealer.extmark")
+  local pngData = require("typst-concealer.png-lua")
+  local extmark = require("typst-concealer.extmark")
   local kitty_codes = require("typst-concealer.kitty-codes")
 
-  local source_rows    = original_range[3] - original_range[1] + 1
-  local success, data  = pcall(pngData, page_path)
+  local source_rows = original_range[3] - original_range[1] + 1
+  local success, data = pcall(pngData, page_path)
   if not success then
     return
   end
@@ -132,7 +131,7 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
   local natural_rows, natural_cols
   if state._cell_px_w and state._cell_px_h then
     natural_rows = math.max(1, math.floor(data.height / state._cell_px_h + 0.5))
-    natural_cols = math.max(1, math.floor(data.width  / state._cell_px_w + 0.5))
+    natural_cols = math.max(1, math.floor(data.width / state._cell_px_w + 0.5))
   else
     natural_rows = source_rows
     natural_cols = math.ceil((data.width / data.height) * 2) * source_rows
@@ -177,18 +176,18 @@ end
 --- @param item    table
 local function try_render_session_page(session, i, item)
   local page_path = session.output_prefix .. "-" .. i .. ".png"
-  local stat      = vim.uv.fs_stat(page_path)
+  local stat = vim.uv.fs_stat(page_path)
   if stat == nil or stat.size == 0 then
     return
   end
 
-  local stamp      = tostring(stat.mtime.sec) .. ":" .. tostring(stat.mtime.nsec) .. ":" .. tostring(stat.size)
+  local stamp = tostring(stat.mtime.sec) .. ":" .. tostring(stat.mtime.nsec) .. ":" .. tostring(stat.size)
   local page_state = session.page_state[i] or {}
 
   -- First sighting: remember only, do not render yet
   if page_state.last_seen ~= stamp then
-    page_state.last_seen    = stamp
-    session.page_state[i]   = page_state
+    page_state.last_seen = stamp
+    session.page_state[i] = page_state
     return
   end
 
@@ -196,7 +195,7 @@ local function try_render_session_page(session, i, item)
   if page_state.rendered == stamp then
     return
   end
-  page_state.rendered  = stamp
+  page_state.rendered = stamp
   session.page_state[i] = page_state
 
   vim.schedule(function()
@@ -215,7 +214,8 @@ local function ensure_session_poller(session)
   end
   session.poll_timer = vim.uv.new_timer()
   session.poll_timer:start(
-    80, 80,
+    80,
+    80,
     vim.schedule_wrap(function()
       if session.dead then
         return
@@ -237,12 +237,12 @@ function M.ensure_watch_session(bufnr, kind)
     return existing
   end
 
-  local main   = require("typst-concealer")
-  local config  = main.config
-  local stdout  = vim.uv.new_pipe()
-  local stderr  = vim.uv.new_pipe()
-  local input_path         = session_input_path(bufnr, kind)
-  local template, prefix   = session_output_template(bufnr, kind)
+  local main = require("typst-concealer")
+  local config = main.config
+  local stdout = vim.uv.new_pipe()
+  local stderr = vim.uv.new_pipe()
+  local input_path = session_input_path(bufnr, kind)
+  local template, prefix = session_output_template(bufnr, kind)
 
   local args = { "watch", input_path, template, "--ppi=" .. (state._render_ppi or config.ppi) }
   if config.compiler_args then
@@ -261,26 +261,26 @@ function M.ensure_watch_session(bufnr, kind)
   end
 
   local session = {
-    kind            = kind,
-    bufnr           = bufnr,
-    handle          = nil,
-    stdout          = stdout,
-    stderr          = stderr,
-    input_path      = input_path,
-    output_prefix   = prefix,
+    kind = kind,
+    bufnr = bufnr,
+    handle = nil,
+    stdout = stdout,
+    stderr = stderr,
+    input_path = input_path,
+    output_prefix = prefix,
     output_template = template,
-    poll_timer      = nil,
-    items           = {},
-    page_state      = {},
+    poll_timer = nil,
+    items = {},
+    page_state = {},
     last_page_count = 0,
-    stderr_chunks   = {},
-    dead            = false,
+    stderr_chunks = {},
+    dead = false,
   }
 
   local handle
   handle = vim.uv.spawn(config.typst_location, {
     stdio = { nil, stdout, stderr },
-    args  = args,
+    args = args,
   }, function()
     session.dead = true
     if session.poll_timer and not session.poll_timer:is_closing() then
@@ -288,9 +288,15 @@ function M.ensure_watch_session(bufnr, kind)
       session.poll_timer:close()
       session.poll_timer = nil
     end
-    if stdout and not stdout:is_closing() then stdout:close() end
-    if stderr and not stderr:is_closing() then stderr:close() end
-    if handle and not handle:is_closing() then handle:close() end
+    if stdout and not stdout:is_closing() then
+      stdout:close()
+    end
+    if stderr and not stderr:is_closing() then
+      stderr:close()
+    end
+    if handle and not handle:is_closing() then
+      handle:close()
+    end
   end)
 
   if handle == nil then
@@ -304,7 +310,9 @@ function M.ensure_watch_session(bufnr, kind)
 
   stdout:read_start(function() end)
   stderr:read_start(function(err2, data)
-    if err2 ~= nil then return end
+    if err2 ~= nil then
+      return
+    end
     if data ~= nil and data ~= "" then
       session.stderr_chunks[#session.stderr_chunks + 1] = data
       if #session.stderr_chunks > 32 then
@@ -313,7 +321,7 @@ function M.ensure_watch_session(bufnr, kind)
     end
   end)
 
-  state.watch_sessions[bufnr]       = state.watch_sessions[bufnr] or {}
+  state.watch_sessions[bufnr] = state.watch_sessions[bufnr] or {}
   state.watch_sessions[bufnr][kind] = session
   ensure_session_poller(session)
   return session
@@ -338,8 +346,8 @@ function M.render_items_via_watch(bufnr, items, kind)
     safe_unlink(session.output_prefix .. "-" .. i .. ".png")
   end
 
-  session.items           = items
-  session.page_state      = {}
+  session.items = items
+  session.page_state = {}
   session.last_page_count = #items
 
   local wrapper = require("typst-concealer.wrapper")
