@@ -9,21 +9,12 @@ M.ns_id2 = vim.api.nvim_create_namespace("typst-concealer-2")
 -- used for virt_lines of block-level multi-line items (separate from conceal_lines extmark)
 M.ns_id3 = vim.api.nvim_create_namespace("typst-concealer-3")
 
---- @type { [integer]: integer[] | { virt_lines: true } | nil }
---- Maps ns_id extmark_id -> list of ns_id2 per-line extmark ids, or {virt_lines=true} for block multiline
-M.multiline_marks = {}
---- @type { [integer]: integer }
---- Maps ns_id extmark_id -> ns_id3 virt_lines extmark_id for block multiline items
-M.block_virt_lines_marks = {}
 --- @type { [integer]: integer }
 --- Maps image_id -> ns_id extmark_id
 M.image_id_to_extmark = {}
 --- @type { [integer]: integer }
 --- Maps image_id -> bufnr (tracks which images are currently allocated)
 M.image_ids_in_use = {}
---- @type { [integer]: table }
---- Maps extmark_id -> saved virt_text/virt_lines data while cursor is over the extmark
-M.Currently_hidden_extmark_ids = {}
 
 --- @class typst_watch_session
 --- @field kind 'full' | 'preview'
@@ -46,6 +37,27 @@ M.watch_sessions = {}
 
 --- @type { [integer]: { full_items?: table[] } }
 M.buffer_render_state = {}
+
+--- Per-buffer mutable render state (extmark, live-preview, conceal transients).
+--- @type table<integer, table>
+M.buffers = {}
+
+--- Lazily create and return per-buffer state for bufnr.
+--- @param bufnr integer
+--- @return table
+function M.get_buf_state(bufnr)
+  if not M.buffers[bufnr] then
+    M.buffers[bufnr] = {
+      preview_image                = nil,
+      live_preview_timer           = nil,
+      last_preview_str             = nil,
+      currently_hidden_extmark_ids = {},
+      multiline_marks              = {},
+      block_virt_lines_marks       = {},
+    }
+  end
+  return M.buffers[bufnr]
+end
 
 --- O(1) flat index: image_id -> item.  Covers both full-render and live-preview items.
 --- Maintained by render.lua (insert on create, delete on cleanup/reset).
@@ -77,22 +89,23 @@ end
 --- @param bufnr integer
 --- @param extmark_id integer
 function M.prepare_extmark_reuse(bufnr, extmark_id)
-  local mm = M.multiline_marks[extmark_id]
+  local bs = M.get_buf_state(bufnr)
+  local mm = bs.multiline_marks[extmark_id]
   if mm ~= nil then
     if mm.virt_lines then
-      local vl_id = M.block_virt_lines_marks[extmark_id]
+      local vl_id = bs.block_virt_lines_marks[extmark_id]
       if vl_id then
         pcall(vim.api.nvim_buf_del_extmark, bufnr, M.ns_id3, vl_id)
       end
-      M.block_virt_lines_marks[extmark_id] = nil
+      bs.block_virt_lines_marks[extmark_id] = nil
     else
       for _, id in pairs(mm) do
         pcall(vim.api.nvim_buf_del_extmark, bufnr, M.ns_id2, id)
       end
     end
-    M.multiline_marks[extmark_id] = nil
+    bs.multiline_marks[extmark_id] = nil
   end
-  M.Currently_hidden_extmark_ids[extmark_id] = nil
+  bs.currently_hidden_extmark_ids[extmark_id] = nil
 end
 
 return M

@@ -61,20 +61,22 @@ local function center_padding(natural_cols, bufnr)
 end
 
 --- Low-level extmark placement. Use place_render_extmark for external callers.
+--- @param bufnr      integer
 --- @param image_id  integer
 --- @param range     Range4
 --- @param extmark_id integer|nil
 --- @param concealing boolean|nil
 --- @param is_block  boolean|nil
 --- @return integer  new extmark_id
-local function place_image_extmark(image_id, range, extmark_id, concealing, is_block)
+local function place_image_extmark(bufnr, image_id, range, extmark_id, concealing, is_block)
   local start_row, start_col, end_row, end_col = range[1], range[2], range[3], range[4]
   local height = end_row - start_row + 1
   local new_extmark_id
+  local bs = state.get_buf_state(bufnr)
 
   if height == 1 then
     if concealing == false then
-      new_extmark_id = vim.api.nvim_buf_set_extmark(0, state.ns_id, start_row, start_col, {
+      new_extmark_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, start_row, start_col, {
         id = extmark_id,
         virt_lines = { { { "" } } },
         virt_text_pos = "overlay",
@@ -84,7 +86,7 @@ local function place_image_extmark(image_id, range, extmark_id, concealing, is_b
       })
     elseif is_block then
       -- Block single-line: overlay to avoid line wrapping, will be centred later
-      new_extmark_id = vim.api.nvim_buf_set_extmark(0, state.ns_id, start_row, start_col, {
+      new_extmark_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, start_row, start_col, {
         id = extmark_id,
         virt_text = { { "" } },
         virt_text_pos = "overlay",
@@ -94,7 +96,7 @@ local function place_image_extmark(image_id, range, extmark_id, concealing, is_b
         end_row = end_row,
       })
     else
-      new_extmark_id = vim.api.nvim_buf_set_extmark(0, state.ns_id, start_row, start_col, {
+      new_extmark_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, start_row, start_col, {
         id = extmark_id,
         virt_text = { { "" } },
         virt_text_pos = "inline",
@@ -106,7 +108,7 @@ local function place_image_extmark(image_id, range, extmark_id, concealing, is_b
     end
   else
     if concealing == false then
-      new_extmark_id = vim.api.nvim_buf_set_extmark(0, state.ns_id, start_row, start_col, {
+      new_extmark_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, start_row, start_col, {
         id = extmark_id,
         invalidate = true,
         virt_text = { { "" } },
@@ -120,7 +122,7 @@ local function place_image_extmark(image_id, range, extmark_id, concealing, is_b
       -- 'wrap' does not insert phantom screen lines between image rows.
       -- They must be in separate extmarks/namespaces because Neovim does not
       -- render virt_lines on a line that is itself concealed.
-      new_extmark_id = vim.api.nvim_buf_set_extmark(0, state.ns_id, start_row, start_col, {
+      new_extmark_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, start_row, start_col, {
         id = extmark_id,
         invalidate = true,
         --- @diagnostic disable-next-line: assign-type-mismatch
@@ -130,19 +132,19 @@ local function place_image_extmark(image_id, range, extmark_id, concealing, is_b
       })
       -- Place a ns_id3 extmark on the line AFTER the concealed range so that
       -- its virt_lines (above=true) appear right where the item was.
-      local line_count = vim.api.nvim_buf_line_count(0)
+      local line_count = vim.api.nvim_buf_line_count(bufnr)
       local vl_row = end_row + 1
       if vl_row >= line_count then
-        vim.api.nvim_buf_set_lines(0, line_count, line_count, false, { "" })
+        vim.api.nvim_buf_set_lines(bufnr, line_count, line_count, false, { "" })
       end
-      local vl_id = vim.api.nvim_buf_set_extmark(0, state.ns_id3, vl_row, 0, {
+      local vl_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id3, vl_row, 0, {
         virt_lines = { { { "", "" } } }, -- placeholder, filled in conceal_for_image_id
         virt_lines_above = true,
       })
-      state.block_virt_lines_marks[new_extmark_id] = vl_id
-      state.multiline_marks[new_extmark_id] = { virt_lines = true }
+      bs.block_virt_lines_marks[new_extmark_id] = vl_id
+      bs.multiline_marks[new_extmark_id] = { virt_lines = true }
     else
-      new_extmark_id = vim.api.nvim_buf_set_extmark(0, state.ns_id, start_row, start_col, {
+      new_extmark_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, start_row, start_col, {
         id = extmark_id,
         invalidate = true,
         virt_text = { { "" } },
@@ -150,7 +152,7 @@ local function place_image_extmark(image_id, range, extmark_id, concealing, is_b
         end_col = end_col,
         end_row = end_row,
       })
-      state.multiline_marks[new_extmark_id] = {}
+      bs.multiline_marks[new_extmark_id] = {}
     end
   end
 
@@ -160,15 +162,16 @@ end
 
 --- Public entry: place an extmark driven by render semantics.
 --- Display decision comes only from semantics.display_kind.
+--- @param bufnr      integer
 --- @param image_id   integer
 --- @param range      Range4
 --- @param extmark_id integer|nil
 --- @param concealing boolean|nil
 --- @param semantics  table  RenderSemantics
 --- @return integer
-function M.place_render_extmark(image_id, range, extmark_id, concealing, semantics)
+function M.place_render_extmark(bufnr, image_id, range, extmark_id, concealing, semantics)
   local is_block = (semantics.display_kind == "block")
-  return place_image_extmark(image_id, range, extmark_id, concealing, is_block)
+  return place_image_extmark(bufnr, image_id, range, extmark_id, concealing, is_block)
 end
 
 --- Rebuild an existing extmark in-place for a new range.
@@ -180,7 +183,7 @@ end
 --- @param semantics  table  RenderSemantics
 function M.swap_extmark_to_range(bufnr, image_id, extmark_id, range, semantics)
   state.prepare_extmark_reuse(bufnr, extmark_id)
-  local new_id = place_image_extmark(image_id, range, extmark_id, nil, semantics.display_kind == "block")
+  local new_id = place_image_extmark(bufnr, image_id, range, extmark_id, nil, semantics.display_kind == "block")
   state.image_id_to_extmark[image_id] = new_id
 end
 
@@ -190,8 +193,9 @@ end
 --- @param virt_text_data  table
 --- @param skip_hide_check boolean|nil
 function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_check)
-  if (skip_hide_check ~= true) and state.Currently_hidden_extmark_ids[extmark_id] ~= nil then
-    state.Currently_hidden_extmark_ids[extmark_id] = virt_text_data
+  local bs = state.get_buf_state(bufnr)
+  if (skip_hide_check ~= true) and bs.currently_hidden_extmark_ids[extmark_id] ~= nil then
+    bs.currently_hidden_extmark_ids[extmark_id] = virt_text_data
     return
   end
   local m = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, extmark_id, { details = true })
@@ -202,7 +206,7 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
 
   local height = opts.end_row - row + 1
   if height ~= 1 then
-    local mm = state.multiline_marks[extmark_id]
+    local mm = bs.multiline_marks[extmark_id]
     -- virt_lines-based block multiline: update is handled in conceal_for_image_id
     if mm and mm.virt_lines then
       return
@@ -212,9 +216,9 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
         vim.api.nvim_buf_del_extmark(bufnr, state.ns_id2, id)
       end
     end
-    state.multiline_marks[extmark_id] = {}
+    bs.multiline_marks[extmark_id] = {}
     for i = 1, height do
-      local lines = vim.api.nvim_buf_get_lines(0, row, opts.end_row + 1, false)
+      local lines = vim.api.nvim_buf_get_lines(bufnr, row, opts.end_row + 1, false)
       local conceal = nil
       if opts.virt_text_pos ~= "right_align" then
         conceal = ""
@@ -225,19 +229,19 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
       then
         virt_text_line = { virt_text_line }
       end
-      local new_id = vim.api.nvim_buf_set_extmark(0, state.ns_id2, row + i - 1, 0, {
+      local new_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, row + i - 1, 0, {
         virt_text     = virt_text_line,
         conceal       = conceal,
         virt_text_pos = opts.virt_text_pos,
         end_col       = #lines[i],
         end_row       = row + i - 1,
       })
-      table.insert(state.multiline_marks[extmark_id], new_id)
+      table.insert(bs.multiline_marks[extmark_id], new_id)
     end
   elseif opts.virt_text_pos == "inline"
     or (opts.virt_text_pos == "overlay" and opts.conceal == "")
   then
-    vim.api.nvim_buf_set_extmark(0, state.ns_id, row, col, {
+    vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
       id            = extmark_id,
       virt_text     = virt_text_data,
       virt_text_pos = opts.virt_text_pos,
@@ -248,7 +252,7 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
       conceal       = "",
     })
   else
-    vim.api.nvim_buf_set_extmark(0, state.ns_id, row, col, {
+    vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
       id            = extmark_id,
       virt_lines    = { virt_text_data },
       virt_text_pos = opts.virt_text_pos,
@@ -272,8 +276,9 @@ end
 --- @param natural_rows integer
 --- @param source_rows  integer
 function M.conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, source_rows)
+  local bs                  = state.get_buf_state(bufnr)
   local extmark_id          = state.image_id_to_extmark[image_id]
-  local multiline_extmark_ids = state.multiline_marks[extmark_id]
+  local multiline_extmark_ids = bs.multiline_marks[extmark_id]
 
   local hl_group = "typst-concealer-image-id-" .. tostring(image_id)
   vim.api.nvim_set_hl(0, hl_group, { fg = string.format("#%06X", image_id) })
@@ -333,11 +338,11 @@ function M.conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, sou
         lines[i] = make_row_list(image_row)
       end
     end
-    if state.Currently_hidden_extmark_ids[extmark_id] ~= nil then
-      state.Currently_hidden_extmark_ids[extmark_id] = { block_virt_lines = true, virt_lines_data = lines }
+    if bs.currently_hidden_extmark_ids[extmark_id] ~= nil then
+      bs.currently_hidden_extmark_ids[extmark_id] = { block_virt_lines = true, virt_lines_data = lines }
       return
     end
-    local vl_id = state.block_virt_lines_marks[extmark_id]
+    local vl_id = bs.block_virt_lines_marks[extmark_id]
     if vl_id then
       local m = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id3, vl_id, { details = true })
       if #m > 0 then

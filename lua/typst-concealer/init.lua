@@ -205,8 +205,8 @@ function M.setup(cfg)
     pattern = "*.typ",
     group   = augroup,
     desc    = "render file on enter",
-    callback = function()
-      require("typst-concealer.render").render_buf()
+    callback = function(ev)
+      require("typst-concealer.render").render_buf(ev.buf)
     end,
   })
 
@@ -221,9 +221,9 @@ function M.setup(cfg)
     pattern  = "*.typ",
     group    = augroup,
     desc     = "render file on write",
-    callback = function()
+    callback = function(ev)
       vim.schedule(function()
-        require("typst-concealer.render").render_buf()
+        require("typst-concealer.render").render_buf(ev.buf)
       end)
     end,
   })
@@ -232,9 +232,9 @@ function M.setup(cfg)
     pattern  = "*.typ",
     group    = augroup,
     desc     = "re-render on normal-mode text changes so block anchors stay correct",
-    callback = function()
+    callback = function(ev)
       vim.schedule(function()
-        require("typst-concealer.render").render_buf()
+        require("typst-concealer.render").render_buf(ev.buf)
       end)
     end,
   })
@@ -243,8 +243,8 @@ function M.setup(cfg)
     pattern  = "*.typ",
     group    = augroup,
     desc     = "unconceal on line hover",
-    callback = function()
-      require("typst-concealer.render").hide_extmarks_at_cursor()
+    callback = function(ev)
+      require("typst-concealer.render").hide_extmarks_at_cursor(ev.buf)
     end,
   })
 
@@ -254,7 +254,7 @@ function M.setup(cfg)
     desc     = "unconceal when exiting visual mode (no CursorMoved event fires)",
     callback = function(ev)
       if vim.api.nvim_buf_get_name(ev.buf):match(".*%.typ$") then
-        require("typst-concealer.render").hide_extmarks_at_cursor()
+        require("typst-concealer.render").hide_extmarks_at_cursor(ev.buf)
       end
     end,
   })
@@ -276,7 +276,7 @@ function M.setup(cfg)
     pattern  = "*:i",
     callback = function(ev)
       if vim.api.nvim_buf_get_name(ev.buf):match(".*%.typ$") then
-        require("typst-concealer.render").render_live_typst_preview()
+        require("typst-concealer.render").render_live_typst_preview(ev.buf)
       end
     end,
   })
@@ -285,9 +285,9 @@ function M.setup(cfg)
     pattern  = "*.typ",
     group    = augroup,
     desc     = "render live preview when insert-mode text changes",
-    callback = function()
+    callback = function(ev)
       vim.schedule(function()
-        require("typst-concealer.render").render_live_typst_preview()
+        require("typst-concealer.render").render_live_typst_preview(ev.buf)
       end)
     end,
   })
@@ -298,7 +298,10 @@ function M.setup(cfg)
       desc     = "update colour scheme",
       callback = function()
         setup_prelude()
-        require("typst-concealer.render").render_buf(vim.fn.bufnr())
+        local render = require("typst-concealer.render")
+        for bufnr in pairs(M._enabled_buffers) do
+          render.render_buf(bufnr)
+        end
       end,
     })
   end
@@ -313,9 +316,19 @@ function M.setup(cfg)
     desc     = "refresh cell pixel size on terminal resize",
     callback = function()
       refresh_cell_px_size()
-      vim.schedule(function()
-        require("typst-concealer.render").render_buf(vim.fn.bufnr())
-      end)
+      local render = require("typst-concealer.render")
+      for bufnr in pairs(M._enabled_buffers) do
+        vim.schedule(function() render.render_buf(bufnr) end)
+      end
+    end,
+  })
+
+  vim.api.nvim_create_autocmd({ "BufLeave" }, {
+    pattern  = "*.typ",
+    group    = augroup,
+    desc     = "clear live preview when leaving a typst buffer",
+    callback = function(ev)
+      require("typst-concealer.render").clear_live_typst_preview(ev.buf)
     end,
   })
 

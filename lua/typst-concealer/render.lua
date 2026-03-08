@@ -9,11 +9,6 @@ local M            = {}
 
 local diagnostics = {}
 
--- Live preview state (module-level because clear/render must share it)
-local preview_image       = nil  ---@type {image_id: integer, extmark_id: integer}|nil
-local live_preview_timer  = nil
-local last_preview_str    = nil
-
 --- Extract the text contained within a buffer range.
 --- @param range Range4
 --- @param bufnr integer
@@ -96,11 +91,8 @@ function M.hard_reset_buf(bufnr)
   vim.api.nvim_buf_clear_namespace(bufnr, state.ns_id2, 0, -1)
   vim.api.nvim_buf_clear_namespace(bufnr, state.ns_id3, 0, -1)
 
-  preview_image                      = nil
-  state.Currently_hidden_extmark_ids = {}
-  state.multiline_marks              = {}
-  state.block_virt_lines_marks       = {}
-  diagnostics                        = {}
+  state.buffers[bufnr] = nil
+  diagnostics          = {}
   -- Remove only entries belonging to this buffer from the shared O(1) index
   local to_remove = {}
   for image_id, item in pairs(state.item_by_image_id) do
@@ -216,7 +208,7 @@ function M.render_buf(bufnr)
       ext_id   = prev_item.extmark_id
     else
       image_id = new_image_id(bufnr)
-      ext_id   = extmark.place_render_extmark(image_id, range, nil, nil, sem)
+      ext_id   = extmark.place_render_extmark(bufnr, image_id, range, nil, nil, sem)
     end
 
     local item = {
@@ -245,15 +237,16 @@ function M.render_buf(bufnr)
   vim.schedule(function()
     session.render_items_via_watch(bufnr, batch_items, "full")
   end)
-  M.hide_extmarks_at_cursor()
+  M.hide_extmarks_at_cursor(bufnr)
 end
 
 --- Hide / restore extmarks that overlap the cursor position.
 --- Called on CursorMoved and ModeChanged.
-function M.hide_extmarks_at_cursor()
-  local main  = require("typst-concealer")
+--- @param bufnr integer
+function M.hide_extmarks_at_cursor(bufnr)
+  local main    = require("typst-concealer")
   local extmark = require("typst-concealer.extmark")
-  local bufnr = vim.fn.bufnr()
+  local bs      = state.get_buf_state(bufnr)
 
   local new_hidden = {}
 
@@ -273,17 +266,17 @@ function M.hide_extmarks_at_cursor()
 
     for _, em in ipairs(extmarks) do
       local id = em[1]
-      if state.multiline_marks[id] ~= nil then
-        local mm = state.multiline_marks[id]
+      if bs.multiline_marks[id] ~= nil then
+        local mm = bs.multiline_marks[id]
         if mm.virt_lines then
           -- Block multiline (virt_lines path)
           if new_hidden[id] ~= nil then
             -- already handled
-          elseif state.Currently_hidden_extmark_ids[id] ~= nil then
-            new_hidden[id] = state.Currently_hidden_extmark_ids[id]
-            state.Currently_hidden_extmark_ids[id] = nil
+          elseif bs.currently_hidden_extmark_ids[id] ~= nil then
+            new_hidden[id] = bs.currently_hidden_extmark_ids[id]
+            bs.currently_hidden_extmark_ids[id] = nil
           else
-            local vl_id     = state.block_virt_lines_marks[id]
+            local vl_id     = bs.block_virt_lines_marks[id]
             local saved_vl  = nil
             if vl_id then
               local vm = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id3, vl_id, { details = true })
@@ -313,9 +306,9 @@ function M.hide_extmarks_at_cursor()
         -- Regular multiline (ns_id2 overlay path)
         if new_hidden[id] ~= nil then
           -- already handled
-        elseif state.Currently_hidden_extmark_ids[id] ~= nil then
-          new_hidden[id] = state.Currently_hidden_extmark_ids[id]
-          state.Currently_hidden_extmark_ids[id] = nil
+        elseif bs.currently_hidden_extmark_ids[id] ~= nil then
+          new_hidden[id] = bs.currently_hidden_extmark_ids[id]
+          bs.currently_hidden_extmark_ids[id] = nil
         else
           if em[4].virt_text_pos == "right_align" then
             goto continue
@@ -328,17 +321,17 @@ function M.hide_extmarks_at_cursor()
             vim.api.nvim_buf_del_extmark(bufnr, state.ns_id2, sub_id)
           end
           new_hidden[id] = text
-          state.Currently_hidden_extmark_ids[id] = nil
+          bs.currently_hidden_extmark_ids[id] = nil
         end
       else
         -- Single-line extmark
         local id2, row, col, opts = em[1], em[2], em[3], em[4]
-        if state.Currently_hidden_extmark_ids[id2] ~= nil then
-          new_hidden[id2] = state.Currently_hidden_extmark_ids[id2]
-          state.Currently_hidden_extmark_ids[id2] = nil
+        if bs.currently_hidden_extmark_ids[id2] ~= nil then
+          new_hidden[id2] = bs.currently_hidden_extmark_ids[id2]
+          bs.currently_hidden_extmark_ids[id2] = nil
         else
           new_hidden[id2] = opts.virt_text
-          state.Currently_hidden_extmark_ids[id2] = nil
+          bs.currently_hidden_extmark_ids[id2] = nil
           vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
             id            = id2,
             virt_text     = { { "" } },
@@ -355,7 +348,7 @@ function M.hide_extmarks_at_cursor()
   end
 
   -- Restore extmarks that are no longer under the cursor
-  for id, text in pairs(state.Currently_hidden_extmark_ids) do
+  for id, text in pairs(bs.currently_hidden_extmark_ids) do
     if type(text) == "table" and text.block_virt_lines then
       local mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, id, { details = true })
       if #mark > 0 then
@@ -369,7 +362,7 @@ function M.hide_extmarks_at_cursor()
           end_row    = opts.end_row,
         })
       end
-      local vl_id = state.block_virt_lines_marks[id]
+      local vl_id = bs.block_virt_lines_marks[id]
       if vl_id and text.virt_lines_data then
         local vm = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id3, vl_id, { details = true })
         if #vm > 0 then
@@ -386,7 +379,7 @@ function M.hide_extmarks_at_cursor()
     end
   end
 
-  state.Currently_hidden_extmark_ids = new_hidden
+  bs.currently_hidden_extmark_ids = new_hidden
 end
 
 --- Find the outermost math/code block under the cursor.
@@ -417,33 +410,35 @@ end
 --- Stop the live preview session and remove its extmark/image.
 --- @param bufnr integer
 function M.clear_live_typst_preview(bufnr)
-  if live_preview_timer then
-    if not live_preview_timer:is_closing() then
-      live_preview_timer:stop()
-      live_preview_timer:close()
+  local bs = state.get_buf_state(bufnr)
+  if bs.live_preview_timer then
+    if not bs.live_preview_timer:is_closing() then
+      bs.live_preview_timer:stop()
+      bs.live_preview_timer:close()
     end
-    live_preview_timer = nil
+    bs.live_preview_timer = nil
   end
-  last_preview_str = nil
+  bs.last_preview_str = nil
 
   local session = require("typst-concealer.session")
   session.stop_watch_session(bufnr, "preview")
 
-  if preview_image ~= nil then
+  if bs.preview_image ~= nil then
     local extmark = require("typst-concealer.extmark")
-    state.prepare_extmark_reuse(bufnr, preview_image.extmark_id)
-    pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id, preview_image.extmark_id)
-    extmark.clear_image(preview_image.image_id)
-    state.image_id_to_extmark[preview_image.image_id] = nil
-    state.item_by_image_id[preview_image.image_id]    = nil
-    preview_image = nil
+    state.prepare_extmark_reuse(bufnr, bs.preview_image.extmark_id)
+    pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id, bs.preview_image.extmark_id)
+    extmark.clear_image(bs.preview_image.image_id)
+    state.image_id_to_extmark[bs.preview_image.image_id] = nil
+    state.item_by_image_id[bs.preview_image.image_id]    = nil
+    bs.preview_image = nil
   end
 end
 
 --- Render a live preview of the Typst node under the cursor (insert mode).
 --- Uses semantics.classify so that multiline code blocks get the flow wrapper.
-function M.render_live_typst_preview()
-  local bufnr = vim.fn.bufnr()
+--- @param bufnr integer
+function M.render_live_typst_preview(bufnr)
+  local bs = state.get_buf_state(bufnr)
   local start_row, start_col, end_row, end_col = get_typst_block_at_cursor()
   if start_row == nil then
     M.clear_live_typst_preview(bufnr)
@@ -453,32 +448,32 @@ function M.render_live_typst_preview()
   local range = { start_row, start_col, end_row, end_col }
   local str   = range_to_string(range, bufnr)
 
-  if last_preview_str == str then
+  if bs.last_preview_str == str then
     return
   end
 
   -- Debounce: cancel previous timer before starting a new one
-  if live_preview_timer then
-    if not live_preview_timer:is_closing() then
-      live_preview_timer:stop()
-      live_preview_timer:close()
+  if bs.live_preview_timer then
+    if not bs.live_preview_timer:is_closing() then
+      bs.live_preview_timer:stop()
+      bs.live_preview_timer:close()
     end
   end
 
-  live_preview_timer = vim.uv.new_timer()
-  live_preview_timer:start(
+  bs.live_preview_timer = vim.uv.new_timer()
+  bs.live_preview_timer:start(
     require("typst-concealer").config.live_preview_debounce,
     0,
     vim.schedule_wrap(function()
-      if live_preview_timer then
-        if not live_preview_timer:is_closing() then
-          live_preview_timer:stop()
-          live_preview_timer:close()
+      if bs.live_preview_timer then
+        if not bs.live_preview_timer:is_closing() then
+          bs.live_preview_timer:stop()
+          bs.live_preview_timer:close()
         end
-        live_preview_timer = nil
+        bs.live_preview_timer = nil
       end
 
-      last_preview_str = str
+      bs.last_preview_str = str
 
       -- Classify as "code" for live preview (same path the batch render uses for code blocks)
       local sem     = semantics_mod.classify(range, bufnr, "code")
@@ -486,18 +481,18 @@ function M.render_live_typst_preview()
       local session = require("typst-concealer.session")
 
       local image_id, ext_id
-      if preview_image ~= nil then
-        image_id = preview_image.image_id
-        state.prepare_extmark_reuse(bufnr, preview_image.extmark_id)
-        ext_id = extmark.place_render_extmark(image_id, range, preview_image.extmark_id, false, sem)
+      if bs.preview_image ~= nil then
+        image_id = bs.preview_image.image_id
+        state.prepare_extmark_reuse(bufnr, bs.preview_image.extmark_id)
+        ext_id = extmark.place_render_extmark(bufnr, image_id, range, bs.preview_image.extmark_id, false, sem)
       else
         image_id = new_image_id(bufnr)
-        ext_id   = extmark.place_render_extmark(image_id, range, nil, false, sem)
+        ext_id   = extmark.place_render_extmark(bufnr, image_id, range, nil, false, sem)
       end
 
       -- Remove old preview item from the O(1) lookup index
-      if preview_image then
-        state.item_by_image_id[preview_image.image_id] = nil
+      if bs.preview_image then
+        state.item_by_image_id[bs.preview_image.image_id] = nil
       end
 
       local item = {
@@ -513,7 +508,7 @@ function M.render_live_typst_preview()
       -- Register in the O(1) index so conceal_for_image_id can find the semantics
       state.item_by_image_id[image_id] = item
       session.render_items_via_watch(bufnr, { item }, "preview")
-      preview_image = { image_id = image_id, extmark_id = ext_id }
+      bs.preview_image = { image_id = image_id, extmark_id = ext_id }
     end)
   )
 end
