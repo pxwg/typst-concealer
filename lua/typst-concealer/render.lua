@@ -89,7 +89,6 @@ function M.hard_reset_buf(bufnr)
 
   vim.api.nvim_buf_clear_namespace(bufnr, state.ns_id,  0, -1)
   vim.api.nvim_buf_clear_namespace(bufnr, state.ns_id2, 0, -1)
-  vim.api.nvim_buf_clear_namespace(bufnr, state.ns_id3, 0, -1)
 
   state.buffers[bufnr] = nil
   diagnostics          = {}
@@ -261,48 +260,40 @@ end
 local function hide_one_extmark(bufnr, bs, extmark_id)
   local mm = bs.multiline_marks[extmark_id]
   if mm ~= nil then
-    if mm.virt_lines then
-      -- Block multiline (virt_lines path)
-      local vl_id    = bs.block_virt_lines_marks[extmark_id]
-      local saved_vl = nil
-      if vl_id then
-        local vm = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id3, vl_id, { details = true })
-        if #vm > 0 and vm[3] then
-          saved_vl = vm[3].virt_lines
-          vim.api.nvim_buf_set_extmark(bufnr, state.ns_id3, vm[1], vm[2], {
-            id               = vl_id,
-            virt_lines       = {},
-            virt_lines_above = true,
-          })
+    if mm.is_block_carrier then
+      -- Top-carrier model: read carrier virt_text + virt_lines for save, then delete all ns_id2
+      local saved = nil
+      if mm.carrier_id then
+        local sm = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, mm.carrier_id, { details = true })
+        if sm and #sm > 0 then
+          saved = { sm[3].virt_text }
+          for _, vl in ipairs(sm[3].virt_lines or {}) do
+            saved[#saved + 1] = vl
+          end
         end
+        vim.api.nvim_buf_del_extmark(bufnr, state.ns_id2, mm.carrier_id)
+        mm.carrier_id = nil
       end
-      local mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, extmark_id, { details = true })
-      if #mark > 0 then
-        local row, col, opts = mark[1], mark[2], mark[3]
-        vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
-          id         = extmark_id,
-          invalidate = true,
-          end_col    = opts.end_col,
-          end_row    = opts.end_row,
-        })
+      for _, sid in ipairs(mm.tail_ids or {}) do
+        vim.api.nvim_buf_del_extmark(bufnr, state.ns_id2, sid)
       end
-      return { block_virt_lines = true, virt_lines_data = saved_vl }
-    else
-      -- Regular multiline (ns_id2 overlay path)
-      local mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, extmark_id, { details = true })
-      if #mark > 0 and mark[3] and mark[3].virt_text_pos == "right_align" then
-        return nil
-      end
-      local text = {}
-      for _, sub_id in ipairs(mm) do
-        local sub_mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, sub_id, { details = true })
-        if sub_mark and sub_mark[3] then
-          text[#text + 1] = sub_mark[3].virt_text
-        end
-        vim.api.nvim_buf_del_extmark(bufnr, state.ns_id2, sub_id)
-      end
-      return text
+      mm.tail_ids = {}
+      return saved
     end
+    -- Non-block multiline (ns_id2 overlay path)
+    local mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, extmark_id, { details = true })
+    if #mark > 0 and mark[3] and mark[3].virt_text_pos == "right_align" then
+      return nil
+    end
+    local text = {}
+    for _, sub_id in ipairs(mm) do
+      local sub_mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, sub_id, { details = true })
+      if sub_mark and sub_mark[3] then
+        text[#text + 1] = sub_mark[3].virt_text
+      end
+      vim.api.nvim_buf_del_extmark(bufnr, state.ns_id2, sub_id)
+    end
+    return text
   else
     -- Single-line extmark
     local mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, extmark_id, { details = true })
@@ -329,33 +320,7 @@ end
 --- @param saved table  the saved data returned by hide_one_extmark
 --- @param extmark_mod table  require("typst-concealer.extmark")
 local function restore_one_extmark(bufnr, bs, extmark_id, saved, extmark_mod)
-  if type(saved) == "table" and saved.block_virt_lines then
-    local mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, extmark_id, { details = true })
-    if #mark > 0 then
-      local row, col, opts = mark[1], mark[2], mark[3]
-      vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
-        id            = extmark_id,
-        invalidate    = true,
-        --- @diagnostic disable-next-line: assign-type-mismatch
-        conceal_lines = "",
-        end_col       = opts.end_col,
-        end_row       = opts.end_row,
-      })
-    end
-    local vl_id = bs.block_virt_lines_marks[extmark_id]
-    if vl_id and saved.virt_lines_data then
-      local vm = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id3, vl_id, { details = true })
-      if #vm > 0 then
-        vim.api.nvim_buf_set_extmark(bufnr, state.ns_id3, vm[1], vm[2], {
-          id               = vl_id,
-          virt_lines       = saved.virt_lines_data,
-          virt_lines_above = true,
-        })
-      end
-    end
-  else
-    extmark_mod.update_extmark_text(bufnr, extmark_id, saved, true)
-  end
+  extmark_mod.update_extmark_text(bufnr, extmark_id, saved, true)
 end
 
 --- Hide / restore extmarks that overlap the cursor position.
