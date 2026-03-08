@@ -168,6 +168,10 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
 
   extmark.create_image(page_path, image_id, natural_cols, natural_rows)
   extmark.conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, source_rows)
+  -- Keep cursor-line unconcealed after async page updates (e.g. after save render).
+  -- on_page_rendered runs after typst watch outputs become stable; this is the
+  -- earliest reliable point where new extmark text is actually present.
+  require("typst-concealer.render").hide_extmarks_at_cursor(bufnr)
 end
 
 --- Attempt to render page i of session if the file is stable (two consecutive equal stamps).

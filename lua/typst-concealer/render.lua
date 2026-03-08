@@ -3,8 +3,8 @@
 --- (render_live_typst_preview).  Both paths share semantics.classify() and the
 --- same extmark/session infrastructure.
 
-local state = require("typst-concealer.state")
 local semantics_mod = require("typst-concealer.semantics")
+local state = require("typst-concealer.state")
 local M = {}
 
 local diagnostics = {}
@@ -355,10 +355,6 @@ function M.hide_extmarks_at_cursor(bufnr)
 
   local cursor_row = vim.api.nvim_win_get_cursor(0)[1] - 1
 
-  -- Same row, same mode: O(1) early return
-  if bs.hover.last_cursor_row == cursor_row and bs.hover.last_mode == mode then
-    return
-  end
   bs.hover.last_cursor_row = cursor_row
   bs.hover.last_mode = mode
 
