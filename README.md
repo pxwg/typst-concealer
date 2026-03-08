@@ -58,6 +58,34 @@ These styles are applied *after* all other rules are applied.
 - Breaks sometimes, pls report if any errors happen
 - Sometimes the message sent to the kitty image protocol gets displayed on the screen as colourful garbage text. It's difficult to reproduce, and I have no idea what to do about this.
 
+## Helpful tips
+
+Sometimes, while rendering typst with some `#show` rules, for example:
+```typ
+#show conf.with(name: "test")
+```
+this plugin would crash since it breaks the preamble injection from the plugin. To fix this, you can do this hacky way to avoid this crash:
+```typ
+#let conf(name: "Title", doc) = {
+  if concealed == "true" {
+    doc
+  } else {
+    // place your actual theme/conf here
+  }
+}
+```
+and passing the `concealed` variable to `typst` in the configuration of the plugin:
+```lua
+require("typst-concealer").setup({
+  -- other options...
+  compile_args = {
+    "--input",
+    "concealed=true",
+  },
+})
+```
+Then the crash should be avoided, and you can still have your actual theme/conf when you render the pdf/html.
+
 ## TODO
 - [ ] Support top level set/let/import when in live insert mode previews
 - [ ] Automatically re-render a 'static' conceal when it is edited in insert mode
