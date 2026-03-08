@@ -230,7 +230,9 @@ function M.setup(cfg)
     group = augroup,
     desc = "render file on enter",
     callback = function(ev)
-      require("typst-concealer.render").render_buf(ev.buf)
+      vim.schedule(function()
+        require("typst-concealer.render").render_buf(ev.buf)
+      end)
     end,
   })
 
