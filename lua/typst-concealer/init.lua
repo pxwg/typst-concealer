@@ -225,7 +225,7 @@ function M.setup(cfg)
 
   -- ── Autocmds ──────────────────────────────────────────────────────────────
 
-  vim.api.nvim_create_autocmd("BufEnter", {
+  vim.api.nvim_create_autocmd("BufReadPost", {
     pattern = "*.typ",
     group = augroup,
     desc = "render file on enter",
