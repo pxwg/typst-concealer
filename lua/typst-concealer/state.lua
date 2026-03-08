@@ -35,7 +35,7 @@ M.image_ids_in_use = {}
 --- @type { [integer]: { full?: typst_watch_session, preview?: typst_watch_session } }
 M.watch_sessions = {}
 
---- @type { [integer]: { full_items?: table[] } }
+--- @type { [integer]: { full_items?: table[], line_to_items?: table } }
 M.buffer_render_state = {}
 
 --- Per-buffer mutable render state (extmark, live-preview, conceal transients).
@@ -54,6 +54,11 @@ function M.get_buf_state(bufnr)
       currently_hidden_extmark_ids = {},
       multiline_marks              = {},
       block_virt_lines_marks       = {},
+      hover = {
+        last_cursor_row = nil,
+        last_mode       = nil,
+        throttle_timer  = nil,
+      },
     }
   end
   return M.buffers[bufnr]

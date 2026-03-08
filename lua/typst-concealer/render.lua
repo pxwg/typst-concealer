@@ -234,148 +234,200 @@ function M.render_buf(bufnr)
   state.buffer_render_state[bufnr]            = state.buffer_render_state[bufnr] or {}
   state.buffer_render_state[bufnr].full_items = batch_items
 
+  -- Rebuild per-line item index for O(1) hover lookup
+  local line_to_items = {}
+  for _, item in ipairs(batch_items) do
+    for row = item.range[1], item.range[3] do
+      if not line_to_items[row] then line_to_items[row] = {} end
+      line_to_items[row][#line_to_items[row] + 1] = item
+    end
+  end
+  state.buffer_render_state[bufnr].line_to_items = line_to_items
+
   vim.schedule(function()
     session.render_items_via_watch(bufnr, batch_items, "full")
   end)
+  -- Reset hover guard so hide_extmarks_at_cursor re-evaluates after render
+  state.get_buf_state(bufnr).hover.last_cursor_row = nil
   M.hide_extmarks_at_cursor(bufnr)
+end
+
+--- Hide a single extmark (removes virt_text/virt_lines from display).
+--- Returns saved state for later restoration, or nil if the extmark should be skipped.
+--- @param bufnr integer
+--- @param bs table  per-buffer state
+--- @param extmark_id integer
+--- @return table|nil saved
+local function hide_one_extmark(bufnr, bs, extmark_id)
+  local mm = bs.multiline_marks[extmark_id]
+  if mm ~= nil then
+    if mm.virt_lines then
+      -- Block multiline (virt_lines path)
+      local vl_id    = bs.block_virt_lines_marks[extmark_id]
+      local saved_vl = nil
+      if vl_id then
+        local vm = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id3, vl_id, { details = true })
+        if #vm > 0 and vm[3] then
+          saved_vl = vm[3].virt_lines
+          vim.api.nvim_buf_set_extmark(bufnr, state.ns_id3, vm[1], vm[2], {
+            id               = vl_id,
+            virt_lines       = {},
+            virt_lines_above = true,
+          })
+        end
+      end
+      local mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, extmark_id, { details = true })
+      if #mark > 0 then
+        local row, col, opts = mark[1], mark[2], mark[3]
+        vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
+          id         = extmark_id,
+          invalidate = true,
+          end_col    = opts.end_col,
+          end_row    = opts.end_row,
+        })
+      end
+      return { block_virt_lines = true, virt_lines_data = saved_vl }
+    else
+      -- Regular multiline (ns_id2 overlay path)
+      local mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, extmark_id, { details = true })
+      if #mark > 0 and mark[3] and mark[3].virt_text_pos == "right_align" then
+        return nil
+      end
+      local text = {}
+      for _, sub_id in ipairs(mm) do
+        local sub_mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, sub_id, { details = true })
+        if sub_mark and sub_mark[3] then
+          text[#text + 1] = sub_mark[3].virt_text
+        end
+        vim.api.nvim_buf_del_extmark(bufnr, state.ns_id2, sub_id)
+      end
+      return text
+    end
+  else
+    -- Single-line extmark
+    local mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, extmark_id, { details = true })
+    if #mark == 0 then return nil end
+    local row, col, opts = mark[1], mark[2], mark[3]
+    local saved = opts.virt_text
+    vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
+      id            = extmark_id,
+      virt_text     = { { "" } },
+      end_row       = opts.end_row,
+      end_col       = opts.end_col,
+      conceal       = nil,
+      virt_text_pos = opts.virt_text_pos,
+      invalidate    = opts.invalidate,
+    })
+    return saved
+  end
+end
+
+--- Restore a previously hidden extmark.
+--- @param bufnr integer
+--- @param bs table  per-buffer state
+--- @param extmark_id integer
+--- @param saved table  the saved data returned by hide_one_extmark
+--- @param extmark_mod table  require("typst-concealer.extmark")
+local function restore_one_extmark(bufnr, bs, extmark_id, saved, extmark_mod)
+  if type(saved) == "table" and saved.block_virt_lines then
+    local mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, extmark_id, { details = true })
+    if #mark > 0 then
+      local row, col, opts = mark[1], mark[2], mark[3]
+      vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
+        id            = extmark_id,
+        invalidate    = true,
+        --- @diagnostic disable-next-line: assign-type-mismatch
+        conceal_lines = "",
+        end_col       = opts.end_col,
+        end_row       = opts.end_row,
+      })
+    end
+    local vl_id = bs.block_virt_lines_marks[extmark_id]
+    if vl_id and saved.virt_lines_data then
+      local vm = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id3, vl_id, { details = true })
+      if #vm > 0 then
+        vim.api.nvim_buf_set_extmark(bufnr, state.ns_id3, vm[1], vm[2], {
+          id               = vl_id,
+          virt_lines       = saved.virt_lines_data,
+          virt_lines_above = true,
+        })
+      end
+    end
+  else
+    extmark_mod.update_extmark_text(bufnr, extmark_id, saved, true)
+  end
 end
 
 --- Hide / restore extmarks that overlap the cursor position.
 --- Called on CursorMoved and ModeChanged.
 --- @param bufnr integer
 function M.hide_extmarks_at_cursor(bufnr)
-  local main    = require("typst-concealer")
-  local extmark = require("typst-concealer.extmark")
-  local bs      = state.get_buf_state(bufnr)
-
-  local new_hidden = {}
+  local main        = require("typst-concealer")
+  local bs          = state.get_buf_state(bufnr)
+  local extmark_mod = require("typst-concealer.extmark")
 
   local mode = vim.api.nvim_get_mode().mode
-  if not (main.config.conceal_in_normal and mode:find("n", 1, true) ~= nil) then
-    local cursor_line = vim.api.nvim_win_get_cursor(0)[1] - 1
-    local range_line  = vim.fn.getpos("v")[2] - 1
 
-    local extmarks
-    if range_line > cursor_line then
-      extmarks = vim.api.nvim_buf_get_extmarks(bufnr, state.ns_id,
-        { cursor_line, 0 }, { range_line, -1 }, { overlap = true, details = true })
-    else
-      extmarks = vim.api.nvim_buf_get_extmarks(bufnr, state.ns_id,
-        { range_line, 0 }, { cursor_line, -1 }, { overlap = true, details = true })
+  -- conceal_in_normal mode: don't hide anything, restore all hidden extmarks
+  if main.config.conceal_in_normal and mode:find("n", 1, true) ~= nil then
+    for id, saved in pairs(bs.currently_hidden_extmark_ids) do
+      restore_one_extmark(bufnr, bs, id, saved, extmark_mod)
     end
+    bs.currently_hidden_extmark_ids = {}
+    bs.hover.last_cursor_row = nil  -- force re-process on next call
+    bs.hover.last_mode = mode
+    return
+  end
 
-    for _, em in ipairs(extmarks) do
-      local id = em[1]
-      if bs.multiline_marks[id] ~= nil then
-        local mm = bs.multiline_marks[id]
-        if mm.virt_lines then
-          -- Block multiline (virt_lines path)
-          if new_hidden[id] ~= nil then
-            -- already handled
-          elseif bs.currently_hidden_extmark_ids[id] ~= nil then
-            new_hidden[id] = bs.currently_hidden_extmark_ids[id]
-            bs.currently_hidden_extmark_ids[id] = nil
-          else
-            local vl_id     = bs.block_virt_lines_marks[id]
-            local saved_vl  = nil
-            if vl_id then
-              local vm = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id3, vl_id, { details = true })
-              if #vm > 0 and vm[3] then
-                saved_vl = vm[3].virt_lines
-                vim.api.nvim_buf_set_extmark(bufnr, state.ns_id3, vm[1], vm[2], {
-                  id               = vl_id,
-                  virt_lines       = {},
-                  virt_lines_above = true,
-                })
-              end
-            end
-            local mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, id, { details = true })
-            if #mark > 0 then
-              local row, col, opts = mark[1], mark[2], mark[3]
-              vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
-                id         = id,
-                invalidate = true,
-                end_col    = opts.end_col,
-                end_row    = opts.end_row,
-              })
-            end
-            new_hidden[id] = { block_virt_lines = true, virt_lines_data = saved_vl }
-          end
-          goto continue
-        end
-        -- Regular multiline (ns_id2 overlay path)
-        if new_hidden[id] ~= nil then
-          -- already handled
-        elseif bs.currently_hidden_extmark_ids[id] ~= nil then
-          new_hidden[id] = bs.currently_hidden_extmark_ids[id]
-          bs.currently_hidden_extmark_ids[id] = nil
-        else
-          if em[4].virt_text_pos == "right_align" then
-            goto continue
-          end
-          local text = {}
-          for _, sub_id in ipairs(mm) do
-            local sub_mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, sub_id, { details = true })
-            local opts = sub_mark[3]
-            text[#text + 1] = opts.virt_text
-            vim.api.nvim_buf_del_extmark(bufnr, state.ns_id2, sub_id)
-          end
-          new_hidden[id] = text
-          bs.currently_hidden_extmark_ids[id] = nil
-        end
-      else
-        -- Single-line extmark
-        local id2, row, col, opts = em[1], em[2], em[3], em[4]
-        if bs.currently_hidden_extmark_ids[id2] ~= nil then
-          new_hidden[id2] = bs.currently_hidden_extmark_ids[id2]
-          bs.currently_hidden_extmark_ids[id2] = nil
-        else
-          new_hidden[id2] = opts.virt_text
-          bs.currently_hidden_extmark_ids[id2] = nil
-          vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
-            id            = id2,
-            virt_text     = { { "" } },
-            end_row       = opts.end_row,
-            end_col       = opts.end_col,
-            conceal       = nil,
-            virt_text_pos = opts.virt_text_pos,
-            invalidate    = opts.invalidate,
-          })
-        end
+  local cursor_row = vim.api.nvim_win_get_cursor(0)[1] - 1
+
+  -- Same row, same mode: O(1) early return
+  if bs.hover.last_cursor_row == cursor_row and bs.hover.last_mode == mode then
+    return
+  end
+  bs.hover.last_cursor_row = cursor_row
+  bs.hover.last_mode       = mode
+
+  -- Determine row range to unconceal
+  local is_visual = mode == "v" or mode == "V" or mode == "\22"
+  local lo, hi = cursor_row, cursor_row
+  if is_visual then
+    local vrow = vim.fn.getpos("v")[2] - 1
+    lo, hi = math.min(cursor_row, vrow), math.max(cursor_row, vrow)
+  end
+
+  -- Collect items to hide from line index (no nvim_buf_get_extmarks call)
+  local brs           = state.buffer_render_state[bufnr]
+  local line_to_items = (brs and brs.line_to_items) or {}
+  local should_hide   = {}  -- extmark_id -> item
+  for row = lo, hi do
+    local row_items = line_to_items[row]
+    if row_items then
+      for _, item in ipairs(row_items) do
+        should_hide[item.extmark_id] = item
       end
-      ::continue::
     end
   end
 
-  -- Restore extmarks that are no longer under the cursor
-  for id, text in pairs(bs.currently_hidden_extmark_ids) do
-    if type(text) == "table" and text.block_virt_lines then
-      local mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, id, { details = true })
-      if #mark > 0 then
-        local row, col, opts = mark[1], mark[2], mark[3]
-        vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
-          id         = id,
-          invalidate = true,
-          --- @diagnostic disable-next-line: assign-type-mismatch
-          conceal_lines = "",
-          end_col    = opts.end_col,
-          end_row    = opts.end_row,
-        })
-      end
-      local vl_id = bs.block_virt_lines_marks[id]
-      if vl_id and text.virt_lines_data then
-        local vm = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id3, vl_id, { details = true })
-        if #vm > 0 then
-          vim.api.nvim_buf_set_extmark(bufnr, state.ns_id3, vm[1], vm[2], {
-            id               = vl_id,
-            virt_lines       = text.virt_lines_data,
-            virt_lines_above = true,
-          })
-        end
-      end
+  -- Differential update
+  local new_hidden = {}
+
+  -- Restore extmarks no longer under cursor
+  for extmark_id, saved in pairs(bs.currently_hidden_extmark_ids) do
+    if should_hide[extmark_id] then
+      new_hidden[extmark_id] = saved  -- still under cursor, keep hidden
     else
-      local extmark_mod = require("typst-concealer.extmark")
-      extmark_mod.update_extmark_text(bufnr, id, text, true)
+      restore_one_extmark(bufnr, bs, extmark_id, saved, extmark_mod)
+    end
+  end
+
+  -- Hide newly entered extmarks
+  for extmark_id, _ in pairs(should_hide) do
+    if not bs.currently_hidden_extmark_ids[extmark_id] then
+      local saved = hide_one_extmark(bufnr, bs, extmark_id)
+      if saved ~= nil then
+        new_hidden[extmark_id] = saved
+      end
     end
   end
 

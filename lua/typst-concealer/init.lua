@@ -79,6 +79,7 @@ end
 --- @field block_padding_cols?    integer   Terminal columns reserved as outer padding for code blocks.
 --- @field block_preview_margin_pt? number  Extra Typst-side inner margin for code block previews.
 --- @field live_preview_debounce? number    Debounce delay for live preview in ms. Default 100.
+--- @field cursor_hover_throttle_ms? number  Throttle delay for CursorMoved hover in ms. Default 0 (disabled).
 
 local function default(val, default_val)
   if val == nil then return default_val end
@@ -143,8 +144,9 @@ function M.setup(cfg)
     compiler_args           = default(cfg.compiler_args,           {}),
     header                  = default(cfg.header,                  ""),
     block_padding_cols      = default(cfg.block_padding_cols,      15),
-    block_preview_margin_pt = default(cfg.block_preview_margin_pt, 6),
-    live_preview_debounce   = default(cfg.live_preview_debounce,   100),
+    block_preview_margin_pt     = default(cfg.block_preview_margin_pt,     6),
+    live_preview_debounce       = default(cfg.live_preview_debounce,       100),
+    cursor_hover_throttle_ms    = default(cfg.cursor_hover_throttle_ms,    0),
   }
 
   if not vim.list_contains({ "none", "simple", "colorscheme" }, M.config.styling_type) then
@@ -244,7 +246,25 @@ function M.setup(cfg)
     group    = augroup,
     desc     = "unconceal on line hover",
     callback = function(ev)
-      require("typst-concealer.render").hide_extmarks_at_cursor(ev.buf)
+      local throttle = require("typst-concealer").config.cursor_hover_throttle_ms
+      if throttle <= 0 then
+        -- No throttle: call directly (row-level guard is inside the function)
+        require("typst-concealer.render").hide_extmarks_at_cursor(ev.buf)
+        return
+      end
+      -- Per-buffer throttle: skip if timer already running
+      local bs = require("typst-concealer.state").get_buf_state(ev.buf)
+      if bs.hover.throttle_timer then
+        return
+      end
+      bs.hover.throttle_timer = vim.uv.new_timer()
+      bs.hover.throttle_timer:start(throttle, 0, vim.schedule_wrap(function()
+        if bs.hover.throttle_timer then
+          bs.hover.throttle_timer:close()
+          bs.hover.throttle_timer = nil
+        end
+        require("typst-concealer.render").hide_extmarks_at_cursor(ev.buf)
+      end))
     end,
   })
 
