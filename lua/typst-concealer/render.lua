@@ -25,14 +25,103 @@ local function range_to_string(range, bufnr)
   return table.concat(content, "\n")
 end
 
---- Returns true if parent_range fully contains child_range (end-position based).
---- @param parent_range Range4
---- @param child_range  Range4
---- @return boolean
-local function range_contains(parent_range, child_range)
-  local _, _, end_row1, end_col1 = parent_range[1], parent_range[2], parent_range[3], parent_range[4]
-  local _, _, end_row2, end_col2 = child_range[1], child_range[2], child_range[3], child_range[4]
-  return end_row1 > end_row2 or (end_row1 == end_row2 and end_col1 >= end_col2)
+--- Build an index of query-matched block nodes keyed by TSNode:id().
+--- This index is used only for semantic annotation; actual top-level selection
+--- is performed by AST traversal with subtree pruning.
+--- @param bufnr integer
+--- @param tree TSNode
+--- @param query vim.treesitter.Query
+--- @return table<integer, table>
+local function build_typst_match_index(bufnr, tree, query)
+  local index = {}
+
+  for _, match, _ in query:iter_matches(tree, bufnr, nil, nil, { all = true }) do
+    local block = match[3] and match[3][1]
+    if block ~= nil then
+      local node_id = block:id()
+      local entry = {
+        node = block,
+        node_type = block:type(),
+        range = { block:range() },
+      }
+
+      if entry.node_type == "code" then
+        local code_node = match[2] and match[2][1]
+        entry.code_type = code_node and code_node:type() or nil
+
+        if match[1] ~= nil then
+          local a, b, c, d = match[1][1]:range()
+          entry.call_ident = range_to_string({ a, b, c, d }, bufnr)
+        else
+          entry.call_ident = ""
+        end
+      end
+
+      index[node_id] = entry
+    end
+  end
+
+  return index
+end
+
+--- Traverse AST top-down and collect only maximal / top-level matched units.
+--- If a node is already a matched block, its subtree is pruned.
+--- @param root TSNode
+--- @param match_index table<integer, table>
+--- @return table[]
+local function collect_top_level_typst_units(root, match_index)
+  local units = {}
+
+  local function visit(node)
+    if node == nil then
+      return
+    end
+
+    local entry = match_index[node:id()]
+    if entry ~= nil then
+      units[#units + 1] = entry
+      return
+    end
+
+    for child in node:iter_children() do
+      if child:named() then
+        visit(child)
+      end
+    end
+  end
+
+  visit(root)
+  return units
+end
+
+--- Convert top-level units into ordered render entries while accumulating preludes.
+--- @param bufnr integer
+--- @param units table[]
+--- @return table[]
+local function build_render_entries_from_units(bufnr, units)
+  local render_entries = {}
+
+  for _, unit in ipairs(units) do
+    if unit.node_type == "math" then
+      render_entries[#render_entries + 1] = {
+        range = unit.range,
+        prelude_count = #state.runtime_preludes,
+        node_type = "math",
+      }
+    elseif unit.node_type == "code" then
+      if vim.list_contains({ "let", "set", "import", "show" }, unit.code_type) then
+        state.runtime_preludes[#state.runtime_preludes + 1] = range_to_string(unit.range, bufnr) .. "\n"
+      elseif not vim.list_contains({ "pagebreak" }, unit.call_ident or "") then
+        render_entries[#render_entries + 1] = {
+          range = unit.range,
+          prelude_count = #state.runtime_preludes,
+          node_type = "code",
+        }
+      end
+    end
+  end
+
+  return render_entries
 end
 
 --- Allocate a new image_id for bufnr, scanning for a free slot.
@@ -137,64 +226,11 @@ function M.render_buf(bufnr)
   local parser = vim.treesitter.get_parser(bufnr)
   local tree = parser:parse()[1]:root()
 
-  --- @type { [integer]: { [1]: Range4, [2]: integer, [3]: string } }
-  local ranges = {}
-  local prev_range = nil
-
-  for _, match, _ in main._typst_query:iter_matches(tree, bufnr, nil, nil, { all = true }) do
-    local block_type = match[3][1]:type()
-    local start_row, start_col, end_row, end_col = match[3][1]:range()
-
-    if prev_range ~= nil and range_contains(prev_range, { start_row, start_col, end_row, end_col }) then
-      goto continue
-    end
-
-    if block_type == "math" then
-      local image_id = new_image_id(bufnr)
-      ranges[image_id] = { { start_row, start_col, end_row, end_col }, #state.runtime_preludes, "math" }
-      prev_range = { start_row, start_col, end_row, end_col }
-    elseif block_type == "code" then
-      local code_type = match[2][1]:type()
-      local call_ident = ""
-      if match[1] ~= nil then
-        local a, b, c, d = match[1][1]:range()
-        call_ident = range_to_string({ a, b, c, d }, bufnr)
-      end
-      if
-        (not vim.list_contains({ "let", "set", "import", "show" }, code_type))
-        and (not vim.list_contains({ "pagebreak" }, call_ident))
-      then
-        local image_id = new_image_id(bufnr)
-        ranges[image_id] = { { start_row, start_col, end_row, end_col }, #state.runtime_preludes, "code" }
-        prev_range = { start_row, start_col, end_row, end_col }
-      end
-      if vim.list_contains({ "let", "set", "import", "show" }, code_type) then
-        state.runtime_preludes[#state.runtime_preludes + 1] = range_to_string(
-          { start_row, start_col, end_row, end_col },
-          bufnr
-        ) .. "\n"
-      end
-    end
-    ::continue::
-  end
-
-  -- Sort entries by document order before allocating extmarks
-  local sorted_entries = {}
-  for id, payload in pairs(ranges) do
-    sorted_entries[#sorted_entries + 1] = {
-      image_id = id,
-      range = payload[1],
-      prelude_count = payload[2],
-      node_type = payload[3],
-    }
-  end
-  table.sort(sorted_entries, function(a, b)
-    local ar, br = a.range, b.range
-    if ar[1] ~= br[1] then
-      return ar[1] < br[1]
-    end
-    return ar[2] < br[2]
-  end)
+  local match_index = build_typst_match_index(bufnr, tree, main._typst_query)
+  local sorted_entries = build_render_entries_from_units(
+    bufnr,
+    collect_top_level_typst_units(tree, match_index)
+  )
 
   local prev_items = (state.buffer_render_state[bufnr] and state.buffer_render_state[bufnr].full_items) or {}
   local batch_items = {}
