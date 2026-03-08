@@ -11,6 +11,8 @@ Forked from [typst-concealer](https://www.github.com/PartyWumpus/typst-concealer
 
 ![example](./docs/example.png)
 
+![example-1](./docs/example-1.png)
+
 ## Installation
 Lazy.nvim:
 ```lua
@@ -52,10 +54,8 @@ The `styling_type` option is probably the most important one. It has three modes
 These styles are applied *after* all other rules are applied.
 
 ## Known issues
-- Assumes a mutable /tmp folder
+- A temporary `.typst-concealer` file is created in the same directory as the file being edited, and is used for `typst watch`. This is a bit hacky, but it works. It will be deleted when the plugin is disabled, but if the plugin crashes or something, it may be left behind. You can safely delete it if it does.
 - Breaks sometimes, pls report if any errors happen
-- The rules about positioning of multiline/inline are totally different from what typst actually does (when doing inline stuff, do it like this: `$ 2+2=4 $`, not `$2+2=4$`, or the plugin will render it weird. This is the complete opposite of what typst normally does, will be fixed eventually)
-- If a file is closed while stuff is rendering, the plugin will freak out.
 - Sometimes the message sent to the kitty image protocol gets displayed on the screen as colourful garbage text. It's difficult to reproduce, and I have no idea what to do about this.
 
 ## TODO
