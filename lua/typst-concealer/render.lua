@@ -454,20 +454,182 @@ function M.hide_extmarks_at_cursor(bufnr)
   bs.hover.invalidated = false
 end
 
-local function preview_win_config(bufnr, width, height, for_create)
+local function clamp(x, lo, hi)
+  return math.max(lo, math.min(hi, x))
+end
+
+local function rect_intersection_area(a, b)
+  local left = math.max(a.left, b.left)
+  local right = math.min(a.right, b.right)
+  local top = math.max(a.top, b.top)
+  local bottom = math.min(a.bottom, b.bottom)
+  if left > right or top > bottom then
+    return 0
+  end
+  return (right - left + 1) * (bottom - top + 1)
+end
+
+local function get_cursor_anchor_screenpos(bufnr)
   local src_winid = vim.fn.bufwinid(bufnr)
   if src_winid == -1 then
     src_winid = 0
   end
+
   local cursor = vim.api.nvim_win_get_cursor(src_winid)
+  local sp = vim.fn.screenpos(src_winid, cursor[1], cursor[2] + 1)
+
+  -- screenpos() returns 1-based screen coordinates; float config uses editor-relative row/col.
+  local row = math.max(0, (sp.row or 1) - 1)
+  local col = math.max(0, (sp.col or 1) - 1)
+
+  return {
+    src_winid = src_winid,
+    row = row,
+    col = col,
+  }
+end
+
+local function get_float_rect(winid)
+  if not vim.api.nvim_win_is_valid(winid) then
+    return nil
+  end
+  local cfg = vim.api.nvim_win_get_config(winid)
+  if cfg.relative == nil or cfg.relative == "" then
+    return nil
+  end
+
+  local pos = vim.api.nvim_win_get_position(winid)
+  local height = vim.api.nvim_win_get_height(winid)
+  local width = vim.api.nvim_win_get_width(winid)
+
+  local top = pos[1]
+  local left = pos[2]
+
+  return {
+    winid = winid,
+    top = top,
+    left = left,
+    bottom = top + height - 1,
+    right = left + width - 1,
+    width = width,
+    height = height,
+    zindex = cfg.zindex or 50,
+    focusable = cfg.focusable ~= false,
+  }
+end
+
+local function is_near_anchor(rect, anchor)
+  -- only cares about floats that are roughly in the same area as the cursor, to reduce the number of obstacles and speed up scoring
+  local margin_row = 12
+  local margin_col = 50
+  return not (
+    rect.bottom < anchor.row - margin_row
+    or rect.top > anchor.row + margin_row
+    or rect.right < anchor.col - margin_col
+    or rect.left > anchor.col + margin_col
+  )
+end
+
+local function list_nearby_float_obstacles(exclude_winid, anchor)
+  local ret = {}
+  for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if winid ~= exclude_winid then
+      local rect = get_float_rect(winid)
+      if rect ~= nil and is_near_anchor(rect, anchor) then
+        ret[#ret + 1] = rect
+      end
+    end
+  end
+  return ret
+end
+
+local function make_candidate_rect(anchor, width, height, row, col)
+  return {
+    top = row,
+    left = col,
+    bottom = row + height - 1,
+    right = col + width - 1,
+    width = width,
+    height = height,
+    dist = math.abs(row - anchor.row) + math.abs(col - anchor.col),
+  }
+end
+
+local function candidate_penalty(rect, obstacles, editor_h, editor_w)
+  local penalty = 0
+
+  if rect.top < 0 then
+    penalty = penalty + 1000 + -rect.top * 20
+  end
+  if rect.left < 0 then
+    penalty = penalty + 1000 + -rect.left * 20
+  end
+  if rect.bottom >= editor_h then
+    penalty = penalty + 1000 + (rect.bottom - editor_h + 1) * 20
+  end
+  if rect.right >= editor_w then
+    penalty = penalty + 1000 + (rect.right - editor_w + 1) * 20
+  end
+
+  for _, obs in ipairs(obstacles) do
+    local area = rect_intersection_area(rect, obs)
+    if area > 0 then
+      local weight = (obs.zindex >= 100) and 8 or 4
+      penalty = penalty + area * weight
+    end
+  end
+
+  penalty = penalty + rect.dist
+
+  return penalty
+end
+
+local function choose_preview_rect(bufnr, width, height, exclude_winid)
+  local anchor = get_cursor_anchor_screenpos(bufnr)
+  local obstacles = list_nearby_float_obstacles(exclude_winid, anchor)
+
+  local editor_h = vim.o.lines - vim.o.cmdheight
+  local editor_w = vim.o.columns
+
+  local candidates = {
+    make_candidate_rect(anchor, width, height, anchor.row + 1, anchor.col + 1),
+    make_candidate_rect(anchor, width, height, anchor.row + 1, anchor.col - width - 1),
+    make_candidate_rect(anchor, width, height, anchor.row - height, anchor.col + 1),
+    make_candidate_rect(anchor, width, height, anchor.row - height, anchor.col - width - 1),
+    make_candidate_rect(anchor, width, height, anchor.row + 2, anchor.col),
+    make_candidate_rect(anchor, width, height, anchor.row - height - 1, anchor.col),
+    make_candidate_rect(anchor, width, height, anchor.row, anchor.col + 2),
+    make_candidate_rect(anchor, width, height, anchor.row, anchor.col - width - 2),
+  }
+
+  local best = nil
+  local best_penalty = math.huge
+
+  for _, rect in ipairs(candidates) do
+    local p = candidate_penalty(rect, obstacles, editor_h, editor_w)
+    if p < best_penalty then
+      best = rect
+      best_penalty = p
+    end
+  end
+
+  best.top = clamp(best.top, 0, math.max(0, editor_h - height))
+  best.left = clamp(best.left, 0, math.max(0, editor_w - width))
+
+  return best
+end
+
+local function preview_win_config(bufnr, width, height, for_create)
+  local bs = state.get_buf_state(bufnr)
+  local preview_winid = bs.preview_float and bs.preview_float.winid or nil
+  local rect = choose_preview_rect(bufnr, math.max(1, width or 1), math.max(1, height or 1), preview_winid)
+
   local config = {
-    relative = "win",
-    win = src_winid,
-    bufpos = { cursor[1] - 1, cursor[2] },
-    row = 1,
-    col = 1,
-    width = math.max(1, width or 1),
-    height = math.max(1, height or 1),
+    relative = "editor",
+    row = rect.top,
+    col = rect.left,
+    width = rect.width,
+    height = rect.height,
     style = "minimal",
     focusable = false,
     zindex = 250,
