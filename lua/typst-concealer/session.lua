@@ -311,7 +311,13 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
   extmark.create_image(page_path, image_id, natural_cols, natural_rows)
   extmark.conceal_for_image_id(target_bufnr, image_id, natural_cols, natural_rows, source_rows)
   if item and item.render_target == "float" then
-    require("typst-concealer.render").sync_live_preview_float(item.bufnr, natural_cols, natural_rows)
+    require("typst-concealer.render").commit_live_typst_preview(
+      item.bufnr,
+      image_id,
+      extmark_id,
+      natural_cols,
+      natural_rows
+    )
   else
     require("typst-concealer.render").hide_extmarks_at_cursor(bufnr)
   end

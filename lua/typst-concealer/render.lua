@@ -757,6 +757,16 @@ function M.clear_live_typst_preview(bufnr)
     state.item_by_image_id[bs.preview_image.image_id] = nil
     bs.preview_image = nil
   end
+  if bs.pending_preview_image ~= nil then
+    local extmark = require("typst-concealer.extmark")
+    local target_bufnr = bs.pending_preview_image.target_bufnr or bufnr
+    state.prepare_extmark_reuse(target_bufnr, bs.pending_preview_image.extmark_id)
+    pcall(vim.api.nvim_buf_del_extmark, target_bufnr, state.ns_id, bs.pending_preview_image.extmark_id)
+    extmark.clear_image(bs.pending_preview_image.image_id)
+    state.image_id_to_extmark[bs.pending_preview_image.image_id] = nil
+    state.item_by_image_id[bs.pending_preview_image.image_id] = nil
+    bs.pending_preview_image = nil
+  end
 end
 
 --- Render a live preview float of the math node under the cursor.
@@ -813,21 +823,8 @@ function M.render_live_typst_preview(bufnr)
       local target_bufnr = pf.bufnr
       local target_range = PREVIEW_FLOAT_TARGET_RANGE
 
-      local image_id, ext_id
-      if bs.preview_image ~= nil then
-        image_id = bs.preview_image.image_id
-        state.prepare_extmark_reuse(target_bufnr, bs.preview_image.extmark_id)
-        ext_id =
-          extmark.place_render_extmark(target_bufnr, image_id, target_range, bs.preview_image.extmark_id, nil, sem)
-      else
-        image_id = new_image_id(bufnr)
-        ext_id = extmark.place_render_extmark(target_bufnr, image_id, target_range, nil, nil, sem)
-      end
-
-      -- Remove old preview item from the O(1) lookup index
-      if bs.preview_image then
-        state.item_by_image_id[bs.preview_image.image_id] = nil
-      end
+      local image_id = new_image_id(bufnr)
+      local ext_id = extmark.place_render_extmark(target_bufnr, image_id, target_range, nil, nil, sem)
 
       local item = {
         bufnr = bufnr,
@@ -845,9 +842,43 @@ function M.render_live_typst_preview(bufnr)
       -- Register in the O(1) index so conceal_for_image_id can find the semantics
       state.item_by_image_id[image_id] = item
       session.render_items_via_watch(bufnr, { item }, "preview")
-      bs.preview_image = { image_id = image_id, extmark_id = ext_id, target_bufnr = target_bufnr }
+      bs.pending_preview_image = {
+        image_id = image_id,
+        extmark_id = ext_id,
+        target_bufnr = target_bufnr,
+        str = str,
+      }
     end)
   )
+end
+
+function M.commit_live_typst_preview(bufnr, image_id, extmark_id, natural_cols, natural_rows)
+  local bs = state.get_buf_state(bufnr)
+  local pending = bs.pending_preview_image
+  local extmark = require("typst-concealer.extmark")
+
+  if pending == nil or pending.image_id ~= image_id or pending.extmark_id ~= extmark_id then
+    pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id, extmark_id)
+    extmark.clear_image(image_id)
+    state.image_id_to_extmark[image_id] = nil
+    state.item_by_image_id[image_id] = nil
+    return
+  end
+
+  M.sync_live_preview_float(bufnr, natural_cols, natural_rows)
+
+  local old = bs.preview_image
+  if old ~= nil then
+    local old_target_bufnr = old.target_bufnr or bufnr
+    state.prepare_extmark_reuse(old_target_bufnr, old.extmark_id)
+    pcall(vim.api.nvim_buf_del_extmark, old_target_bufnr, state.ns_id, old.extmark_id)
+    extmark.clear_image(old.image_id)
+    state.image_id_to_extmark[old.image_id] = nil
+    state.item_by_image_id[old.image_id] = nil
+  end
+
+  bs.preview_image = pending
+  bs.pending_preview_image = nil
 end
 
 return M

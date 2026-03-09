@@ -47,6 +47,7 @@ function M.get_buf_state(bufnr)
   if not M.buffers[bufnr] then
     M.buffers[bufnr] = {
       preview_image = nil,
+      pending_preview_image = nil,
       live_preview_timer = nil,
       last_preview_str = nil,
       preview_float = {
