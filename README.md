@@ -13,6 +13,8 @@ Forked from [typst-concealer](https://www.github.com/PartyWumpus/typst-concealer
 
 ![example-1](./docs/example-1.png)
 
+![example-cmp](./docs/example-cmp.png)
+
 ## Installation
 Lazy.nvim:
 ```lua
@@ -38,7 +40,7 @@ end)
 ## Features
 - (Maybe) highest resolution typst rendering in neovim community.
 - More configurations aimed for multiple files projects.
-- Live previews when in insert mode (WIP: does not support top level set/let/import)
+- Live previews when in insert mode with float window (WIP: does not support top level set/let/import)
 - Supports top level set/let/import
 - Renders code blocks
 - Renders math blocks
@@ -88,7 +90,5 @@ Then the crash should be avoided, and you can still have your actual theme/conf 
 
 ## TODO
 - [ ] Support top level set/let/import when in live insert mode previews
-- [ ] Automatically re-render a 'static' conceal when it is edited in insert mode
-- [ ] Proper cleanup to get rid of dangling image ids
 - [ ] Investigate weird rendering bug with transparency
 - [ ] Write some better documentation. Investigate what the best way of doing it is.
