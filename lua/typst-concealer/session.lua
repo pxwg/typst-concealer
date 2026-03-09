@@ -11,6 +11,66 @@
 local state = require("typst-concealer.state")
 local M = {}
 
+--- Generate quickfix title for a watch session.
+--- @param bufnr integer
+--- @param kind  'full' | 'preview'
+--- @return string
+local function qf_title(bufnr, kind)
+  local name = vim.api.nvim_buf_get_name(bufnr)
+  if name == nil or name == "" then
+    name = ("buf:%d"):format(bufnr)
+  end
+  return ("typst-concealer (%s): %s"):format(kind, name)
+end
+
+--- Clear quickfix list for a session.
+--- @param bufnr integer
+--- @param kind  'full' | 'preview'
+local function clear_quickfix(bufnr, kind)
+  vim.schedule(function()
+    vim.fn.setqflist({}, "r", {
+      title = qf_title(bufnr, kind),
+      items = {},
+    })
+  end)
+end
+
+--- @param line_map table[]|nil
+--- @param gen_lnum integer
+--- @param gen_col integer
+--- @return table|nil
+local function map_generated_pos(line_map, gen_lnum, gen_col)
+  if not line_map or #line_map == 0 then
+    return nil
+  end
+
+  local nearest = nil
+  for _, seg in ipairs(line_map) do
+    if gen_lnum >= seg.gen_start and gen_lnum <= seg.gen_end then
+      return {
+        filename = vim.api.nvim_buf_get_name(seg.bufnr),
+        lnum = seg.src_start + (gen_lnum - seg.gen_start),
+        col = gen_col,
+        exact = true,
+      }
+    end
+    if gen_lnum < seg.gen_start then
+      nearest = seg
+      break
+    end
+    nearest = seg
+  end
+
+  if nearest then
+    return {
+      filename = vim.api.nvim_buf_get_name(nearest.bufnr),
+      lnum = nearest.src_start,
+      col = 1,
+      exact = false,
+    }
+  end
+end
+
 --- @param path string
 local function safe_unlink(path)
   if vim.uv.fs_stat(path) ~= nil then
@@ -18,7 +78,6 @@ local function safe_unlink(path)
   end
 end
 
---- Overwrite a file in-place so `typst watch` sees content changes on a stable path.
 --- @param path string
 --- @param text string
 --- @return boolean, string?
@@ -33,6 +92,76 @@ local function write_file_in_place(path, text)
     return false, write_err
   end
   return true
+end
+
+local function parse_typst_stderr(session, text)
+  local items = {}
+  local current_msg = nil
+
+  for line in (text .. "\n"):gmatch("(.-)\n") do
+    local trimmed = vim.trim(line)
+
+    if trimmed ~= "" then
+      local msg = trimmed:match("^error:%s*(.*)$")
+      if msg and msg ~= "" then
+        current_msg = msg
+      end
+
+      local file, lnum, col = trimmed:match("^┌─%s+(.+):(%d+):(%d+)$")
+      if not file then
+        file, lnum, col = trimmed:match("^╭─%s+(.+):(%d+):(%d+)$")
+      end
+      if not file then
+        file, lnum, col = trimmed:match("^%s*[╭┌]─%s+(.+):(%d+):(%d+)$")
+      end
+
+      if file and lnum and col then
+        local gen_lnum = tonumber(lnum)
+        local gen_col = tonumber(col)
+        local mapped = map_generated_pos(session.line_map, gen_lnum, gen_col)
+
+        if mapped then
+          items[#items + 1] = {
+            filename = mapped.filename,
+            lnum = mapped.lnum,
+            col = mapped.col,
+            text = mapped.exact and (current_msg or "typst watch error")
+              or ((current_msg or "typst watch error") .. " [generated wrapper/prelude]"),
+            type = "E",
+          }
+        else
+          if file == session.input_path then
+            file = vim.api.nvim_buf_get_name(session.bufnr)
+          end
+          items[#items + 1] = {
+            filename = file,
+            lnum = gen_lnum,
+            col = gen_col,
+            text = current_msg or "typst watch error",
+            type = "E",
+          }
+        end
+      end
+    end
+  end
+
+  return items
+end
+
+--- Update quickfix from accumulated stderr chunks.
+--- @param bufnr integer
+--- @param kind  'full' | 'preview'
+--- @param input_path string
+--- @param chunks string[]
+local function update_quickfix_from_stderr(session)
+  local text = table.concat(session.stderr_chunks, "")
+  local items = parse_typst_stderr(session, text)
+  vim.schedule(function()
+    vim.fn.setqflist({}, "r", {
+      title = qf_title(session.bufnr, session.kind),
+      items = items,
+    })
+  end)
 end
 
 local function get_buf_dir(bufnr)
@@ -78,6 +207,10 @@ function M.stop_watch_session(bufnr, kind)
   end
   local session = bucket[kind]
 
+  if session.stderr_debounce and not session.stderr_debounce:is_closing() then
+    session.stderr_debounce:stop()
+    session.stderr_debounce:close()
+  end
   if session.poll_timer and not session.poll_timer:is_closing() then
     session.poll_timer:stop()
     session.poll_timer:close()
@@ -113,10 +246,10 @@ end
 --- Called when a rendered page file is stable and ready to display.
 --- Looks up item.semantics for the swap / padding decisions.
 --- @param bufnr          integer
---- @param page_path      string   path to the PNG file
+--- @param page_path      string
 --- @param image_id       integer
 --- @param extmark_id     integer
---- @param original_range table    Range4
+--- @param original_range table
 local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original_range)
   local pngData = require("typst-concealer.png-lua")
   local extmark = require("typst-concealer.extmark")
@@ -277,7 +410,9 @@ function M.ensure_watch_session(bufnr, kind)
     items = {},
     page_state = {},
     last_page_count = 0,
+    line_map = nil,
     stderr_chunks = {},
+    stderr_debounce = nil,
     dead = false,
   }
 
@@ -287,6 +422,11 @@ function M.ensure_watch_session(bufnr, kind)
     args = args,
   }, function()
     session.dead = true
+    if session.stderr_debounce and not session.stderr_debounce:is_closing() then
+      session.stderr_debounce:stop()
+      session.stderr_debounce:close()
+      session.stderr_debounce = nil
+    end
     if session.poll_timer and not session.poll_timer:is_closing() then
       session.poll_timer:stop()
       session.poll_timer:close()
@@ -317,11 +457,30 @@ function M.ensure_watch_session(bufnr, kind)
     if err2 ~= nil then
       return
     end
+    if not config.do_diagnostics then
+      return
+    end
     if data ~= nil and data ~= "" then
       session.stderr_chunks[#session.stderr_chunks + 1] = data
       if #session.stderr_chunks > 32 then
         table.remove(session.stderr_chunks, 1)
       end
+
+      if session.stderr_debounce == nil or session.stderr_debounce:is_closing() then
+        session.stderr_debounce = vim.uv.new_timer()
+      end
+      session.stderr_debounce:stop()
+      session.stderr_debounce:start(
+        120,
+        0,
+        vim.schedule_wrap(function()
+          local current = get_watch_session(bufnr, kind)
+          if current ~= session or session.dead then
+            return
+          end
+          update_quickfix_from_stderr(session)
+        end)
+      )
     end
   end)
 
@@ -345,17 +504,19 @@ function M.render_items_via_watch(bufnr, items, kind)
   if session == nil then
     return
   end
-
-  for i = #items + 1, session.last_page_count do
-    safe_unlink(session.output_prefix .. "-" .. i .. ".png")
-  end
-
   session.items = items
   session.page_state = {}
+  session.line_map = nil
   session.last_page_count = #items
 
+  if require("typst-concealer").config.do_diagnostics then
+    session.stderr_chunks = {}
+    clear_quickfix(bufnr, kind)
+  end
+
   local wrapper = require("typst-concealer.wrapper")
-  local doc_str = wrapper.build_batch_document(items)
+  local doc_str, line_map = wrapper.build_batch_document(items)
+  session.line_map = line_map
   local ok, err = write_file_in_place(session.input_path, doc_str)
   if not ok then
     vim.schedule(function()

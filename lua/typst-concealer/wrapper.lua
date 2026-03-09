@@ -8,9 +8,39 @@
 ---   M.make_inline_sizing_wrap(source_rows)     intrinsic-constraint wrapper
 ---   M.make_flow_block_wrap(bufnr)              flow-constraint wrapper
 ---                                              (page width = available cols, no terminal padding)
-
 local state = require("typst-concealer.state")
 local M = {}
+
+--- @param s string
+--- @return integer
+local function count_lines(s)
+  if s == "" then
+    return 0
+  end
+  local _, n = s:gsub("\n", "\n")
+  if s:sub(-1) ~= "\n" then
+    n = n + 1
+  end
+  return n
+end
+
+--- @param parts string[]
+--- @param s string
+--- @param cur_line integer
+--- @return integer
+local function push(parts, s, cur_line)
+  parts[#parts + 1] = s
+  return cur_line + count_lines(s)
+end
+
+--- @param item table
+--- @return string
+local function normalize_item_str(item)
+  if type(item.str) == "table" then
+    return table.concat(item.str)
+  end
+  return item.str
+end
 
 --- Returns the column width of the window displaying bufnr (falls back to current window).
 --- @param bufnr integer
@@ -28,15 +58,12 @@ local function current_window_width_pt(bufnr)
   local config = require("typst-concealer").config
   local baseline_pt = config.math_baseline_pt or 11
   local pad_cols = config.block_padding_cols or 4
-
   local win_cols = get_win_cols(bufnr)
   local usable_cols = math.max(8, win_cols - 2 * pad_cols)
-
   if state._cell_px_w and state._cell_px_h then
     local cell_w_pt = baseline_pt * (state._cell_px_w / state._cell_px_h)
     return usable_cols * cell_w_pt
   end
-
   local approx_cell_w_pt = baseline_pt * 0.55
   return usable_cols * approx_cell_w_pt
 end
@@ -133,45 +160,58 @@ end
 
 --- Build multi-page Typst source for a batch render session.
 --- @param items table[]
---- @return string
+--- @return string, table
 function M.build_batch_document(items)
   local main = require("typst-concealer")
   local config = main.config
   local doc = {}
+  local line_map = {}
+  local cur_line = 1
 
   if config.header and config.header ~= "" then
-    doc[#doc + 1] = config.header .. "\n"
+    cur_line = push(doc, config.header .. "\n", cur_line)
   end
-  doc[#doc + 1] = main._styling_prelude
+
+  cur_line = push(doc, main._styling_prelude, cur_line)
 
   for idx, item in ipairs(items) do
     if idx > 1 then
-      doc[#doc + 1] = "#pagebreak()\n"
+      cur_line = push(doc, "#pagebreak()\n", cur_line)
     end
+
     for i = 1, item.prelude_count do
-      doc[#doc + 1] = state.runtime_preludes[i]
+      cur_line = push(doc, state.runtime_preludes[i], cur_line)
     end
+
     local source_rows = item.range[3] - item.range[1] + 1
     local wrap_prefix, wrap_suffix = M.build_wrapper(item, source_rows)
+
     if wrap_prefix ~= "" then
-      doc[#doc + 1] = wrap_prefix
+      cur_line = push(doc, wrap_prefix, cur_line)
     end
-    local str = item.str
-    if type(str) == "table" then
-      for _, s in ipairs(str) do
-        doc[#doc + 1] = s
-      end
-    else
-      doc[#doc + 1] = str
-    end
+
+    local item_text = normalize_item_str(item)
+    local gen_start = cur_line
+    cur_line = push(doc, item_text, cur_line)
+    local gen_end = cur_line - 1
+
+    line_map[#line_map + 1] = {
+      gen_start = gen_start,
+      gen_end = gen_end,
+      bufnr = item.bufnr,
+      src_start = item.range[1] + 1,
+      src_end = item.range[3] + 1,
+      item_idx = idx,
+    }
+
     if wrap_suffix ~= "" then
-      doc[#doc + 1] = wrap_suffix
+      cur_line = push(doc, wrap_suffix, cur_line)
     else
-      doc[#doc + 1] = "\n"
+      cur_line = push(doc, "\n", cur_line)
     end
   end
 
-  return table.concat(doc)
+  return table.concat(doc), line_map
 end
 
 return M
