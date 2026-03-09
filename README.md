@@ -7,7 +7,7 @@ Requires nvim >=11.0, and only works properly in ghostty and kitty.
 
 Works in tmux (partially, it will break if two instances of the plugin work as they will replace each-other's images), will not work in zellij as they have no way of passing through the escape sequences kitty needs to display images.
 
-Forked from [typst-concealer](https://www.github.com/PartyWumpus/typst-concealer), with love and efforts.
+Forked from [typst-concealer](https://www.github.com/PartyWumpus/typst-concealer), with love and efforts (both from me and gpt5.4, claude sonnet 4.6 etc.)
 
 ![example](./docs/example.png)
 
