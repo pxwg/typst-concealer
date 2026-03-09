@@ -262,7 +262,9 @@ function M.setup(cfg)
     desc = "re-render on normal-mode text changes so block anchors stay correct",
     callback = function(ev)
       vim.schedule(function()
-        require("typst-concealer.render").render_buf(ev.buf)
+        local render = require("typst-concealer.render")
+        render.render_buf(ev.buf)
+        render.render_live_typst_preview(ev.buf)
       end)
     end,
   })
@@ -272,6 +274,8 @@ function M.setup(cfg)
     group = augroup,
     desc = "unconceal on line hover",
     callback = function(ev)
+      require("typst-concealer.render").render_live_typst_preview(ev.buf)
+
       local throttle = require("typst-concealer").config.cursor_hover_throttle_ms
       if throttle <= 0 then
         -- No throttle: call directly (row-level guard is inside the function)
@@ -305,32 +309,28 @@ function M.setup(cfg)
     end,
   })
 
-  vim.api.nvim_create_autocmd({ "ModeChanged" }, {
+  vim.api.nvim_create_autocmd("CursorMovedI", {
     group = augroup,
-    pattern = "i:*",
-    desc = "remove preview when exiting insert mode",
+    pattern = "*.typ",
+    desc = "keep float preview synced while moving in insert mode",
     callback = function(ev)
-      if vim.api.nvim_buf_get_name(ev.buf):match(".*%.typ$") then
-        require("typst-concealer.render").clear_live_typst_preview(ev.buf)
-      end
+      require("typst-concealer.render").render_live_typst_preview(ev.buf)
     end,
   })
 
-  vim.api.nvim_create_autocmd("ModeChanged", {
+  vim.api.nvim_create_autocmd("BufEnter", {
     group = augroup,
-    desc = "render live preview on insert enter",
-    pattern = "*:i",
+    pattern = "*.typ",
+    desc = "sync float preview when entering a typst buffer",
     callback = function(ev)
-      if vim.api.nvim_buf_get_name(ev.buf):match(".*%.typ$") then
-        require("typst-concealer.render").render_live_typst_preview(ev.buf)
-      end
+      require("typst-concealer.render").render_live_typst_preview(ev.buf)
     end,
   })
 
   vim.api.nvim_create_autocmd("TextChangedI", {
     pattern = "*.typ",
     group = augroup,
-    desc = "render live preview when insert-mode text changes",
+    desc = "render live preview float when insert-mode text changes",
     callback = function(ev)
       vim.schedule(function()
         require("typst-concealer.render").render_live_typst_preview(ev.buf)

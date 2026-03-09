@@ -9,6 +9,9 @@ local M = {}
 
 local diagnostics = {}
 
+local PREVIEW_FLOAT_TARGET_RANGE = { 0, 0, 1, 0 }
+local PREVIEW_FLOAT_LINE_COUNT = 2
+
 --- Extract the text contained within a buffer range.
 --- @param range Range4
 --- @param bufnr integer
@@ -451,12 +454,98 @@ function M.hide_extmarks_at_cursor(bufnr)
   bs.hover.invalidated = false
 end
 
---- Find the outermost math/code block under the cursor.
---- @return integer|nil start_row, integer start_col, integer end_row, integer end_col
-local function get_typst_block_at_cursor()
-  local parser = vim.treesitter.get_parser(0, "typst")
+local function preview_win_config(bufnr, width, height, for_create)
+  local src_winid = vim.fn.bufwinid(bufnr)
+  if src_winid == -1 then
+    src_winid = 0
+  end
+  local cursor = vim.api.nvim_win_get_cursor(src_winid)
+  local config = {
+    relative = "win",
+    win = src_winid,
+    bufpos = { cursor[1] - 1, cursor[2] },
+    row = 1,
+    col = 1,
+    width = math.max(1, width or 1),
+    height = math.max(1, height or 1),
+    style = "minimal",
+    focusable = false,
+    zindex = 250,
+  }
+  if for_create then
+    config.noautocmd = true
+  end
+  return config
+end
+
+local function ensure_live_preview_float(bufnr)
+  local bs = state.get_buf_state(bufnr)
+  local pf = bs.preview_float
+
+  if pf.bufnr == nil or not vim.api.nvim_buf_is_valid(pf.bufnr) then
+    pf.bufnr = vim.api.nvim_create_buf(false, true)
+    vim.bo[pf.bufnr].bufhidden = "wipe"
+    vim.api.nvim_buf_set_lines(pf.bufnr, 0, -1, false, { "", "" })
+  end
+
+  if vim.api.nvim_buf_line_count(pf.bufnr) < PREVIEW_FLOAT_LINE_COUNT then
+    vim.api.nvim_buf_set_lines(pf.bufnr, 0, -1, false, { "", "" })
+  end
+
+  if pf.winid == nil or not vim.api.nvim_win_is_valid(pf.winid) then
+    local cfg = preview_win_config(bufnr, pf.width, pf.height, true)
+    pf.winid = vim.api.nvim_open_win(pf.bufnr, false, cfg)
+  else
+    local cfg = preview_win_config(bufnr, pf.width, pf.height, false)
+    vim.api.nvim_win_set_config(pf.winid, cfg)
+  end
+
+  return pf
+end
+
+local function close_live_preview_float(bufnr)
+  local bs = state.get_buf_state(bufnr)
+  local pf = bs.preview_float
+
+  if pf.winid ~= nil and vim.api.nvim_win_is_valid(pf.winid) then
+    pcall(vim.api.nvim_win_close, pf.winid, true)
+  end
+  if pf.bufnr ~= nil and vim.api.nvim_buf_is_valid(pf.bufnr) then
+    pcall(vim.api.nvim_buf_delete, pf.bufnr, { force = true })
+  end
+
+  bs.preview_float = {
+    bufnr = nil,
+    winid = nil,
+    width = 1,
+    height = 1,
+  }
+end
+
+function M.sync_live_preview_float(bufnr, width, height)
+  local pf = ensure_live_preview_float(bufnr)
+  if width ~= nil then
+    pf.width = math.max(1, width)
+  end
+  if height ~= nil then
+    pf.height = math.max(1, height)
+  end
+  if pf.winid ~= nil and vim.api.nvim_win_is_valid(pf.winid) then
+    vim.api.nvim_win_set_config(pf.winid, preview_win_config(bufnr, pf.width, pf.height, false))
+  end
+end
+
+--- Find the outermost math/code block under the cursor in bufnr.
+--- @param bufnr integer
+--- @return string|nil node_type, integer|nil start_row, integer start_col, integer end_row, integer end_col
+local function get_typst_block_at_cursor(bufnr)
+  local winid = vim.fn.bufwinid(bufnr)
+  if winid == -1 then
+    return nil
+  end
+  local parser = vim.treesitter.get_parser(bufnr, "typst")
   local tree = parser:parse()[1]:root()
-  local cursor = vim.api.nvim_win_get_cursor(0)
+  local cursor = vim.api.nvim_win_get_cursor(winid)
   local crow, ccol = cursor[1] - 1, cursor[2]
   local element = tree:named_descendant_for_range(crow, ccol, crow, ccol)
   local outermost = nil
@@ -473,7 +562,8 @@ local function get_typst_block_at_cursor()
     element = element:parent()
   end
   if outermost ~= nil then
-    return outermost:range()
+    local node_type = outermost:type()
+    return node_type, outermost:range()
   end
   return nil
 end
@@ -490,14 +580,16 @@ function M.clear_live_typst_preview(bufnr)
     bs.live_preview_timer = nil
   end
   bs.last_preview_str = nil
+  close_live_preview_float(bufnr)
 
   local session = require("typst-concealer.session")
   session.stop_watch_session(bufnr, "preview")
 
   if bs.preview_image ~= nil then
     local extmark = require("typst-concealer.extmark")
-    state.prepare_extmark_reuse(bufnr, bs.preview_image.extmark_id)
-    pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id, bs.preview_image.extmark_id)
+    local target_bufnr = bs.preview_image.target_bufnr or bufnr
+    state.prepare_extmark_reuse(target_bufnr, bs.preview_image.extmark_id)
+    pcall(vim.api.nvim_buf_del_extmark, target_bufnr, state.ns_id, bs.preview_image.extmark_id)
     extmark.clear_image(bs.preview_image.image_id)
     state.image_id_to_extmark[bs.preview_image.image_id] = nil
     state.item_by_image_id[bs.preview_image.image_id] = nil
@@ -505,16 +597,18 @@ function M.clear_live_typst_preview(bufnr)
   end
 end
 
---- Render a live preview of the Typst node under the cursor (insert mode).
---- Uses semantics.classify so that multiline code blocks get the flow wrapper.
+--- Render a live preview float of the math node under the cursor.
 --- @param bufnr integer
 function M.render_live_typst_preview(bufnr)
   local bs = state.get_buf_state(bufnr)
-  local start_row, start_col, end_row, end_col = get_typst_block_at_cursor()
-  if start_row == nil then
+  local node_type, start_row, start_col, end_row, end_col = get_typst_block_at_cursor(bufnr)
+  if start_row == nil or node_type ~= "math" then
     M.clear_live_typst_preview(bufnr)
     return
   end
+
+  -- Reposition immediately even if the rendered content is unchanged.
+  M.sync_live_preview_float(bufnr)
 
   local range = { start_row, start_col, end_row, end_col }
   local str = range_to_string(range, bufnr)
@@ -546,19 +640,26 @@ function M.render_live_typst_preview(bufnr)
 
       bs.last_preview_str = str
 
-      -- Classify as "code" for live preview (same path the batch render uses for code blocks)
-      local sem = semantics_mod.classify(range, bufnr, "code")
+      local sem = {
+        constraint_kind = "intrinsic",
+        display_kind = "block",
+        source_kind = "math",
+      }
       local extmark = require("typst-concealer.extmark")
       local session = require("typst-concealer.session")
+      local pf = ensure_live_preview_float(bufnr)
+      local target_bufnr = pf.bufnr
+      local target_range = PREVIEW_FLOAT_TARGET_RANGE
 
       local image_id, ext_id
       if bs.preview_image ~= nil then
         image_id = bs.preview_image.image_id
-        state.prepare_extmark_reuse(bufnr, bs.preview_image.extmark_id)
-        ext_id = extmark.place_render_extmark(bufnr, image_id, range, bs.preview_image.extmark_id, false, sem)
+        state.prepare_extmark_reuse(target_bufnr, bs.preview_image.extmark_id)
+        ext_id =
+          extmark.place_render_extmark(target_bufnr, image_id, target_range, bs.preview_image.extmark_id, nil, sem)
       else
         image_id = new_image_id(bufnr)
-        ext_id = extmark.place_render_extmark(bufnr, image_id, range, nil, false, sem)
+        ext_id = extmark.place_render_extmark(target_bufnr, image_id, target_range, nil, nil, sem)
       end
 
       -- Remove old preview item from the O(1) lookup index
@@ -573,13 +674,16 @@ function M.render_live_typst_preview(bufnr)
         range = range,
         str = str,
         prelude_count = 0,
-        node_type = "code",
+        node_type = "math",
         semantics = sem,
+        render_target = "float",
+        target_bufnr = target_bufnr,
+        target_range = target_range,
       }
       -- Register in the O(1) index so conceal_for_image_id can find the semantics
       state.item_by_image_id[image_id] = item
       session.render_items_via_watch(bufnr, { item }, "preview")
-      bs.preview_image = { image_id = image_id, extmark_id = ext_id }
+      bs.preview_image = { image_id = image_id, extmark_id = ext_id, target_bufnr = target_bufnr }
     end)
   )
 end

@@ -49,6 +49,12 @@ function M.get_buf_state(bufnr)
       preview_image = nil,
       live_preview_timer = nil,
       last_preview_str = nil,
+      preview_float = {
+        bufnr = nil,
+        winid = nil,
+        width = 1,
+        height = 1,
+      },
       currently_hidden_extmark_ids = {},
       multiline_marks = {},
       hover = {

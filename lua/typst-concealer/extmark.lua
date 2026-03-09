@@ -317,7 +317,9 @@ function M.conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, sou
   local item = state.get_item_by_image_id(image_id)
   local config = require("typst-concealer").config
   local pad = 0
-  if item and item.semantics then
+  if item and item.render_target == "float" then
+    pad = 0
+  elseif item and item.semantics then
     if item.semantics.constraint_kind == "flow" then
       -- Multiline code: left padding = terminal display padding
       -- block_padding_cols = 终端显示留白（Neovim display 层）

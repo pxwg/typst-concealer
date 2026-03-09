@@ -255,7 +255,16 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
   local extmark = require("typst-concealer.extmark")
   local kitty_codes = require("typst-concealer.kitty-codes")
 
-  local source_rows = original_range[3] - original_range[1] + 1
+  local item = state.get_item_by_image_id(image_id)
+
+  local target_bufnr = bufnr
+  local target_range = original_range
+  if item and item.render_target == "float" then
+    target_bufnr = item.target_bufnr or bufnr
+    target_range = item.target_range or original_range
+  end
+
+  local source_rows = target_range[3] - target_range[1] + 1
   local success, data = pcall(pngData, page_path)
   if not success then
     return
@@ -300,11 +309,12 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
   end
 
   extmark.create_image(page_path, image_id, natural_cols, natural_rows)
-  extmark.conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, source_rows)
-  -- Keep cursor-line unconcealed after async page updates (e.g. after save render).
-  -- on_page_rendered runs after typst watch outputs become stable; this is the
-  -- earliest reliable point where new extmark text is actually present.
-  require("typst-concealer.render").hide_extmarks_at_cursor(bufnr)
+  extmark.conceal_for_image_id(target_bufnr, image_id, natural_cols, natural_rows, source_rows)
+  if item and item.render_target == "float" then
+    require("typst-concealer.render").sync_live_preview_float(item.bufnr, natural_cols, natural_rows)
+  else
+    require("typst-concealer.render").hide_extmarks_at_cursor(bufnr)
+  end
 end
 
 --- Attempt to render page i of session if the file is stable (two consecutive equal stamps).
