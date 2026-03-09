@@ -223,14 +223,11 @@ function M.render_buf(bufnr)
   local extmark = require("typst-concealer.extmark")
   local session = require("typst-concealer.session")
 
-  local parser = vim.treesitter.get_parser(bufnr)
+  local parser = vim.treesitter.get_parser(bufnr, "typst")
   local tree = parser:parse()[1]:root()
 
   local match_index = build_typst_match_index(bufnr, tree, main._typst_query)
-  local sorted_entries = build_render_entries_from_units(
-    bufnr,
-    collect_top_level_typst_units(tree, match_index)
-  )
+  local sorted_entries = build_render_entries_from_units(bufnr, collect_top_level_typst_units(tree, match_index))
 
   local prev_items = (state.buffer_render_state[bufnr] and state.buffer_render_state[bufnr].full_items) or {}
   local batch_items = {}
