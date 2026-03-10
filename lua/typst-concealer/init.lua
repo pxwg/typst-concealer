@@ -362,14 +362,10 @@ function M.setup(cfg)
   vim.api.nvim_create_autocmd("VimResized", {
     group = augroup,
     desc = "refresh cell pixel size on terminal resize",
-    callback = function()
+    callback = function(ev)
       refresh_cell_px_size()
       local render = require("typst-concealer.render")
-      for bufnr in pairs(M._enabled_buffers) do
-        vim.schedule(function()
-          render.render_buf(bufnr)
-        end)
-      end
+      render.render_buf(ev.buf)
     end,
   })
 
