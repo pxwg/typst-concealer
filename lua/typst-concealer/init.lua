@@ -98,6 +98,8 @@ end
 --- @field block_preview_margin_pt? number  Extra Typst-side inner margin for code block previews.
 --- @field live_preview_debounce? number    Debounce delay for live preview in ms. Default 100.
 --- @field cursor_hover_throttle_ms? number  Throttle delay for CursorMoved hover in ms. Default 0 (disabled).
+--- @field render_paths?          { include?: (string|fun(path: string, bufnr: integer): boolean)[], exclude?: (string|fun(path: string, bufnr: integer): boolean)[] }
+---                                     Optional path rules. `include` acts as a whitelist when non-empty; `exclude` always wins.
 
 local function default(val, default_val)
   if val == nil then
@@ -108,8 +110,58 @@ end
 
 local augroup = vim.api.nvim_create_augroup("typst-concealer", { clear = true })
 
+local function normalize_path(path)
+  if path == nil or path == "" then
+    return ""
+  end
+  return vim.fs.normalize(path)
+end
+
+local function matches_path_rule(rule, path, bufnr)
+  if type(rule) == "string" then
+    return path:match(rule) ~= nil
+  end
+  if type(rule) == "function" then
+    local ok, matched = pcall(rule, path, bufnr)
+    return ok and matched == true
+  end
+  return false
+end
+
+local function matches_any_path_rule(rules, path, bufnr)
+  for _, rule in ipairs(rules or {}) do
+    if matches_path_rule(rule, path, bufnr) then
+      return true
+    end
+  end
+  return false
+end
+
+function M.is_render_allowed(bufnr)
+  bufnr = bufnr or vim.fn.bufnr()
+  local path = normalize_path(vim.api.nvim_buf_get_name(bufnr))
+  local render_paths = (M.config and M.config.render_paths) or {}
+  local includes = render_paths.include or {}
+  local excludes = render_paths.exclude or {}
+
+  if #includes > 0 and not matches_any_path_rule(includes, path, bufnr) then
+    return false
+  end
+
+  if matches_any_path_rule(excludes, path, bufnr) then
+    return false
+  end
+
+  return true
+end
+
 M.enable_buf = function(bufnr)
   bufnr = bufnr or vim.fn.bufnr()
+  if not M.is_render_allowed(bufnr) then
+    M._enabled_buffers[bufnr] = nil
+    require("typst-concealer.render").hard_reset_buf(bufnr)
+    return
+  end
   M._enabled_buffers[bufnr] = true
   require("typst-concealer.render").render_buf(bufnr)
 end
@@ -168,6 +220,7 @@ function M.setup(cfg)
     block_preview_margin_pt = default(cfg.block_preview_margin_pt, 6),
     live_preview_debounce = default(cfg.live_preview_debounce, 100),
     cursor_hover_throttle_ms = default(cfg.cursor_hover_throttle_ms, 0),
+    render_paths = default(cfg.render_paths, {}),
   }
 
   if not vim.list_contains({ "none", "simple", "colorscheme" }, M.config.styling_type) then
@@ -211,8 +264,10 @@ function M.setup(cfg)
   local function init_buf(bufnr)
     vim.opt_local.conceallevel = 2
     vim.opt_local.concealcursor = "nci"
-    if M.config.enabled_by_default then
+    if M.config.enabled_by_default and M.is_render_allowed(bufnr) then
       M._enabled_buffers[bufnr] = true
+    else
+      M._enabled_buffers[bufnr] = nil
     end
   end
 

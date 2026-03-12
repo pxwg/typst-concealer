@@ -55,6 +55,33 @@ The `styling_type` option is probably the most important one. It has three modes
 
 These styles are applied *after* all other rules are applied.
 
+For multi-file projects, `render_paths` can be used to bypass expensive files by path pattern. The table shape is intentionally simple Neovim config:
+
+```lua
+require("typst-concealer").setup({
+  render_paths = {
+    -- Optional whitelist: when non-empty, only these paths render.
+    include = {
+      "/notes/",
+      "/slides/",
+      function(path)
+        return path:match("/chapters/[^/]+%.typ$") ~= nil
+      end,
+    },
+    -- Blacklist always wins over include.
+    exclude = {
+      "/vendor/",
+      "/node_modules/",
+      "/%.git/",
+      "/large%-generated/",
+      "template%-cache%.typ$",
+    },
+  },
+})
+```
+
+String rules use Lua patterns matched against the normalized absolute file path. Function rules receive `(path, bufnr)` and should return `true` when the buffer should match that rule.
+
 ## Known issues
 - A temporary `.typst-concealer` file is created in the same directory as the file being edited, and is used for `typst watch`. This is a bit hacky, but it works. It will be deleted when the plugin is disabled, but if the plugin crashes or something, it may be left behind. You can safely delete it if it does.
 - Breaks sometimes, pls report if any errors happen

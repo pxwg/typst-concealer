@@ -213,7 +213,7 @@ function M.render_buf(bufnr)
   bufnr = bufnr or vim.fn.bufnr()
   clear_diagnostics(bufnr)
 
-  if main._enabled_buffers[bufnr] ~= true then
+  if main._enabled_buffers[bufnr] ~= true or not main.is_render_allowed(bufnr) then
     M.hard_reset_buf(bufnr)
     local session = require("typst-concealer.session")
     session.stop_watch_session(bufnr, "full")
@@ -380,6 +380,19 @@ function M.hide_extmarks_at_cursor(bufnr)
   local main = require("typst-concealer")
   local bs = state.get_buf_state(bufnr)
   local extmark_mod = require("typst-concealer.extmark")
+
+  if main._enabled_buffers[bufnr] ~= true or not main.is_render_allowed(bufnr) then
+    for id, saved in pairs(bs.currently_hidden_extmark_ids) do
+      restore_one_extmark(bufnr, bs, id, saved, extmark_mod)
+    end
+    bs.currently_hidden_extmark_ids = {}
+    bs.hover.last_cursor_row = nil
+    bs.hover.last_mode = nil
+    bs.hover.last_lo = nil
+    bs.hover.last_hi = nil
+    bs.hover.invalidated = false
+    return
+  end
 
   local mode = vim.api.nvim_get_mode().mode
 
@@ -772,7 +785,12 @@ end
 --- Render a live preview float of the math node under the cursor.
 --- @param bufnr integer
 function M.render_live_typst_preview(bufnr)
+  local main = require("typst-concealer")
   local bs = state.get_buf_state(bufnr)
+  if main._enabled_buffers[bufnr] ~= true or not main.is_render_allowed(bufnr) then
+    M.clear_live_typst_preview(bufnr)
+    return
+  end
   local node_type, start_row, start_col, end_row, end_col = get_typst_block_at_cursor(bufnr)
   if start_row == nil or node_type ~= "math" then
     M.clear_live_typst_preview(bufnr)
