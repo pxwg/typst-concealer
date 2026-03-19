@@ -350,6 +350,12 @@ local function hide_one_extmark(bufnr, bs, extmark_id)
     end
     local row, col, opts = mark[1], mark[2], mark[3]
     local saved = opts.virt_text
+    if saved == nil and opts.virt_lines ~= nil then
+      saved = opts.virt_lines[1]
+    end
+    if saved == nil then
+      return nil
+    end
     vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
       id = extmark_id,
       virt_text = { { "" } },
@@ -485,7 +491,7 @@ end
 local function get_cursor_anchor_screenpos(bufnr)
   local src_winid = vim.fn.bufwinid(bufnr)
   if src_winid == -1 then
-    src_winid = 0
+    return nil
   end
 
   local cursor = vim.api.nvim_win_get_cursor(src_winid)
@@ -599,6 +605,9 @@ end
 
 local function choose_preview_rect(bufnr, width, height, exclude_winid)
   local anchor = get_cursor_anchor_screenpos(bufnr)
+  if anchor == nil then
+    return nil
+  end
   local obstacles = list_nearby_float_obstacles(exclude_winid, anchor)
 
   local editor_h = vim.o.lines - vim.o.cmdheight
@@ -636,6 +645,9 @@ local function preview_win_config(bufnr, width, height, for_create)
   local bs = state.get_buf_state(bufnr)
   local preview_winid = bs.preview_float and bs.preview_float.winid or nil
   local rect = choose_preview_rect(bufnr, math.max(1, width or 1), math.max(1, height or 1), preview_winid)
+  if rect == nil then
+    return nil
+  end
 
   local config = {
     relative = "editor",
@@ -669,9 +681,17 @@ local function ensure_live_preview_float(bufnr)
 
   if pf.winid == nil or not vim.api.nvim_win_is_valid(pf.winid) then
     local cfg = preview_win_config(bufnr, pf.width, pf.height, true)
+    if cfg == nil then
+      close_live_preview_float(bufnr)
+      return nil
+    end
     pf.winid = vim.api.nvim_open_win(pf.bufnr, false, cfg)
   else
     local cfg = preview_win_config(bufnr, pf.width, pf.height, false)
+    if cfg == nil then
+      close_live_preview_float(bufnr)
+      return nil
+    end
     vim.api.nvim_win_set_config(pf.winid, cfg)
   end
 
@@ -699,6 +719,9 @@ end
 
 function M.sync_live_preview_float(bufnr, width, height)
   local pf = ensure_live_preview_float(bufnr)
+  if pf == nil then
+    return
+  end
   if width ~= nil then
     pf.width = math.max(1, width)
   end
@@ -838,6 +861,10 @@ function M.render_live_typst_preview(bufnr)
       local extmark = require("typst-concealer.extmark")
       local session = require("typst-concealer.session")
       local pf = ensure_live_preview_float(bufnr)
+      if pf == nil then
+        M.clear_live_typst_preview(bufnr)
+        return
+      end
       local target_bufnr = pf.bufnr
       local target_range = PREVIEW_FLOAT_TARGET_RANGE
 

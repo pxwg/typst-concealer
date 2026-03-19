@@ -388,7 +388,9 @@ function M.setup(cfg)
     desc = "render live preview float when insert-mode text changes",
     callback = function(ev)
       vim.schedule(function()
-        require("typst-concealer.render").render_live_typst_preview(ev.buf)
+        local render = require("typst-concealer.render")
+        render.render_buf(ev.buf)
+        render.render_live_typst_preview(ev.buf)
       end)
     end,
   })
@@ -424,7 +426,7 @@ function M.setup(cfg)
     end,
   })
 
-  vim.api.nvim_create_autocmd({ "BufLeave" }, {
+  vim.api.nvim_create_autocmd({ "BufLeave", "BufWinLeave", "BufHidden", "BufDelete" }, {
     pattern = "*.typ",
     group = augroup,
     desc = "clear live preview when leaving a typst buffer",

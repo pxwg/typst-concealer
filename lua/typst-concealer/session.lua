@@ -197,6 +197,46 @@ local function get_watch_session(bufnr, kind)
   return bucket and bucket[kind] or nil
 end
 
+--- @param bufnr integer
+--- @param range table
+--- @return string|nil
+local function range_to_string(bufnr, range)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return nil
+  end
+
+  local start_row, start_col, end_row, end_col = range[1], range[2], range[3], range[4]
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+  if line_count <= 0 then
+    return ""
+  end
+
+  start_row = math.max(0, math.min(start_row, line_count - 1))
+  end_row = math.max(start_row, math.min(end_row, line_count - 1))
+
+  local content = vim.api.nvim_buf_get_lines(bufnr, start_row, end_row + 1, false)
+  if #content == 0 then
+    return ""
+  end
+
+  local first_len = #(content[1] or "")
+  local last_len = #(content[#content] or "")
+  start_col = math.max(0, math.min(start_col, first_len))
+  end_col = math.max(0, math.min(end_col, last_len))
+
+  if start_row == end_row then
+    if end_col < start_col then
+      end_col = start_col
+    end
+    content[1] = string.sub(content[1], start_col + 1, end_col)
+  else
+    content[1] = string.sub(content[1], start_col + 1)
+    content[#content] = string.sub(content[#content], 1, end_col)
+  end
+
+  return table.concat(content, "\n")
+end
+
 --- Stop a watch session and clean up its files.
 --- @param bufnr integer
 --- @param kind  'full' | 'preview'
@@ -256,12 +296,28 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
   local kitty_codes = require("typst-concealer.kitty-codes")
 
   local item = state.get_item_by_image_id(image_id)
+  if item == nil or type(extmark_id) ~= "number" then
+    return
+  end
 
   local target_bufnr = bufnr
   local target_range = original_range
   if item and item.render_target == "float" then
     target_bufnr = item.target_bufnr or bufnr
     target_range = item.target_range or original_range
+  end
+  if not vim.api.nvim_buf_is_valid(target_bufnr) then
+    return
+  end
+  if state.image_id_to_extmark[image_id] ~= extmark_id then
+    return
+  end
+  local ok_mark, mark = pcall(vim.api.nvim_buf_get_extmark_by_id, target_bufnr, state.ns_id, extmark_id, { details = true })
+  if not ok_mark or mark == nil or #mark == 0 then
+    return
+  end
+  if item.str ~= nil and range_to_string(item.bufnr, item.range) ~= item.str then
+    return
   end
 
   local source_rows = target_range[3] - target_range[1] + 1

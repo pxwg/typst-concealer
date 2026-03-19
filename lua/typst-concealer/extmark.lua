@@ -60,6 +60,60 @@ local function center_padding(natural_cols, bufnr)
   return math.floor((win_width - natural_cols) / 2)
 end
 
+--- Clamp a range to the current buffer contents so extmark updates survive edits.
+--- @param bufnr integer
+--- @param range Range4
+--- @return Range4|nil
+local function normalize_range(bufnr, range)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return nil
+  end
+
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+  if line_count <= 0 then
+    return nil
+  end
+
+  local start_row = math.max(0, math.min(range[1], line_count - 1))
+  local end_row = math.max(start_row, math.min(range[3], line_count - 1))
+  local lines = vim.api.nvim_buf_get_lines(bufnr, start_row, end_row + 1, false)
+
+  local start_len = #(lines[1] or "")
+  local end_len = #(lines[#lines] or "")
+  local start_col = math.max(0, math.min(range[2], start_len))
+  local end_col = math.max(0, math.min(range[4], end_len))
+
+  if start_row == end_row and end_col < start_col then
+    end_col = start_col
+  end
+
+  return { start_row, start_col, end_row, end_col }
+end
+
+--- Normalize virt text payload into one extmark line: { {text, hl?}, ... }.
+--- Accepts chunk, line, or single-item virt_lines forms.
+--- @param value any
+--- @return table
+local function normalize_virt_text_line(value)
+  if type(value) ~= "table" then
+    return { { tostring(value or ""), "" } }
+  end
+
+  if type(value[1]) == "string" then
+    return { value }
+  end
+
+  if type(value[1]) == "table" and type(value[1][1]) == "string" then
+    return value
+  end
+
+  if type(value[1]) == "table" and type(value[1][1]) == "table" then
+    return normalize_virt_text_line(value[1])
+  end
+
+  return { { "", "" } }
+end
+
 --- Low-level extmark placement. Use place_render_extmark for external callers.
 --- @param bufnr      integer
 --- @param image_id  integer
@@ -69,7 +123,12 @@ end
 --- @param is_block  boolean|nil
 --- @return integer  new extmark_id
 local function place_image_extmark(bufnr, image_id, range, extmark_id, concealing, is_block)
-  local start_row, start_col, end_row, end_col = range[1], range[2], range[3], range[4]
+  local normalized = normalize_range(bufnr, range)
+  if normalized == nil then
+    return extmark_id
+  end
+
+  local start_row, start_col, end_row, end_col = normalized[1], normalized[2], normalized[3], normalized[4]
   local height = end_row - start_row + 1
   local new_extmark_id
   local bs = state.get_buf_state(bufnr)
@@ -180,16 +239,23 @@ end
 --- @param virt_text_data  table
 --- @param skip_hide_check boolean|nil
 function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_check)
+  if type(extmark_id) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
   local bs = state.get_buf_state(bufnr)
   if (skip_hide_check ~= true) and bs.currently_hidden_extmark_ids[extmark_id] ~= nil then
     bs.currently_hidden_extmark_ids[extmark_id] = virt_text_data
     return
   end
-  local m = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, extmark_id, { details = true })
+  local ok, m = pcall(vim.api.nvim_buf_get_extmark_by_id, bufnr, state.ns_id, extmark_id, { details = true })
+  if not ok then
+    return
+  end
   if #m == 0 then
     return
   end
   local row, col, opts = m[1], m[2], m[3]
+  local single_line = normalize_virt_text_line(virt_text_data)
 
   local height = opts.end_row - row + 1
   if height ~= 1 then
@@ -273,7 +339,7 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
   elseif opts.virt_text_pos == "inline" or (opts.virt_text_pos == "overlay" and opts.conceal == "") then
     vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
       id = extmark_id,
-      virt_text = virt_text_data,
+      virt_text = single_line,
       virt_text_pos = opts.virt_text_pos,
       invalidate = opts.invalidate,
       end_col = opts.end_col,
@@ -284,7 +350,7 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
   else
     vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
       id = extmark_id,
-      virt_lines = { virt_text_data },
+      virt_lines = { single_line },
       virt_text_pos = opts.virt_text_pos,
       invalidate = opts.invalidate,
       end_col = opts.end_col,
@@ -308,6 +374,9 @@ end
 function M.conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, source_rows)
   local bs = state.get_buf_state(bufnr)
   local extmark_id = state.image_id_to_extmark[image_id]
+  if type(extmark_id) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
   local multiline_extmark_ids = bs.multiline_marks[extmark_id]
 
   local hl_group = "typst-concealer-image-id-" .. tostring(image_id)
