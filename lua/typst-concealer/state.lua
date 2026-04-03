@@ -35,6 +35,10 @@ M.image_ids_in_use = {}
 --- @type { [integer]: { full?: typst_watch_session, preview?: typst_watch_session } }
 M.watch_sessions = {}
 
+--- Aggregated watch diagnostics per buffer/session kind for quickfix injection.
+--- @type { [integer]: { full?: table[], preview?: table[] } }
+M.watch_diagnostics = {}
+
 --- @type { [integer]: { full_items?: table[], line_to_items?: table, extmark_to_item?: table } }
 M.buffer_render_state = {}
 
@@ -87,6 +91,7 @@ M._cell_px_w = nil
 M._cell_px_h = nil
 --- PPI derived so that 1 typst text line ≈ 1 terminal cell height
 M._render_ppi = nil
+M.typst_package_roots = nil
 
 -- PID-derived base for image IDs (collision-resistant per session)
 M.pid = vim.fn.getpid() % 256

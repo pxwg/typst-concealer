@@ -33,6 +33,29 @@ local function push(parts, s, cur_line)
   return cur_line + count_lines(s)
 end
 
+--- Advance a 1-based (line, col) cursor through string s.
+--- Column is also 1-based and points to the next character position.
+--- @param s string
+--- @param line integer
+--- @param col integer
+--- @return integer, integer
+local function advance_pos(s, line, col)
+  if s == "" then
+    return line, col
+  end
+
+  local idx = 1
+  while true do
+    local nl = s:find("\n", idx, true)
+    if nl == nil then
+      return line, col + (#s - idx + 1)
+    end
+    line = line + 1
+    col = 1
+    idx = nl + 1
+  end
+end
+
 --- @param item table
 --- @return string
 local function normalize_item_str(item)
@@ -169,53 +192,68 @@ function M.build_batch_document(items, buf_dir, project_root)
   local doc = {}
   local line_map = {}
   local cur_line = 1
+  local cur_col = 1
 
   local do_rewrite = buf_dir ~= nil and project_root ~= nil
   local pr = do_rewrite and require("typst-concealer.path-rewrite") or nil
   local function maybe_rewrite(text)
     return pr and pr.rewrite_paths(text, buf_dir, project_root) or text
   end
-
-  if config.header and config.header ~= "" then
-    cur_line = push(doc, maybe_rewrite(config.header) .. "\n", cur_line)
+  local function append_chunk(chunk)
+    doc[#doc + 1] = chunk
+    cur_line, cur_col = advance_pos(chunk, cur_line, cur_col)
   end
 
-  cur_line = push(doc, main._styling_prelude, cur_line)
+  if config.header and config.header ~= "" then
+    append_chunk(maybe_rewrite(config.header) .. "\n")
+  end
+
+  append_chunk(main._styling_prelude)
 
   for idx, item in ipairs(items) do
     if idx > 1 then
-      cur_line = push(doc, "#pagebreak()\n", cur_line)
+      append_chunk("#pagebreak()\n")
     end
 
     for i = 1, item.prelude_count do
-      cur_line = push(doc, maybe_rewrite(state.runtime_preludes[i]), cur_line)
+      append_chunk(maybe_rewrite(state.runtime_preludes[i]))
     end
 
     local source_rows = item.range[3] - item.range[1] + 1
     local wrap_prefix, wrap_suffix = M.build_wrapper(item, source_rows)
 
     if wrap_prefix ~= "" then
-      cur_line = push(doc, wrap_prefix, cur_line)
+      append_chunk(wrap_prefix)
     end
 
     local item_text = maybe_rewrite(normalize_item_str(item))
     local gen_start = cur_line
-    cur_line = push(doc, item_text, cur_line)
-    local gen_end = cur_line - 1
+    local gen_start_col = cur_col
+    local gen_end_line, gen_end_col_next = advance_pos(item_text, gen_start, gen_start_col)
+    local gen_end = gen_end_line
+    append_chunk(item_text)
+
+    local src_start_col = item.range[2] + 1
+    local src_end_col = item.range[4] + 1
+    local gen_end_col = math.max(1, gen_end_col_next - 1)
 
     line_map[#line_map + 1] = {
       gen_start = gen_start,
       gen_end = gen_end,
+      gen_start_col = gen_start_col,
+      gen_end_col = gen_end_col,
       bufnr = item.bufnr,
       src_start = item.range[1] + 1,
       src_end = item.range[3] + 1,
+      src_start_col = src_start_col,
+      src_end_col = src_end_col,
       item_idx = idx,
     }
 
     if wrap_suffix ~= "" then
-      cur_line = push(doc, wrap_suffix, cur_line)
+      append_chunk(wrap_suffix)
     else
-      cur_line = push(doc, "\n", cur_line)
+      append_chunk("\n")
     end
   end
 

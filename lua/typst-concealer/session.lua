@@ -11,28 +11,44 @@
 local state = require("typst-concealer.state")
 local M = {}
 
---- Generate quickfix title for a watch session.
+--- Generate quickfix title for all watch diagnostics belonging to a buffer.
 --- @param bufnr integer
---- @param kind  'full' | 'preview'
 --- @return string
-local function qf_title(bufnr, kind)
+local function qf_title(bufnr)
   local name = vim.api.nvim_buf_get_name(bufnr)
   if name == nil or name == "" then
     name = ("buf:%d"):format(bufnr)
   end
-  return ("typst-concealer (%s): %s"):format(kind, name)
+  return ("typst-concealer: %s"):format(name)
 end
 
---- Clear quickfix list for a session.
+--- Rebuild the global quickfix list for a buffer by aggregating watch diagnostics
+--- from both the full and preview sessions.
+--- @param bufnr integer
+local function rebuild_quickfix(bufnr)
+  local bucket = state.watch_diagnostics[bufnr] or {}
+  local items = {}
+  for _, kind in ipairs({ "full", "preview" }) do
+    for _, item in ipairs(bucket[kind] or {}) do
+      items[#items + 1] = item
+    end
+  end
+  vim.schedule(function()
+    vim.fn.setqflist({}, "r", {
+      title = qf_title(bufnr),
+      items = items,
+    })
+  end)
+end
+
+--- Clear quickfix diagnostics for one session kind and rebuild the aggregated
+--- buffer quickfix list.
 --- @param bufnr integer
 --- @param kind  'full' | 'preview'
 local function clear_quickfix(bufnr, kind)
-  vim.schedule(function()
-    vim.fn.setqflist({}, "r", {
-      title = qf_title(bufnr, kind),
-      items = {},
-    })
-  end)
+  state.watch_diagnostics[bufnr] = state.watch_diagnostics[bufnr] or {}
+  state.watch_diagnostics[bufnr][kind] = {}
+  rebuild_quickfix(bufnr)
 end
 
 --- @param line_map table[]|nil
@@ -44,13 +60,41 @@ local function map_generated_pos(line_map, gen_lnum, gen_col)
     return nil
   end
 
+  local function clamp(x, lo, hi)
+    return math.max(lo, math.min(hi, x))
+  end
+
+  local function map_col(seg)
+    local line_offset = gen_lnum - seg.gen_start
+    local src_lnum = seg.src_start + line_offset
+
+    if seg.src_start == seg.src_end and seg.gen_start == seg.gen_end then
+      local delta = math.max(0, gen_col - seg.gen_start_col)
+      local hi = math.max(seg.src_start_col, seg.src_end_col - 1)
+      return src_lnum, clamp(seg.src_start_col + delta, seg.src_start_col, hi)
+    end
+
+    if gen_lnum == seg.gen_start then
+      local delta = math.max(0, gen_col - seg.gen_start_col)
+      return src_lnum, math.max(seg.src_start_col, seg.src_start_col + delta)
+    end
+
+    if gen_lnum == seg.gen_end then
+      local hi = math.max(1, seg.src_end_col - 1)
+      return src_lnum, clamp(gen_col, 1, hi)
+    end
+
+    return src_lnum, math.max(1, gen_col)
+  end
+
   local nearest = nil
   for _, seg in ipairs(line_map) do
     if gen_lnum >= seg.gen_start and gen_lnum <= seg.gen_end then
+      local src_lnum, src_col = map_col(seg)
       return {
         filename = vim.api.nvim_buf_get_name(seg.bufnr),
-        lnum = seg.src_start + (gen_lnum - seg.gen_start),
-        col = gen_col,
+        lnum = src_lnum,
+        col = src_col,
         exact = true,
       }
     end
@@ -65,10 +109,184 @@ local function map_generated_pos(line_map, gen_lnum, gen_col)
     return {
       filename = vim.api.nvim_buf_get_name(nearest.bufnr),
       lnum = nearest.src_start,
-      col = 1,
+      col = nearest.src_start_col or 1,
       exact = false,
     }
   end
+end
+
+--- Normalize a path for comparison when possible.
+--- @param path string
+--- @return string
+local function normalize_path(path)
+  if path == nil or path == "" then
+    return ""
+  end
+  return vim.fs.normalize(vim.fn.fnamemodify(path, ":p"))
+end
+
+--- Determine whether a Typst-reported path refers to this session's generated
+--- temporary input file. Typst may report the path as absolute or relative.
+--- @param session typst_watch_session
+--- @param file string
+--- @return boolean
+local function is_session_input_path(session, file)
+  if file == nil or file == "" then
+    return false
+  end
+
+  local target = normalize_path(session.input_path)
+  local candidates = {
+    file,
+    vim.fn.getcwd() .. "/" .. file,
+    vim.fn.expand("~") .. "/" .. file,
+  }
+  if session.buf_dir then
+    candidates[#candidates + 1] = session.buf_dir .. "/" .. file
+  end
+  if session.project_root then
+    candidates[#candidates + 1] = session.project_root .. "/" .. file
+  end
+
+  for _, candidate in ipairs(candidates) do
+    if normalize_path(candidate) == target then
+      return true
+    end
+  end
+  return false
+end
+
+--- Discover Typst package roots once, preferring `typst info --format=json`.
+--- Falls back to common environment variables and platform defaults.
+--- @return string[]
+local function get_typst_package_roots()
+  if state.typst_package_roots ~= nil then
+    return state.typst_package_roots
+  end
+
+  local roots = {}
+  local seen = {}
+  local function add(path)
+    if path == nil or path == "" then
+      return
+    end
+    local norm = normalize_path(path)
+    if norm == "" or seen[norm] then
+      return
+    end
+    seen[norm] = true
+    roots[#roots + 1] = norm
+  end
+
+  local ok_main, main = pcall(require, "typst-concealer")
+  local typst_location = (ok_main and main.config and main.config.typst_location) or "typst"
+  local ok_run, result = pcall(vim.system, { typst_location, "info", "--format=json" }, { text = true })
+  if ok_run and result then
+    local completed = result:wait(1500)
+    if completed and completed.code == 0 and completed.stdout and completed.stdout ~= "" then
+      local ok_json, info = pcall(vim.json.decode, completed.stdout)
+      if ok_json and info and info.packages then
+        add(info.packages["package-cache-path"])
+        add(info.packages["package-path"])
+      end
+    end
+  end
+
+  add(vim.env.TYPST_PACKAGE_CACHE_PATH)
+  add(vim.env.TYPST_PACKAGE_PATH)
+  add(vim.fn.expand("~/Library/Caches/typst/packages"))
+  add(vim.fn.expand("~/Library/Application Support/typst/packages"))
+  add(vim.fn.expand("~/.cache/typst/packages"))
+  add(vim.fn.expand("~/.local/share/typst/packages"))
+
+  state.typst_package_roots = roots
+  return roots
+end
+
+--- Resolve a Typst-reported source path into a local filesystem path when
+--- possible. Supports:
+---   - absolute paths
+---   - Typst package references like @preview/pkg:1.2.3/file.typ
+---   - paths relative to the buffer directory / project root
+--- @param session typst_watch_session
+--- @param file string
+--- @return string
+local function resolve_typst_source_path(session, file)
+  if file == nil or file == "" then
+    return vim.api.nvim_buf_get_name(session.bufnr)
+  end
+
+  if file:sub(1, 1) == "/" then
+    return file
+  end
+
+  local namespace, pkg, ver, rest = file:match("^@([^/]+)/([^:]+):([^/]+)/(.*)$")
+  if namespace and pkg and ver and rest then
+    for _, base in ipairs(get_typst_package_roots()) do
+      local path = table.concat({ base, namespace, pkg, ver, rest }, "/")
+      if vim.uv.fs_stat(path) ~= nil then
+        return path
+      end
+    end
+  end
+
+  local relative_candidates = {}
+  if session.buf_dir then
+    relative_candidates[#relative_candidates + 1] = session.buf_dir .. "/" .. file
+  end
+  if session.project_root then
+    relative_candidates[#relative_candidates + 1] = session.project_root .. "/" .. file
+  end
+
+  for _, path in ipairs(relative_candidates) do
+    if vim.uv.fs_stat(path) ~= nil then
+      return path
+    end
+  end
+
+  return file
+end
+
+--- Classify a Typst stderr location as either generated-wrapper space (map back
+--- into the edited source buffer) or an external/real source file that should
+--- be navigated directly.
+--- @param session typst_watch_session
+--- @param file string
+--- @param lnum integer
+--- @param col integer
+--- @return table
+local function resolve_report_location(session, file, lnum, col)
+  if is_session_input_path(session, file) then
+    local mapped = map_generated_pos(session.line_map, lnum, col)
+    if mapped and mapped.exact then
+      return {
+        filename = mapped.filename,
+        lnum = mapped.lnum,
+        col = mapped.col,
+        exact = true,
+        generated = false,
+      }
+    end
+
+    -- The error points into generated wrapper/prelude space rather than the
+    -- original item body. Jump directly to the generated cache file so the
+    -- user can inspect the real failing Typst source.
+    return {
+      filename = session.input_path,
+      lnum = lnum,
+      col = col,
+      exact = true,
+      generated = true,
+    }
+  end
+
+  return {
+    filename = resolve_typst_source_path(session, file),
+    lnum = lnum,
+    col = col,
+    exact = true,
+    generated = false,
+  }
 end
 
 --- @param path string
@@ -121,14 +339,45 @@ end
 local function parse_typst_stderr(session, text)
   local items = {}
   local current_msg = nil
+  local current_type = "E"
+  local current_has_location = false
+
+  local function fallback_item(msg, typ)
+    local mapped = map_generated_pos(session.line_map, 1, 1)
+    return {
+      filename = mapped and mapped.filename or vim.api.nvim_buf_get_name(session.bufnr),
+      lnum = mapped and mapped.lnum or 1,
+      col = mapped and mapped.col or 1,
+      text = msg,
+      type = typ or "E",
+    }
+  end
+
+  local function flush_pending_message()
+    if current_msg ~= nil and current_msg ~= "" and not current_has_location then
+      items[#items + 1] = fallback_item(current_msg, current_type)
+    end
+    current_msg = nil
+    current_type = "E"
+    current_has_location = false
+  end
 
   for line in (text .. "\n"):gmatch("(.-)\n") do
     local trimmed = vim.trim(line)
 
-    if trimmed ~= "" then
-      local msg = trimmed:match("^error:%s*(.*)$")
-      if msg and msg ~= "" then
-        current_msg = msg
+    if trimmed == "" then
+      flush_pending_message()
+    else
+      local err_msg = trimmed:match("^error:%s*(.*)$")
+      local warn_msg = trimmed:match("^warning:%s*(.*)$")
+      if err_msg and err_msg ~= "" then
+        flush_pending_message()
+        current_msg = err_msg
+        current_type = "E"
+      elseif warn_msg and warn_msg ~= "" then
+        flush_pending_message()
+        current_msg = warn_msg
+        current_type = "W"
       end
 
       local file, lnum, col = trimmed:match("^┌─%s+(.+):(%d+):(%d+)$")
@@ -140,34 +389,23 @@ local function parse_typst_stderr(session, text)
       end
 
       if file and lnum and col then
+        current_has_location = true
         local gen_lnum = tonumber(lnum)
         local gen_col = tonumber(col)
-        local mapped = map_generated_pos(session.line_map, gen_lnum, gen_col)
+        local resolved = resolve_report_location(session, file, gen_lnum, gen_col)
 
-        if mapped then
-          items[#items + 1] = {
-            filename = mapped.filename,
-            lnum = mapped.lnum,
-            col = mapped.col,
-            text = mapped.exact and (current_msg or "typst watch error")
-              or ((current_msg or "typst watch error") .. " [generated wrapper/prelude]"),
-            type = "E",
-          }
-        else
-          if file == session.input_path then
-            file = vim.api.nvim_buf_get_name(session.bufnr)
-          end
-          items[#items + 1] = {
-            filename = file,
-            lnum = gen_lnum,
-            col = gen_col,
-            text = current_msg or "typst watch error",
-            type = "E",
-          }
-        end
+        items[#items + 1] = {
+          filename = resolved.filename,
+          lnum = resolved.lnum,
+          col = resolved.col,
+          text = current_msg or "typst watch error",
+          type = current_type,
+        }
       end
     end
   end
+
+  flush_pending_message()
 
   return items
 end
@@ -178,14 +416,17 @@ end
 --- @param input_path string
 --- @param chunks string[]
 local function update_quickfix_from_stderr(session)
-  local text = table.concat(session.stderr_chunks, "")
+  local text = session.stderr_text or ""
+  if session.stderr_line_buffer and session.stderr_line_buffer ~= "" then
+    text = text .. session.stderr_line_buffer
+  end
   local items = parse_typst_stderr(session, text)
-  vim.schedule(function()
-    vim.fn.setqflist({}, "r", {
-      title = qf_title(session.bufnr, session.kind),
-      items = items,
-    })
-  end)
+  for _, item in ipairs(items) do
+    item.text = ("[%s] %s"):format(session.kind, item.text)
+  end
+  state.watch_diagnostics[session.bufnr] = state.watch_diagnostics[session.bufnr] or {}
+  state.watch_diagnostics[session.bufnr][session.kind] = items
+  rebuild_quickfix(session.bufnr)
 end
 
 local function get_buf_dir(bufnr)
@@ -321,6 +562,13 @@ function M.stop_watch_session(bufnr, kind)
   end
 
   bucket[kind] = nil
+  if state.watch_diagnostics[bufnr] then
+    state.watch_diagnostics[bufnr][kind] = nil
+    if next(state.watch_diagnostics[bufnr]) == nil then
+      state.watch_diagnostics[bufnr] = nil
+    end
+    rebuild_quickfix(bufnr)
+  end
   if next(bucket) == nil then
     state.watch_sessions[bufnr] = nil
   end
@@ -571,6 +819,8 @@ function M.ensure_watch_session(bufnr, kind)
     last_page_count = 0,
     line_map = nil,
     stderr_chunks = {},
+    stderr_text = "",
+    stderr_line_buffer = "",
     stderr_debounce = nil,
     dead = false,
     buf_dir = buf_dir,
@@ -583,6 +833,13 @@ function M.ensure_watch_session(bufnr, kind)
     args = args,
   }, function()
     session.dead = true
+    if session.stderr_line_buffer and session.stderr_line_buffer ~= "" then
+      session.stderr_text = (session.stderr_text or "") .. session.stderr_line_buffer
+      session.stderr_line_buffer = ""
+    end
+    if config.do_diagnostics then
+      update_quickfix_from_stderr(session)
+    end
     if session.stderr_debounce and not session.stderr_debounce:is_closing() then
       session.stderr_debounce:stop()
       session.stderr_debounce:close()
@@ -622,9 +879,15 @@ function M.ensure_watch_session(bufnr, kind)
       return
     end
     if data ~= nil and data ~= "" then
-      session.stderr_chunks[#session.stderr_chunks + 1] = data
-      if #session.stderr_chunks > 32 then
-        table.remove(session.stderr_chunks, 1)
+      session.stderr_line_buffer = (session.stderr_line_buffer or "") .. data
+      while true do
+        local nl = session.stderr_line_buffer:find("\n", 1, true)
+        if nl == nil then
+          break
+        end
+        local line = session.stderr_line_buffer:sub(1, nl)
+        session.stderr_text = (session.stderr_text or "") .. line
+        session.stderr_line_buffer = session.stderr_line_buffer:sub(nl + 1)
       end
 
       if session.stderr_debounce == nil or session.stderr_debounce:is_closing() then
@@ -673,6 +936,8 @@ function M.render_items_via_watch(bufnr, items, kind)
 
   if require("typst-concealer").config.do_diagnostics then
     session.stderr_chunks = {}
+    session.stderr_text = ""
+    session.stderr_line_buffer = ""
     clear_quickfix(bufnr, kind)
   end
 
