@@ -82,16 +82,40 @@ end
 --- @param text string
 --- @return boolean, string?
 local function write_file_in_place(path, text)
-  local fd, open_err = vim.uv.fs_open(path, "w", tonumber("644", 8))
+  local dir = vim.fn.fnamemodify(path, ":h")
+  local base = vim.fn.fnamemodify(path, ":t")
+  local tmp_path = string.format("%s/.%s.tmp-%d", dir, base, vim.uv.hrtime())
+  local fd, open_err = vim.uv.fs_open(tmp_path, "w", tonumber("644", 8))
   if not fd then
     return false, open_err
   end
   local _, write_err = vim.uv.fs_write(fd, text, 0)
   vim.uv.fs_close(fd)
   if write_err ~= nil then
+    safe_unlink(tmp_path)
     return false, write_err
   end
+  local ok, rename_err = vim.uv.fs_rename(tmp_path, path)
+  if not ok then
+    safe_unlink(tmp_path)
+    return false, rename_err
+  end
   return true
+end
+
+--- Remove previously rendered page images so a new watch cycle never consumes
+--- stale pages before Typst finishes writing the current generation.
+--- @param prefix string
+local function clear_session_output_pages(prefix)
+  local first = 1
+  while true do
+    local page_path = prefix .. "-" .. first .. ".png"
+    if vim.uv.fs_stat(page_path) == nil then
+      break
+    end
+    safe_unlink(page_path)
+    first = first + 1
+  end
 end
 
 local function parse_typst_stderr(session, text)
@@ -645,6 +669,7 @@ function M.render_items_via_watch(bufnr, items, kind)
   session.page_state = {}
   session.line_map = nil
   session.last_page_count = #items
+  clear_session_output_pages(session.output_prefix)
 
   if require("typst-concealer").config.do_diagnostics then
     session.stderr_chunks = {}
