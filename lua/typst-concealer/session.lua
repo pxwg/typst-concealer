@@ -349,6 +349,12 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
     natural_cols = #kitty_codes.diacritics - 1
   end
 
+  if item ~= nil then
+    item.natural_cols = natural_cols
+    item.natural_rows = natural_rows
+    item.source_rows = source_rows
+  end
+
   -- Swap extmark to new range when the new image is ready.
   -- item.semantics drives the is_block decision (replaces display_as_block boolean).
   local bstate = state.buffer_render_state[bufnr]

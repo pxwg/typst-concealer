@@ -277,7 +277,9 @@ function M.render_buf(bufnr)
 
   -- Rebuild per-line item index for O(1) hover lookup
   local line_to_items = {}
+  local extmark_to_item = {}
   for _, item in ipairs(batch_items) do
+    extmark_to_item[item.extmark_id] = item
     for row = item.range[1], item.range[3] do
       if not line_to_items[row] then
         line_to_items[row] = {}
@@ -286,6 +288,7 @@ function M.render_buf(bufnr)
     end
   end
   state.buffer_render_state[bufnr].line_to_items = line_to_items
+  state.buffer_render_state[bufnr].extmark_to_item = extmark_to_item
 
   vim.schedule(function()
     session.render_items_via_watch(bufnr, batch_items, "full")
@@ -300,25 +303,15 @@ function M.render_buf(bufnr)
 end
 
 --- Hide a single extmark (removes virt_text/virt_lines from display).
---- Returns saved state for later restoration, or nil if the extmark should be skipped.
+--- Returns true when the extmark was hidden and should be tracked.
 --- @param bufnr integer
 --- @param bs table  per-buffer state
 --- @param extmark_id integer
---- @return table|nil saved
 local function hide_one_extmark(bufnr, bs, extmark_id)
   local mm = bs.multiline_marks[extmark_id]
   if mm ~= nil then
     if mm.is_block_carrier then
-      -- Top-carrier model: read carrier virt_text + virt_lines for save, then delete all ns_id2
-      local saved = nil
       if mm.carrier_id then
-        local sm = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, mm.carrier_id, { details = true })
-        if sm and #sm > 0 then
-          saved = { sm[3].virt_text }
-          for _, vl in ipairs(sm[3].virt_lines or {}) do
-            saved[#saved + 1] = vl
-          end
-        end
         vim.api.nvim_buf_del_extmark(bufnr, state.ns_id2, mm.carrier_id)
         mm.carrier_id = nil
       end
@@ -326,22 +319,17 @@ local function hide_one_extmark(bufnr, bs, extmark_id)
         vim.api.nvim_buf_del_extmark(bufnr, state.ns_id2, sid)
       end
       mm.tail_ids = {}
-      return saved
+      return true
     end
     -- Non-block multiline (ns_id2 overlay path)
     local mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, extmark_id, { details = true })
     if #mark > 0 and mark[3] and mark[3].virt_text_pos == "right_align" then
       return nil
     end
-    local text = {}
     for _, sub_id in ipairs(mm) do
-      local sub_mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, sub_id, { details = true })
-      if sub_mark and sub_mark[3] then
-        text[#text + 1] = sub_mark[3].virt_text
-      end
       vim.api.nvim_buf_del_extmark(bufnr, state.ns_id2, sub_id)
     end
-    return text
+    return true
   else
     -- Single-line extmark
     local mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, extmark_id, { details = true })
@@ -349,13 +337,6 @@ local function hide_one_extmark(bufnr, bs, extmark_id)
       return nil
     end
     local row, col, opts = mark[1], mark[2], mark[3]
-    local saved = opts.virt_text
-    if saved == nil and opts.virt_lines ~= nil then
-      saved = opts.virt_lines[1]
-    end
-    if saved == nil then
-      return nil
-    end
     vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
       id = extmark_id,
       virt_text = { { "" } },
@@ -365,18 +346,31 @@ local function hide_one_extmark(bufnr, bs, extmark_id)
       virt_text_pos = opts.virt_text_pos,
       invalidate = opts.invalidate,
     })
-    return saved
+    return true
   end
 end
 
---- Restore a previously hidden extmark.
+--- Restore a previously hidden extmark from the current rendered item state.
 --- @param bufnr integer
---- @param bs table  per-buffer state
 --- @param extmark_id integer
---- @param saved table  the saved data returned by hide_one_extmark
---- @param extmark_mod table  require("typst-concealer.extmark")
-local function restore_one_extmark(bufnr, bs, extmark_id, saved, extmark_mod)
-  extmark_mod.update_extmark_text(bufnr, extmark_id, saved, true)
+local function restore_one_extmark(bufnr, extmark_id)
+  local bs = state.get_buf_state(bufnr)
+  local brs = state.buffer_render_state[bufnr]
+  if brs == nil or brs.extmark_to_item == nil then
+    return
+  end
+  local item = brs.extmark_to_item[extmark_id]
+  if item == nil or item.natural_cols == nil or item.natural_rows == nil then
+    return
+  end
+  bs.currently_hidden_extmark_ids[extmark_id] = nil
+  require("typst-concealer.extmark").conceal_for_image_id(
+    bufnr,
+    item.image_id,
+    item.natural_cols,
+    item.natural_rows,
+    item.source_rows or (item.range[3] - item.range[1] + 1)
+  )
 end
 
 --- Hide / restore extmarks that overlap the cursor position.
@@ -385,11 +379,10 @@ end
 function M.hide_extmarks_at_cursor(bufnr)
   local main = require("typst-concealer")
   local bs = state.get_buf_state(bufnr)
-  local extmark_mod = require("typst-concealer.extmark")
 
   if main._enabled_buffers[bufnr] ~= true or not main.is_render_allowed(bufnr) then
-    for id, saved in pairs(bs.currently_hidden_extmark_ids) do
-      restore_one_extmark(bufnr, bs, id, saved, extmark_mod)
+    for id in pairs(bs.currently_hidden_extmark_ids) do
+      restore_one_extmark(bufnr, id)
     end
     bs.currently_hidden_extmark_ids = {}
     bs.hover.last_cursor_row = nil
@@ -404,8 +397,8 @@ function M.hide_extmarks_at_cursor(bufnr)
 
   -- conceal_in_normal mode: don't hide anything, restore all hidden extmarks
   if main.config.conceal_in_normal and mode:find("n", 1, true) ~= nil then
-    for id, saved in pairs(bs.currently_hidden_extmark_ids) do
-      restore_one_extmark(bufnr, bs, id, saved, extmark_mod)
+    for id in pairs(bs.currently_hidden_extmark_ids) do
+      restore_one_extmark(bufnr, id)
     end
     bs.currently_hidden_extmark_ids = {}
     bs.hover.last_cursor_row = nil -- force re-process on next call
@@ -447,20 +440,20 @@ function M.hide_extmarks_at_cursor(bufnr)
   local new_hidden = {}
 
   -- Restore extmarks no longer under cursor
-  for extmark_id, saved in pairs(bs.currently_hidden_extmark_ids) do
+  for extmark_id in pairs(bs.currently_hidden_extmark_ids) do
     if should_hide[extmark_id] then
-      new_hidden[extmark_id] = saved -- still under cursor, keep hidden
+      new_hidden[extmark_id] = true -- still under cursor, keep hidden
     else
-      restore_one_extmark(bufnr, bs, extmark_id, saved, extmark_mod)
+      restore_one_extmark(bufnr, extmark_id)
     end
   end
 
   -- Hide newly entered extmarks
   for extmark_id, _ in pairs(should_hide) do
     if not bs.currently_hidden_extmark_ids[extmark_id] then
-      local saved = hide_one_extmark(bufnr, bs, extmark_id)
-      if saved ~= nil then
-        new_hidden[extmark_id] = saved
+      local hidden = hide_one_extmark(bufnr, bs, extmark_id)
+      if hidden ~= nil then
+        new_hidden[extmark_id] = true
       end
     end
   end

@@ -244,7 +244,6 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
   end
   local bs = state.get_buf_state(bufnr)
   if (skip_hide_check ~= true) and bs.currently_hidden_extmark_ids[extmark_id] ~= nil then
-    bs.currently_hidden_extmark_ids[extmark_id] = virt_text_data
     return
   end
   local ok, m = pcall(vim.api.nvim_buf_get_extmark_by_id, bufnr, state.ns_id, extmark_id, { details = true })

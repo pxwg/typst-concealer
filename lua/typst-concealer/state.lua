@@ -33,7 +33,7 @@ M.image_ids_in_use = {}
 --- @type { [integer]: { full?: typst_watch_session, preview?: typst_watch_session } }
 M.watch_sessions = {}
 
---- @type { [integer]: { full_items?: table[], line_to_items?: table } }
+--- @type { [integer]: { full_items?: table[], line_to_items?: table, extmark_to_item?: table } }
 M.buffer_render_state = {}
 
 --- Per-buffer mutable render state (extmark, live-preview, conceal transients).
