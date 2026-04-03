@@ -84,14 +84,14 @@ function M.rewrite_paths(text, buf_dir, project_root)
 
   -- #import / #include keywords
   for _, kw in ipairs({ "import", "include" }) do
-    text = text:gsub('(#' .. kw .. '%s+")([^"]*)(")', sub)
+    text = text:gsub("(#" .. kw .. '%s+")([^"]*)(")', sub)
     text = text:gsub("(#" .. kw .. "%s+')" .. "([^']*)" .. "(')", sub)
   end
 
   -- Function calls: first positional string argument
   local FIRST_ARG_FNS = { "image", "json", "toml", "yaml", "read", "csv", "bibliography" }
   for _, fn in ipairs(FIRST_ARG_FNS) do
-    text = text:gsub('(' .. fn .. '%s*%(%s*")([^"]*)(")', sub)
+    text = text:gsub("(" .. fn .. '%s*%(%s*")([^"]*)(")', sub)
     text = text:gsub("(" .. fn .. "%s*%(%s*')" .. "([^']*)" .. "(')", sub)
   end
 

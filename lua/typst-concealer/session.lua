@@ -609,7 +609,8 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
   if state.image_id_to_extmark[image_id] ~= extmark_id then
     return
   end
-  local ok_mark, mark = pcall(vim.api.nvim_buf_get_extmark_by_id, target_bufnr, state.ns_id, extmark_id, { details = true })
+  local ok_mark, mark =
+    pcall(vim.api.nvim_buf_get_extmark_by_id, target_bufnr, state.ns_id, extmark_id, { details = true })
   if not ok_mark or mark == nil or #mark == 0 then
     return
   end
