@@ -29,6 +29,8 @@ M.image_ids_in_use = {}
 --- @field last_page_count integer
 --- @field stderr_chunks string[]
 --- @field dead boolean|nil
+--- @field buf_dir string
+--- @field project_root string
 
 --- @type { [integer]: { full?: typst_watch_session, preview?: typst_watch_session } }
 M.watch_sessions = {}

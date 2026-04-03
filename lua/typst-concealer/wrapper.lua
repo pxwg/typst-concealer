@@ -160,16 +160,24 @@ end
 
 --- Build multi-page Typst source for a batch render session.
 --- @param items table[]
+--- @param buf_dir string|nil   source buffer directory (for path rewriting)
+--- @param project_root string|nil  project root (for path rewriting)
 --- @return string, table
-function M.build_batch_document(items)
+function M.build_batch_document(items, buf_dir, project_root)
   local main = require("typst-concealer")
   local config = main.config
   local doc = {}
   local line_map = {}
   local cur_line = 1
 
+  local do_rewrite = buf_dir ~= nil and project_root ~= nil
+  local pr = do_rewrite and require("typst-concealer.path-rewrite") or nil
+  local function maybe_rewrite(text)
+    return pr and pr.rewrite_paths(text, buf_dir, project_root) or text
+  end
+
   if config.header and config.header ~= "" then
-    cur_line = push(doc, config.header .. "\n", cur_line)
+    cur_line = push(doc, maybe_rewrite(config.header) .. "\n", cur_line)
   end
 
   cur_line = push(doc, main._styling_prelude, cur_line)
@@ -180,7 +188,7 @@ function M.build_batch_document(items)
     end
 
     for i = 1, item.prelude_count do
-      cur_line = push(doc, state.runtime_preludes[i], cur_line)
+      cur_line = push(doc, maybe_rewrite(state.runtime_preludes[i]), cur_line)
     end
 
     local source_rows = item.range[3] - item.range[1] + 1
@@ -190,7 +198,7 @@ function M.build_batch_document(items)
       cur_line = push(doc, wrap_prefix, cur_line)
     end
 
-    local item_text = normalize_item_str(item)
+    local item_text = maybe_rewrite(normalize_item_str(item))
     local gen_start = cur_line
     cur_line = push(doc, item_text, cur_line)
     local gen_end = cur_line - 1
