@@ -67,7 +67,7 @@ function M.get_buf_state(bufnr)
         winid = nil,
         width = 1,
         height = 1,
-        vertical = "below",
+        vertical = "above",
       },
       currently_hidden_extmark_ids = {},
       multiline_marks = {},

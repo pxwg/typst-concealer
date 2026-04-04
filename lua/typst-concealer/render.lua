@@ -599,7 +599,7 @@ end
 
 local function choose_preview_vertical(bufnr, range, natural_cols, natural_rows)
   local bs = state.get_buf_state(bufnr)
-  local preferred = (bs.preview_float and bs.preview_float.vertical) or "below"
+  local preferred = (bs.preview_float and bs.preview_float.vertical) or "above"
   local anchor_rect = get_range_screen_rect(bufnr, range)
   if anchor_rect == nil then
     return preferred
@@ -1128,15 +1128,15 @@ local function choose_preview_rect(bufnr, width, height, exclude_winid)
 
   local editor_h = vim.o.lines - vim.o.cmdheight
   local editor_w = vim.o.columns
-  local preferred_vertical = (bs.preview_float and bs.preview_float.vertical) or "below"
+  local preferred_vertical = (bs.preview_float and bs.preview_float.vertical) or "above"
 
   local candidates = {
-    make_candidate_rect(anchor, width, height, anchor.row + 1, anchor.col + 1, "below"),
-    make_candidate_rect(anchor, width, height, anchor.row + 1, anchor.col - width - 1, "below"),
     make_candidate_rect(anchor, width, height, anchor.row - height, anchor.col + 1, "above"),
     make_candidate_rect(anchor, width, height, anchor.row - height, anchor.col - width - 1, "above"),
-    make_candidate_rect(anchor, width, height, anchor.row + 2, anchor.col, "below"),
     make_candidate_rect(anchor, width, height, anchor.row - height - 1, anchor.col, "above"),
+    make_candidate_rect(anchor, width, height, anchor.row + 1, anchor.col + 1, "below"),
+    make_candidate_rect(anchor, width, height, anchor.row + 1, anchor.col - width - 1, "below"),
+    make_candidate_rect(anchor, width, height, anchor.row + 2, anchor.col, "below"),
     make_candidate_rect(anchor, width, height, anchor.row, anchor.col + 2, preferred_vertical),
     make_candidate_rect(anchor, width, height, anchor.row, anchor.col - width - 2, preferred_vertical),
   }
@@ -1178,7 +1178,7 @@ local function preview_win_config(bufnr, width, height, for_create)
     return nil
   end
   if bs.preview_float ~= nil and rect.bounds_penalty == 0 and rect.obstacle_penalty == 0 then
-    bs.preview_float.vertical = rect.vertical or bs.preview_float.vertical or "below"
+    bs.preview_float.vertical = rect.vertical or bs.preview_float.vertical or "above"
   end
 
   local config = {
@@ -1261,7 +1261,7 @@ local function close_live_preview_float(bufnr)
     winid = nil,
     width = 1,
     height = 1,
-    vertical = "below",
+    vertical = "above",
   }
 end
 
