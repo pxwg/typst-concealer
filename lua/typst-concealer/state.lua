@@ -56,6 +56,7 @@ function M.get_buf_state(bufnr)
       preview_image = nil,
       preview_source_image_id = nil,
       preview_source_page_stamp = nil,
+      preview_source_range = nil,
       preview_float = {
         bufnr = nil,
         winid = nil,

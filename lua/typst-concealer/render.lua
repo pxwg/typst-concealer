@@ -158,6 +158,27 @@ local function clear_diagnostics(bufnr)
   end)
 end
 
+local function is_insert_like_mode(mode)
+  mode = mode or vim.api.nvim_get_mode().mode or ""
+  return mode:find("i", 1, true) ~= nil or mode:find("R", 1, true) ~= nil
+end
+
+local function item_has_stable_render(item)
+  return item ~= nil and item.page_path ~= nil and item.natural_cols ~= nil and item.natural_rows ~= nil
+end
+
+local function carry_stable_render_metadata(dst, src)
+  if dst == nil or not item_has_stable_render(src) then
+    return
+  end
+
+  dst.page_path = src.page_path
+  dst.page_stamp = src.page_stamp
+  dst.natural_cols = src.natural_cols
+  dst.natural_rows = src.natural_rows
+  dst.source_rows = src.source_rows
+end
+
 local function row_overlap_len(a, b)
   local top = math.max(a[1], b[1])
   local bottom = math.min(a[3], b[3])
@@ -243,6 +264,7 @@ local function cleanup_preview_image(bufnr)
   if preview == nil then
     bs.preview_source_image_id = nil
     bs.preview_source_page_stamp = nil
+    bs.preview_source_range = nil
     return
   end
 
@@ -259,6 +281,71 @@ local function cleanup_preview_image(bufnr)
   bs.preview_image = nil
   bs.preview_source_image_id = nil
   bs.preview_source_page_stamp = nil
+  bs.preview_source_range = nil
+end
+
+local function cursor_in_range(range, row, col, opts)
+  opts = opts or {}
+  local sr, sc, er, ec = range[1], range[2], range[3], range[4]
+  local include_right_edge = opts.include_right_edge == true
+
+  if row < sr or row > er then
+    return false
+  end
+
+  if sr == er then
+    if include_right_edge then
+      return col >= sc and col <= ec
+    end
+    return col >= sc and col < ec
+  end
+
+  if row == sr then
+    return col >= sc
+  end
+
+  if row == er then
+    if include_right_edge then
+      return col <= ec
+    end
+    return col < ec
+  end
+
+  return true
+end
+
+local function cursor_engages_inline_item(range, row, col, mode)
+  return cursor_in_range(range, row, col, {
+    include_right_edge = is_insert_like_mode(mode),
+  })
+end
+
+local function cursor_near_range(range, row, col)
+  if range == nil or row < range[1] or row > range[3] then
+    return false
+  end
+
+  local slack_cols = 8
+  if range[1] == range[3] then
+    return col >= math.max(0, range[2] - 1) and col <= math.max(range[4], range[2]) + slack_cols
+  end
+  if row == range[1] then
+    return col >= math.max(0, range[2] - 1)
+  end
+  if row == range[3] then
+    return col <= range[4] + slack_cols
+  end
+  return true
+end
+
+local function should_preserve_preview(bufnr, cursor_row, cursor_col)
+  local mode = vim.api.nvim_get_mode().mode or ""
+  if not is_insert_like_mode(mode) then
+    return false
+  end
+
+  local bs = state.get_buf_state(bufnr)
+  return bs.preview_image ~= nil and cursor_near_range(bs.preview_source_range, cursor_row, cursor_col)
 end
 
 local function preview_left_pad_cols(bufnr, range)
@@ -448,15 +535,9 @@ function M.render_buf(bufnr)
     }
 
     -- Preserve the last stable rendered page metadata while a fresh watch update
-    -- is in flight. This prevents preview consumers from dropping to an empty
-    -- state between edits and the next rendered page becoming ready.
-    if prev_item ~= nil then
-      item.page_path = prev_item.page_path
-      item.page_stamp = prev_item.page_stamp
-      item.natural_cols = prev_item.natural_cols
-      item.natural_rows = prev_item.natural_rows
-      item.source_rows = prev_item.source_rows
-    end
+    -- is in flight. This prevents both concealed block renders and inline live
+    -- preview consumers from dropping to an empty state before the next page is ready.
+    carry_stable_render_metadata(item, prev_item)
 
     batch_items[#batch_items + 1] = item
     state.item_by_image_id[image_id] = item
@@ -570,30 +651,6 @@ local function restore_one_extmark(bufnr, extmark_id)
   )
 end
 
-local cursor_in_range
-
-cursor_in_range = function(range, row, col)
-  local sr, sc, er, ec = range[1], range[2], range[3], range[4]
-
-  if row < sr or row > er then
-    return false
-  end
-
-  if sr == er then
-    return col >= sc and col < ec
-  end
-
-  if row == sr then
-    return col >= sc
-  end
-
-  if row == er then
-    return col < ec
-  end
-
-  return true
-end
-
 local function should_unconceal_item_for_row(item, row, cursor_row, cursor_col)
   local sem = item.semantics or {}
   local source_kind = sem.source_kind or item.node_type
@@ -604,7 +661,7 @@ local function should_unconceal_item_for_row(item, row, cursor_row, cursor_col)
     if row ~= cursor_row then
       return false
     end
-    return cursor_in_range(item.range, cursor_row, cursor_col)
+    return cursor_engages_inline_item(item.range, cursor_row, cursor_col)
   end
 
   if source_kind == "math" or source_kind == "code" then
@@ -1036,7 +1093,7 @@ local function find_full_item_at_cursor(bufnr, row, col)
 
   local best_item = nil
   for _, item in ipairs(bstate.full_items) do
-    if item.node_type == "math" and cursor_in_range(item.range, row, col) then
+    if item.node_type == "math" and cursor_engages_inline_item(item.range, row, col) then
       if best_item == nil then
         best_item = item
       else
@@ -1052,15 +1109,18 @@ local function find_full_item_at_cursor(bufnr, row, col)
   return best_item
 end
 
-local function present_preview_item(bufnr, item)
+local function present_preview_item(bufnr, item, cursor_row, cursor_col)
   if item == nil then
     cleanup_preview_image(bufnr)
     return
   end
 
   local bs = state.get_buf_state(bufnr)
-  if item.page_path == nil or item.natural_cols == nil or item.natural_rows == nil then
+  if not item_has_stable_render(item) then
     if bs.preview_source_image_id == item.image_id and bs.preview_image ~= nil then
+      return
+    end
+    if should_preserve_preview(bufnr, cursor_row, cursor_col) then
       return
     end
     cleanup_preview_image(bufnr)
@@ -1085,6 +1145,7 @@ local function present_preview_item(bufnr, item)
   }
   bs.preview_source_image_id = item.image_id
   bs.preview_source_page_stamp = item.page_stamp
+  bs.preview_source_range = vim.deepcopy(item.range)
 end
 
 --- Stop the live preview session and remove its extmark/image.
@@ -1122,10 +1183,13 @@ function M.render_live_typst_preview(bufnr)
   -- under the cursor while anchoring the float to the wrong range.
   local item = find_full_item_at_cursor(bufnr, cursor_row, cursor_col)
   if item ~= nil then
-    present_preview_item(bufnr, item)
+    present_preview_item(bufnr, item, cursor_row, cursor_col)
     return
   end
 
+  if should_preserve_preview(bufnr, cursor_row, cursor_col) then
+    return
+  end
   M.clear_live_typst_preview(bufnr)
 end
 
