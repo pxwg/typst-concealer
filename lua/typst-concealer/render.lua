@@ -1484,8 +1484,11 @@ function M.render_live_typst_preview(bufnr)
       return
     end
     if bs.preview_render_key == render_key then
+      present_preview_item(bufnr, item, cursor_row, cursor_col)
       return
     end
+
+    present_preview_item(bufnr, item, cursor_row, cursor_col)
 
     local shared_extmark_id = bs.preview_image and bs.preview_image.extmark_id or nil
     if
