@@ -82,6 +82,14 @@ require("typst-concealer").setup({
 
 String rules use Lua patterns matched against the normalized absolute file path. Function rules receive `(path, bufnr)` and should return `true` when the buffer should match that rule.
 
+Live preview is enabled by default. If you want only the static concealed render and no cursor-following preview, disable it explicitly:
+
+```lua
+require("typst-concealer").setup({
+  live_preview_enabled = false,
+})
+```
+
 For multi-file projects that rely on rooted Typst paths like `#image("/assets/figure.png")`, configure `get_root` so concealer can preserve the same project-root semantics as your real build:
 
 ```lua

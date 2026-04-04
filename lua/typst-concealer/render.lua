@@ -12,6 +12,10 @@ local diagnostics = {}
 local PREVIEW_FLOAT_TARGET_RANGE = { 0, 0, 0, 0 }
 local PREVIEW_FLOAT_LINE_COUNT = 2
 
+local candidate_bounds_penalty
+local candidate_obstacle_penalty
+local list_nearby_float_obstacles
+
 --- Extract the text contained within a buffer range.
 --- @param range Range4
 --- @param bufnr integer
@@ -183,6 +187,7 @@ local function cleanup_preview_image(bufnr)
   state.prepare_extmark_reuse(target_bufnr, preview.extmark_id)
   pcall(vim.api.nvim_buf_del_extmark, target_bufnr, state.ns_id, preview.extmark_id)
   if preview.image_id ~= nil then
+    extmark.clear_image(preview.image_id)
     state.image_id_to_extmark[preview.image_id] = nil
     state.item_by_image_id[preview.image_id] = nil
     state.image_ids_in_use[preview.image_id] = nil
@@ -190,6 +195,96 @@ local function cleanup_preview_image(bufnr)
   bs.preview_image = nil
   bs.preview_source_image_id = nil
   bs.preview_source_page_stamp = nil
+end
+
+local function preview_left_pad_cols(bufnr, range)
+  local winid = vim.fn.bufwinid(bufnr)
+  if winid == -1 then
+    local line = (vim.api.nvim_buf_get_lines(bufnr, range[1], range[1] + 1, false) or { "" })[1] or ""
+    local prefix = string.sub(line, 1, range[2])
+    return vim.fn.strdisplaywidth(prefix)
+  end
+
+  local sp = vim.fn.screenpos(winid, range[1] + 1, range[2] + 1)
+  local winpos = vim.api.nvim_win_get_position(winid)
+  local textoff = vim.fn.getwininfo(winid)[1].textoff or 0
+  local screen_col = math.max(1, (sp.col or 1) - winpos[2] - textoff)
+  return screen_col - 1
+end
+
+local function get_range_screen_rect(bufnr, range)
+  local winid = vim.fn.bufwinid(bufnr)
+  if winid == -1 then
+    return nil
+  end
+
+  local start_sp = vim.fn.screenpos(winid, range[1] + 1, range[2] + 1)
+  local end_col = math.max(range[2] + 1, range[4])
+  local end_sp = vim.fn.screenpos(winid, range[3] + 1, end_col)
+  if start_sp == nil or end_sp == nil then
+    return nil
+  end
+
+  return {
+    winid = winid,
+    top = math.max(0, (start_sp.row or 1) - 1),
+    bottom = math.max(0, (end_sp.row or 1) - 1),
+    left = math.max(0, (start_sp.col or 1) - 1),
+  }
+end
+
+local function make_preview_screen_rect(anchor_rect, natural_cols, natural_rows, vertical)
+  local top
+  if vertical == "above" then
+    top = anchor_rect.top - natural_rows
+  else
+    top = anchor_rect.bottom + 1
+  end
+  return {
+    top = top,
+    bottom = top + natural_rows - 1,
+    left = anchor_rect.left,
+    right = anchor_rect.left + natural_cols - 1,
+    width = natural_cols,
+    height = natural_rows,
+    vertical = vertical,
+  }
+end
+
+local function choose_preview_vertical(bufnr, range, natural_cols, natural_rows)
+  local bs = state.get_buf_state(bufnr)
+  local preferred = (bs.preview_float and bs.preview_float.vertical) or "below"
+  local anchor_rect = get_range_screen_rect(bufnr, range)
+  if anchor_rect == nil then
+    return preferred
+  end
+
+  local obstacles = list_nearby_float_obstacles(nil, {
+    row = anchor_rect.top,
+    col = anchor_rect.left,
+  })
+  local editor_h = vim.o.lines - vim.o.cmdheight
+  local editor_w = vim.o.columns
+
+  local preferred_rect = make_preview_screen_rect(anchor_rect, natural_cols, natural_rows, preferred)
+  preferred_rect.bounds_penalty = candidate_bounds_penalty(preferred_rect, editor_h, editor_w)
+  preferred_rect.obstacle_penalty = candidate_obstacle_penalty(preferred_rect, obstacles)
+  if preferred_rect.bounds_penalty == 0 and preferred_rect.obstacle_penalty == 0 then
+    return preferred
+  end
+
+  local alternate = preferred == "above" and "below" or "above"
+  local alternate_rect = make_preview_screen_rect(anchor_rect, natural_cols, natural_rows, alternate)
+  alternate_rect.bounds_penalty = candidate_bounds_penalty(alternate_rect, editor_h, editor_w)
+  alternate_rect.obstacle_penalty = candidate_obstacle_penalty(alternate_rect, obstacles)
+  local preferred_penalty = preferred_rect.bounds_penalty + preferred_rect.obstacle_penalty
+  local alternate_penalty = alternate_rect.bounds_penalty + alternate_rect.obstacle_penalty
+  if alternate_penalty < preferred_penalty then
+    bs.preview_float.vertical = alternate
+    return alternate
+  end
+
+  return preferred
 end
 
 --- Full reset of all concealer state for a buffer (called on disable or wipeout).
@@ -577,7 +672,7 @@ local function is_near_anchor(rect, anchor)
   )
 end
 
-local function list_nearby_float_obstacles(exclude_winid, anchor)
+list_nearby_float_obstacles = function(exclude_winid, anchor)
   local ret = {}
   for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
     if winid ~= exclude_winid then
@@ -603,7 +698,7 @@ local function make_candidate_rect(anchor, width, height, row, col, vertical)
   }
 end
 
-local function candidate_bounds_penalty(rect, editor_h, editor_w)
+candidate_bounds_penalty = function(rect, editor_h, editor_w)
   local penalty = 0
 
   if rect.top < 0 then
@@ -622,7 +717,7 @@ local function candidate_bounds_penalty(rect, editor_h, editor_w)
   return penalty
 end
 
-local function candidate_obstacle_penalty(rect, obstacles)
+candidate_obstacle_penalty = function(rect, obstacles)
   local penalty = 0
 
   for _, obs in ipairs(obstacles) do
@@ -674,7 +769,12 @@ local function choose_preview_rect(bufnr, width, height, exclude_winid)
 
   for _, rect in ipairs(candidates) do
     local p = candidate_penalty(rect, obstacles, editor_h, editor_w)
-    if rect.vertical == preferred_vertical and rect.bounds_penalty == 0 and rect.obstacle_penalty == 0 and p < preferred_best_penalty then
+    if
+      rect.vertical == preferred_vertical
+      and rect.bounds_penalty == 0
+      and rect.obstacle_penalty == 0
+      and p < preferred_best_penalty
+    then
       preferred_best = rect
       preferred_best_penalty = p
     end
@@ -698,11 +798,7 @@ local function preview_win_config(bufnr, width, height, for_create)
   if rect == nil then
     return nil
   end
-  if
-    bs.preview_float ~= nil
-    and rect.bounds_penalty == 0
-    and rect.obstacle_penalty == 0
-  then
+  if bs.preview_float ~= nil and rect.bounds_penalty == 0 and rect.obstacle_penalty == 0 then
     bs.preview_float.vertical = rect.vertical or bs.preview_float.vertical or "below"
   end
 
@@ -863,7 +959,6 @@ end
 
 local function present_preview_item(bufnr, item)
   if item == nil then
-    close_live_preview_float(bufnr)
     cleanup_preview_image(bufnr)
     return
   end
@@ -873,77 +968,75 @@ local function present_preview_item(bufnr, item)
     if bs.preview_source_image_id == item.image_id and bs.preview_image ~= nil then
       return
     end
-    close_live_preview_float(bufnr)
     cleanup_preview_image(bufnr)
     return
   end
 
-  local pf = ensure_live_preview_float(bufnr)
-  if pf == nil then
-    cleanup_preview_image(bufnr)
-    return
-  end
-
-  if
-    bs.preview_source_image_id == item.image_id
-    and bs.preview_source_page_stamp == item.page_stamp
-    and bs.preview_image ~= nil
-  then
-    M.sync_live_preview_float(bufnr, item.natural_cols, item.natural_rows)
-    return
-  end
-
-  cleanup_preview_image(bufnr)
-  ensure_preview_float_lines(bufnr, item.natural_rows)
-
-  local sem = {
-    constraint_kind = "intrinsic",
-    display_kind = "block",
-    source_kind = "math",
-  }
   local extmark = require("typst-concealer.extmark")
-  local target_range = { 0, 0, math.max(0, item.natural_rows - 1), 0 }
-  local preview_image_id = new_image_id(bufnr)
-  local extmark_id = extmark.place_render_extmark(pf.bufnr, preview_image_id, target_range, nil, nil, sem)
-  local preview_item = {
-    bufnr = bufnr,
-    image_id = preview_image_id,
-    extmark_id = extmark_id,
-    range = item.range,
-    str = item.str,
-    node_type = "math",
-    semantics = sem,
-    render_target = "float",
-    source_image_id = item.image_id,
-    target_bufnr = pf.bufnr,
-    target_range = target_range,
-  }
-
-  state.item_by_image_id[preview_image_id] = preview_item
-  extmark.conceal_existing_image(pf.bufnr, extmark_id, item.image_id, item.natural_cols, item.natural_rows, 1, preview_item)
-  M.sync_live_preview_float(bufnr, item.natural_cols, item.natural_rows)
+  local vertical = choose_preview_vertical(bufnr, item.range, item.natural_cols, item.natural_rows)
+  local anchor_row = vertical == "above" and item.range[1] or item.range[3]
+  local extmark_id = bs.preview_image and bs.preview_image.extmark_id or nil
+  extmark_id =
+    extmark.show_virtual_image(bufnr, extmark_id, anchor_row, item.image_id, item.natural_cols, item.natural_rows, {
+      above = vertical == "above",
+      left_pad_cols = preview_left_pad_cols(bufnr, item.range),
+    })
 
   bs.preview_image = {
-    image_id = preview_image_id,
     extmark_id = extmark_id,
-    target_bufnr = pf.bufnr,
+    target_bufnr = bufnr,
+    natural_cols = item.natural_cols,
+    natural_rows = item.natural_rows,
   }
   bs.preview_source_image_id = item.image_id
   bs.preview_source_page_stamp = item.page_stamp
+end
+
+local function present_cached_preview(bufnr, range)
+  local bs = state.get_buf_state(bufnr)
+  local preview = bs.preview_image
+  if preview == nil or bs.preview_source_image_id == nil then
+    return false
+  end
+  if preview.natural_cols == nil or preview.natural_rows == nil then
+    return false
+  end
+
+  local extmark = require("typst-concealer.extmark")
+  local vertical = choose_preview_vertical(bufnr, range, preview.natural_cols, preview.natural_rows)
+  local anchor_row = vertical == "above" and range[1] or range[3]
+  local extmark_id = extmark.show_virtual_image(
+    bufnr,
+    preview.extmark_id,
+    anchor_row,
+    bs.preview_source_image_id,
+    preview.natural_cols,
+    preview.natural_rows,
+    {
+      above = vertical == "above",
+      left_pad_cols = preview_left_pad_cols(bufnr, range),
+    }
+  )
+  preview.extmark_id = extmark_id
+  preview.target_bufnr = bufnr
+  return true
 end
 
 --- Stop the live preview session and remove its extmark/image.
 --- @param bufnr integer
 function M.clear_live_typst_preview(bufnr)
   cleanup_preview_image(bufnr)
-  close_live_preview_float(bufnr)
 end
 
---- Render a live preview float of the math node under the cursor.
+--- Render a live preview image in virtual lines around the math node under the cursor.
 --- @param bufnr integer
 function M.render_live_typst_preview(bufnr)
   local main = require("typst-concealer")
-  if main._enabled_buffers[bufnr] ~= true or not main.is_render_allowed(bufnr) then
+  if
+    main._enabled_buffers[bufnr] ~= true
+    or not main.is_render_allowed(bufnr)
+    or (main.config and main.config.live_preview_enabled == false)
+  then
     M.clear_live_typst_preview(bufnr)
     return
   end
@@ -953,11 +1046,18 @@ function M.render_live_typst_preview(bufnr)
     return
   end
 
-  -- Reposition immediately even if the rendered content is unchanged.
-  M.sync_live_preview_float(bufnr)
-
   local range = { start_row, start_col, end_row, end_col }
-  present_preview_item(bufnr, find_full_item_for_range(bufnr, range))
+  local item = find_full_item_for_range(bufnr, range)
+  if item ~= nil then
+    present_preview_item(bufnr, item)
+    return
+  end
+
+  if present_cached_preview(bufnr, range) then
+    return
+  end
+
+  M.clear_live_typst_preview(bufnr)
 end
 
 return M

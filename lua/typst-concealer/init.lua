@@ -96,6 +96,7 @@ end
 --- @field header?                string    Custom Typst code prepended to every rendered document.
 --- @field block_padding_cols?    integer   Terminal columns reserved as outer padding for code blocks.
 --- @field block_preview_margin_pt? number  Extra Typst-side inner margin for code block previews.
+--- @field live_preview_enabled?  boolean   Enable inline live preview around the active math node. Default true.
 --- @field live_preview_debounce? number    Debounce delay for live preview in ms. Default 100.
 --- @field cursor_hover_throttle_ms? number  Throttle delay for CursorMoved hover in ms. Default 0 (disabled).
 --- @field render_paths?          { include?: (string|fun(path: string, bufnr: integer): boolean)[], exclude?: (string|fun(path: string, bufnr: integer): boolean)[] }
@@ -227,6 +228,7 @@ function M.setup(cfg)
     header = default(cfg.header, ""),
     block_padding_cols = default(cfg.block_padding_cols, 15),
     block_preview_margin_pt = default(cfg.block_preview_margin_pt, 6),
+    live_preview_enabled = default(cfg.live_preview_enabled, true),
     live_preview_debounce = default(cfg.live_preview_debounce, 100),
     cursor_hover_throttle_ms = default(cfg.cursor_hover_throttle_ms, 0),
     render_paths = default(cfg.render_paths, {}),

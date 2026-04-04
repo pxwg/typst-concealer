@@ -368,7 +368,15 @@ end
 --- @param natural_rows integer
 --- @param source_rows integer
 --- @param item table|nil
-local function conceal_extmark_with_image(bufnr, extmark_id, render_image_id, natural_cols, natural_rows, source_rows, item)
+local function conceal_extmark_with_image(
+  bufnr,
+  extmark_id,
+  render_image_id,
+  natural_cols,
+  natural_rows,
+  source_rows,
+  item
+)
   local bs = state.get_buf_state(bufnr)
   if type(extmark_id) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
     return
@@ -478,6 +486,56 @@ end
 --- @param item table|nil
 function M.conceal_existing_image(bufnr, extmark_id, render_image_id, natural_cols, natural_rows, source_rows, item)
   conceal_extmark_with_image(bufnr, extmark_id, render_image_id, natural_cols, natural_rows, source_rows, item)
+end
+
+--- Render an existing kitty image into virtual lines above or below a buffer row.
+--- Unlike conceal_existing_image, this never conceals source text.
+--- @param bufnr integer
+--- @param extmark_id integer|nil
+--- @param anchor_row integer
+--- @param render_image_id integer
+--- @param natural_cols integer
+--- @param natural_rows integer
+--- @param opts table|nil
+--- @return integer
+function M.show_virtual_image(bufnr, extmark_id, anchor_row, render_image_id, natural_cols, natural_rows, opts)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return extmark_id
+  end
+
+  opts = opts or {}
+  local left_pad_cols = math.max(0, opts.left_pad_cols or 0)
+  local pad_str = left_pad_cols > 0 and string.rep(" ", left_pad_cols) or nil
+  local hl_group = "typst-concealer-image-id-" .. tostring(render_image_id)
+  vim.api.nvim_set_hl(0, hl_group, { fg = string.format("#%06X", render_image_id) })
+
+  local lines = {}
+  local too_tall_msg = "This image attempted to render taller than "
+    .. #kitty_codes.diacritics
+    .. " lines. If you legitimately see this in a real document, open an issue."
+
+  for i = 1, natural_rows do
+    local line = ""
+    if i >= #kitty_codes.diacritics then
+      line = too_tall_msg
+    else
+      for j = 0, natural_cols - 1 do
+        line = line .. kitty_codes.placeholder .. kitty_codes.diacritics[i] .. kitty_codes.diacritics[j + 1]
+      end
+    end
+    if pad_str then
+      lines[#lines + 1] = { { pad_str, "" }, { line, hl_group } }
+    else
+      lines[#lines + 1] = { { line, hl_group } }
+    end
+  end
+
+  return vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, anchor_row, 0, {
+    id = extmark_id,
+    invalidate = true,
+    virt_lines = lines,
+    virt_lines_above = opts.above == true,
+  })
 end
 
 return M
