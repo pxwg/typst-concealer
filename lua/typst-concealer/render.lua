@@ -549,7 +549,9 @@ function M.hide_extmarks_at_cursor(bufnr)
     lo, hi = math.min(cursor_row, vrow), math.max(cursor_row, vrow)
   end
 
-  if bs.hover.last_mode == mode and bs.hover.last_lo == lo and bs.hover.last_hi == hi and bs.hover.invalidated then
+  -- Skip only when the cursor span is unchanged and no render pass has
+  -- invalidated the current hide/restore decision.
+  if bs.hover.last_mode == mode and bs.hover.last_lo == lo and bs.hover.last_hi == hi and not bs.hover.invalidated then
     return
   end
 

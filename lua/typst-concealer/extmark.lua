@@ -14,12 +14,26 @@ local function tmux_escape(message)
   return "\x1bPtmux;" .. message:gsub("\x1b", "\x1b\x1b") .. "\x1b\\"
 end
 
-local function send_kitty_escape(message)
-  if is_tmux then
-    vim_stdout:write(tmux_escape("\x1b_G" .. message .. "\x1b\\"))
-  else
-    vim_stdout:write("\x1b_G" .. message .. "\x1b\\")
+local function send_terminal_data(data)
+  if vim.api.nvim_ui_send ~= nil then
+    local ok = pcall(vim.api.nvim_ui_send, data)
+    if ok then
+      return
+    end
   end
+  vim_stdout:write(data)
+end
+
+local function encode_kitty_escape(message)
+  local payload = "\x1b_G" .. message .. "\x1b\\"
+  if is_tmux then
+    return tmux_escape(payload)
+  end
+  return payload
+end
+
+local function send_kitty_escape(message)
+  send_terminal_data(encode_kitty_escape(message))
 end
 
 --- Upload an image to the terminal via kitty graphics protocol.
@@ -29,8 +43,10 @@ end
 --- @param height  integer  in terminal cells
 function M.create_image(path, image_id, width, height)
   path = vim.base64.encode(path)
-  send_kitty_escape("q=2,f=100,t=t,i=" .. image_id .. ";" .. path)
-  send_kitty_escape("q=2,a=p,U=1,i=" .. image_id .. ",c=" .. width .. ",r=" .. height)
+  send_terminal_data(
+    encode_kitty_escape("q=2,f=100,t=t,i=" .. image_id .. ";" .. path)
+      .. encode_kitty_escape("q=2,a=p,U=1,i=" .. image_id .. ",c=" .. width .. ",r=" .. height)
+  )
 end
 
 --- Delete an image from the terminal.
