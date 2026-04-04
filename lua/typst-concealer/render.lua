@@ -503,6 +503,48 @@ local function restore_one_extmark(bufnr, extmark_id)
   )
 end
 
+local function cursor_in_range(range, row, col)
+  local sr, sc, er, ec = range[1], range[2], range[3], range[4]
+
+  if row < sr or row > er then
+    return false
+  end
+
+  if sr == er then
+    return col >= sc and col < ec
+  end
+
+  if row == sr then
+    return col >= sc
+  end
+
+  if row == er then
+    return col < ec
+  end
+
+  return true
+end
+
+local function should_unconceal_item_for_row(item, row, cursor_row, cursor_col)
+  local sem = item.semantics or {}
+  local source_kind = sem.source_kind or item.node_type
+  local display_kind = sem.display_kind
+  local sr, _, er, _ = item.range[1], item.range[2], item.range[3], item.range[4]
+
+  if sr == er and display_kind == "inline" then
+    if row ~= cursor_row then
+      return false
+    end
+    return cursor_in_range(item.range, cursor_row, cursor_col)
+  end
+
+  if source_kind == "math" or source_kind == "code" then
+    return row >= sr and row <= er
+  end
+
+  return false
+end
+
 --- Hide / restore extmarks that overlap the cursor position.
 --- Called on CursorMoved and ModeChanged.
 --- @param bufnr integer
@@ -516,6 +558,7 @@ function M.hide_extmarks_at_cursor(bufnr)
     end
     bs.currently_hidden_extmark_ids = {}
     bs.hover.last_cursor_row = nil
+    bs.hover.last_cursor_col = nil
     bs.hover.last_mode = nil
     bs.hover.last_lo = nil
     bs.hover.last_hi = nil
@@ -532,6 +575,7 @@ function M.hide_extmarks_at_cursor(bufnr)
     end
     bs.currently_hidden_extmark_ids = {}
     bs.hover.last_cursor_row = nil -- force re-process on next call
+    bs.hover.last_cursor_col = nil
     bs.hover.last_mode = mode
     bs.hover.last_lo = nil
     bs.hover.last_hi = nil
@@ -539,7 +583,9 @@ function M.hide_extmarks_at_cursor(bufnr)
     return
   end
 
-  local cursor_row = vim.api.nvim_win_get_cursor(0)[1] - 1
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local cursor_row = cursor[1] - 1
+  local cursor_col = cursor[2]
 
   -- Determine row range to unconceal
   local is_visual = mode == "v" or mode == "V" or mode == "\22"
@@ -551,7 +597,13 @@ function M.hide_extmarks_at_cursor(bufnr)
 
   -- Skip only when the cursor span is unchanged and no render pass has
   -- invalidated the current hide/restore decision.
-  if bs.hover.last_mode == mode and bs.hover.last_lo == lo and bs.hover.last_hi == hi and not bs.hover.invalidated then
+  if
+    bs.hover.last_mode == mode
+    and bs.hover.last_lo == lo
+    and bs.hover.last_hi == hi
+    and bs.hover.last_cursor_col == cursor_col
+    and not bs.hover.invalidated
+  then
     return
   end
 
@@ -563,7 +615,9 @@ function M.hide_extmarks_at_cursor(bufnr)
     local row_items = line_to_items[row]
     if row_items then
       for _, item in ipairs(row_items) do
-        should_hide[item.extmark_id] = item
+        if should_unconceal_item_for_row(item, row, cursor_row, cursor_col) then
+          should_hide[item.extmark_id] = item
+        end
       end
     end
   end
@@ -592,6 +646,7 @@ function M.hide_extmarks_at_cursor(bufnr)
 
   bs.currently_hidden_extmark_ids = new_hidden
   bs.hover.last_cursor_row = cursor_row
+  bs.hover.last_cursor_col = cursor_col
   bs.hover.last_mode = mode
   bs.hover.last_lo = lo
   bs.hover.last_hi = hi

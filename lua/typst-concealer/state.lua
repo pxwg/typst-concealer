@@ -67,6 +67,7 @@ function M.get_buf_state(bufnr)
       multiline_marks = {},
       hover = {
         last_cursor_row = nil,
+        last_cursor_col = nil,
         last_mode = nil,
         last_lo = nil,
         last_hi = nil,
