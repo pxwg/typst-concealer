@@ -82,8 +82,48 @@ require("typst-concealer").setup({
 
 String rules use Lua patterns matched against the normalized absolute file path. Function rules receive `(path, bufnr)` and should return `true` when the buffer should match that rule.
 
+For multi-file projects that rely on rooted Typst paths like `#image("/assets/figure.png")`, configure `get_root` so concealer can preserve the same project-root semantics as your real build:
+
+```lua
+require("typst-concealer").setup({
+  get_root = function(_bufnr, path, _cwd, _kind)
+    local wiki_root = vim.fs.normalize(vim.fn.expand("~/wiki"))
+    local normalized = vim.fs.normalize(path)
+    if normalized == wiki_root or normalized:sub(1, #wiki_root + 1) == wiki_root .. "/" then
+      return wiki_root
+    end
+  end,
+})
+```
+
+`get_root(bufnr, path, cwd, kind)` should return the source/project root as an absolute filesystem path. When omitted or when it returns `nil`, concealer falls back to the nearest directory containing `typst.toml`, and then to the current buffer directory.
+
+`compiler_args` is still passed through to Typst, but `--root` inside `compiler_args` is ignored because concealer computes the watch root itself.
+
+Two other project hooks are available:
+
+```lua
+require("typst-concealer").setup({
+  get_inputs = function(_bufnr, _path, _cwd, kind)
+    if kind == "preview" then
+      return { "concealed=true", "preview=true" }
+    end
+    return { "concealed=true" }
+  end,
+  get_preamble_file = function(_bufnr, path, _cwd, _kind)
+    local wiki_root = vim.fs.normalize(vim.fn.expand("~/wiki"))
+    if vim.fs.normalize(path):find(wiki_root, 1, true) == 1 then
+      return wiki_root .. "/concealer-context.typ"
+    end
+  end,
+})
+```
+
+- `get_inputs` appends extra `--input key=value` pairs to `typst watch`.
+- `get_preamble_file` injects a project-level `.typ` file at the top of the generated batch document.
+
 ## Known issues
-- A temporary `.typst-concealer` file is created in the same directory as the file being edited, and is used for `typst watch`. This is a bit hacky, but it works. It will be deleted when the plugin is disabled, but if the plugin crashes or something, it may be left behind. You can safely delete it if it does.
+- A temporary watch workspace is created under `<project-root>/.typst-concealer/` and used for `typst watch`. Keeping it inside the project root preserves rooted Typst path semantics for imported project files. The plugin removes active session files when disabled, but the directory may remain after crashes and is safe to delete.
 - Breaks sometimes, pls report if any errors happen
 - Sometimes the message sent to the kitty image protocol gets displayed on the screen as colourful garbage text. It's difficult to reproduce, and I have no idea what to do about this.
 
@@ -107,7 +147,7 @@ and passing the `concealed` variable to `typst` in the configuration of the plug
 ```lua
 require("typst-concealer").setup({
   -- other options...
-  compile_args = {
+  compiler_args = {
     "--input",
     "concealed=true",
   },
