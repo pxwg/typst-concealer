@@ -360,29 +360,24 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
   end
 end
 
---- Add concealing unicode characters for a rendered image.
---- Padding decision comes from the item's semantics (looked up from state).
----   flow + block  → block_padding_cols left padding (terminal display layer)
----   intrinsic + block → centred
----   inline        → no padding
---- @param bufnr        integer
---- @param image_id     integer
+--- Shared placeholder writer used by both main-buffer items and preview-float clones.
+--- @param bufnr integer
+--- @param extmark_id integer
+--- @param render_image_id integer
 --- @param natural_cols integer
 --- @param natural_rows integer
---- @param source_rows  integer
-function M.conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, source_rows)
+--- @param source_rows integer
+--- @param item table|nil
+local function conceal_extmark_with_image(bufnr, extmark_id, render_image_id, natural_cols, natural_rows, source_rows, item)
   local bs = state.get_buf_state(bufnr)
-  local extmark_id = state.image_id_to_extmark[image_id]
   if type(extmark_id) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
     return
   end
   local multiline_extmark_ids = bs.multiline_marks[extmark_id]
 
-  local hl_group = "typst-concealer-image-id-" .. tostring(image_id)
-  vim.api.nvim_set_hl(0, hl_group, { fg = string.format("#%06X", image_id) })
+  local hl_group = "typst-concealer-image-id-" .. tostring(render_image_id)
+  vim.api.nvim_set_hl(0, hl_group, { fg = string.format("#%06X", render_image_id) })
 
-  -- Retrieve semantics from the owning item (replaces block_formula_ids / flow_block_ids)
-  local item = state.get_item_by_image_id(image_id)
   local config = require("typst-concealer").config
   local pad = 0
   if item and item.render_target == "float" then
@@ -454,6 +449,35 @@ function M.conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, sou
     end
     M.update_extmark_text(bufnr, extmark_id, lines)
   end
+end
+
+--- Add concealing unicode characters for a rendered image.
+--- Padding decision comes from the item's semantics (looked up from state).
+---   flow + block  → block_padding_cols left padding (terminal display layer)
+---   intrinsic + block → centred
+---   inline        → no padding
+--- @param bufnr        integer
+--- @param image_id     integer
+--- @param natural_cols integer
+--- @param natural_rows integer
+--- @param source_rows  integer
+function M.conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, source_rows)
+  local extmark_id = state.image_id_to_extmark[image_id]
+  local item = state.get_item_by_image_id(image_id)
+  conceal_extmark_with_image(bufnr, extmark_id, image_id, natural_cols, natural_rows, source_rows, item)
+end
+
+--- Render an existing kitty image into an arbitrary extmark.
+--- Used by preview float so it can reuse the exact full-render image payload.
+--- @param bufnr integer
+--- @param extmark_id integer
+--- @param render_image_id integer
+--- @param natural_cols integer
+--- @param natural_rows integer
+--- @param source_rows integer
+--- @param item table|nil
+function M.conceal_existing_image(bufnr, extmark_id, render_image_id, natural_cols, natural_rows, source_rows, item)
+  conceal_extmark_with_image(bufnr, extmark_id, render_image_id, natural_cols, natural_rows, source_rows, item)
 end
 
 return M

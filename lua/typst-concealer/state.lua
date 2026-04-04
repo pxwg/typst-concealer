@@ -15,7 +15,7 @@ M.image_id_to_extmark = {}
 M.image_ids_in_use = {}
 
 --- @class typst_watch_session
---- @field kind 'full' | 'preview'
+--- @field kind 'full'
 --- @field bufnr integer
 --- @field handle uv_process_t|nil
 --- @field stdout uv_pipe_t|nil
@@ -33,11 +33,11 @@ M.image_ids_in_use = {}
 --- @field source_root string
 --- @field effective_root string
 
---- @type { [integer]: { full?: typst_watch_session, preview?: typst_watch_session } }
+--- @type { [integer]: { full?: typst_watch_session } }
 M.watch_sessions = {}
 
 --- Aggregated watch diagnostics per buffer/session kind for quickfix injection.
---- @type { [integer]: { full?: table[], preview?: table[] } }
+--- @type { [integer]: { full?: table[] } }
 M.watch_diagnostics = {}
 
 --- @type { [integer]: { full_items?: table[], line_to_items?: table, extmark_to_item?: table } }
@@ -54,14 +54,14 @@ function M.get_buf_state(bufnr)
   if not M.buffers[bufnr] then
     M.buffers[bufnr] = {
       preview_image = nil,
-      pending_preview_image = nil,
-      live_preview_timer = nil,
-      last_preview_str = nil,
+      preview_source_image_id = nil,
+      preview_source_page_stamp = nil,
       preview_float = {
         bufnr = nil,
         winid = nil,
         width = 1,
         height = 1,
+        vertical = "below",
       },
       currently_hidden_extmark_ids = {},
       multiline_marks = {},

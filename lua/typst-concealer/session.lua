@@ -6,7 +6,7 @@
 ---   M.render_items_via_watch(bufnr, items, kind)    dispatch items to a watch session
 ---   M.ensure_watch_session(bufnr, kind)             start/reuse a watch session
 ---   M.stop_watch_session(bufnr, kind)               kill and clean up a session
----   M.stop_watch_sessions_for_buf(bufnr)            kill both sessions for a buffer
+---   M.stop_watch_sessions_for_buf(bufnr)            kill the buffer session
 
 local state = require("typst-concealer.state")
 local M = {}
@@ -22,13 +22,12 @@ local function qf_title(bufnr)
   return ("typst-concealer: %s"):format(name)
 end
 
---- Rebuild the global quickfix list for a buffer by aggregating watch diagnostics
---- from both the full and preview sessions.
+--- Rebuild the global quickfix list for a buffer from active watch diagnostics.
 --- @param bufnr integer
 local function rebuild_quickfix(bufnr)
   local bucket = state.watch_diagnostics[bufnr] or {}
   local items = {}
-  for _, kind in ipairs({ "full", "preview" }) do
+  for _, kind in ipairs({ "full" }) do
     for _, item in ipairs(bucket[kind] or {}) do
       items[#items + 1] = item
     end
@@ -44,7 +43,7 @@ end
 --- Clear quickfix diagnostics for one session kind and rebuild the aggregated
 --- buffer quickfix list.
 --- @param bufnr integer
---- @param kind  'full' | 'preview'
+--- @param kind  'full'
 local function clear_quickfix(bufnr, kind)
   state.watch_diagnostics[bufnr] = state.watch_diagnostics[bufnr] or {}
   state.watch_diagnostics[bufnr][kind] = {}
@@ -557,7 +556,7 @@ end
 
 --- Stop a watch session and clean up its files.
 --- @param bufnr integer
---- @param kind  'full' | 'preview'
+--- @param kind  'full'
 function M.stop_watch_session(bufnr, kind)
   local bucket = state.watch_sessions[bufnr]
   if bucket == nil or bucket[kind] == nil then
@@ -605,7 +604,6 @@ end
 --- @param bufnr integer
 function M.stop_watch_sessions_for_buf(bufnr)
   M.stop_watch_session(bufnr, "full")
-  M.stop_watch_session(bufnr, "preview")
 end
 
 --- Called when a rendered page file is stable and ready to display.
@@ -615,7 +613,8 @@ end
 --- @param image_id       integer
 --- @param extmark_id     integer
 --- @param original_range table
-local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original_range)
+--- @param page_stamp     string
+local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original_range, page_stamp)
   local pngData = require("typst-concealer.png-lua")
   local extmark = require("typst-concealer.extmark")
   local kitty_codes = require("typst-concealer.kitty-codes")
@@ -679,6 +678,8 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
     item.natural_cols = natural_cols
     item.natural_rows = natural_rows
     item.source_rows = source_rows
+    item.page_path = page_path
+    item.page_stamp = page_stamp
   end
 
   -- Swap extmark to new range when the new image is ready.
@@ -698,17 +699,8 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
 
   extmark.create_image(page_path, image_id, natural_cols, natural_rows)
   extmark.conceal_for_image_id(target_bufnr, image_id, natural_cols, natural_rows, source_rows)
-  if item and item.render_target == "float" then
-    require("typst-concealer.render").commit_live_typst_preview(
-      item.bufnr,
-      image_id,
-      extmark_id,
-      natural_cols,
-      natural_rows
-    )
-  else
-    require("typst-concealer.render").hide_extmarks_at_cursor(bufnr)
-  end
+  require("typst-concealer.render").hide_extmarks_at_cursor(bufnr)
+  require("typst-concealer.render").render_live_typst_preview(bufnr)
 end
 
 --- Attempt to render page i of session if the file is stable (two consecutive equal stamps).
@@ -744,7 +736,7 @@ local function try_render_session_page(session, i, item)
     if current ~= session then
       return
     end
-    on_page_rendered(session.bufnr, page_path, item.image_id, item.extmark_id, item.range)
+    on_page_rendered(session.bufnr, page_path, item.image_id, item.extmark_id, item.range, stamp)
   end)
 end
 
@@ -770,7 +762,7 @@ end
 
 --- Start or reuse a `typst watch` session for bufnr.
 --- @param bufnr integer
---- @param kind  'full' | 'preview'
+--- @param kind  'full'
 --- @return typst_watch_session|nil
 function M.ensure_watch_session(bufnr, kind)
   local existing = get_watch_session(bufnr, kind)
@@ -967,7 +959,7 @@ end
 --- Send a batch of items to a watch session for rendering.
 --- @param bufnr integer
 --- @param items table[]
---- @param kind  'full' | 'preview'
+--- @param kind  'full'
 function M.render_items_via_watch(bufnr, items, kind)
   if #items == 0 then
     M.stop_watch_session(bufnr, kind)

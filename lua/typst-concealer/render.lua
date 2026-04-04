@@ -9,7 +9,7 @@ local M = {}
 
 local diagnostics = {}
 
-local PREVIEW_FLOAT_TARGET_RANGE = { 0, 0, 1, 0 }
+local PREVIEW_FLOAT_TARGET_RANGE = { 0, 0, 0, 0 }
 local PREVIEW_FLOAT_LINE_COUNT = 2
 
 --- Extract the text contained within a buffer range.
@@ -169,6 +169,29 @@ local function cleanup_item(bufnr, item)
   state.item_by_image_id[item.image_id] = nil
 end
 
+local function cleanup_preview_image(bufnr)
+  local bs = state.get_buf_state(bufnr)
+  local preview = bs.preview_image
+  if preview == nil then
+    bs.preview_source_image_id = nil
+    bs.preview_source_page_stamp = nil
+    return
+  end
+
+  local extmark = require("typst-concealer.extmark")
+  local target_bufnr = preview.target_bufnr or bufnr
+  state.prepare_extmark_reuse(target_bufnr, preview.extmark_id)
+  pcall(vim.api.nvim_buf_del_extmark, target_bufnr, state.ns_id, preview.extmark_id)
+  if preview.image_id ~= nil then
+    state.image_id_to_extmark[preview.image_id] = nil
+    state.item_by_image_id[preview.image_id] = nil
+    state.image_ids_in_use[preview.image_id] = nil
+  end
+  bs.preview_image = nil
+  bs.preview_source_image_id = nil
+  bs.preview_source_page_stamp = nil
+end
+
 --- Full reset of all concealer state for a buffer (called on disable or wipeout).
 --- @param bufnr integer
 function M.hard_reset_buf(bufnr)
@@ -263,6 +286,18 @@ function M.render_buf(bufnr)
       semantics = sem, -- unified: replaces layout_kind/is_block/display_as_block
       needs_swap = prev_item ~= nil,
     }
+
+    -- Preserve the last stable rendered page metadata while a fresh watch update
+    -- is in flight. This prevents preview consumers from dropping to an empty
+    -- state between edits and the next rendered page becoming ready.
+    if prev_item ~= nil then
+      item.page_path = prev_item.page_path
+      item.page_stamp = prev_item.page_stamp
+      item.natural_cols = prev_item.natural_cols
+      item.natural_rows = prev_item.natural_rows
+      item.source_rows = prev_item.source_rows
+    end
+
     batch_items[#batch_items + 1] = item
     state.item_by_image_id[image_id] = item
   end
@@ -555,7 +590,7 @@ local function list_nearby_float_obstacles(exclude_winid, anchor)
   return ret
 end
 
-local function make_candidate_rect(anchor, width, height, row, col)
+local function make_candidate_rect(anchor, width, height, row, col, vertical)
   return {
     top = row,
     left = col,
@@ -564,10 +599,11 @@ local function make_candidate_rect(anchor, width, height, row, col)
     width = width,
     height = height,
     dist = math.abs(row - anchor.row) + math.abs(col - anchor.col),
+    vertical = vertical,
   }
 end
 
-local function candidate_penalty(rect, obstacles, editor_h, editor_w)
+local function candidate_bounds_penalty(rect, editor_h, editor_w)
   local penalty = 0
 
   if rect.top < 0 then
@@ -583,6 +619,12 @@ local function candidate_penalty(rect, obstacles, editor_h, editor_w)
     penalty = penalty + 1000 + (rect.right - editor_w + 1) * 20
   end
 
+  return penalty
+end
+
+local function candidate_obstacle_penalty(rect, obstacles)
+  local penalty = 0
+
   for _, obs in ipairs(obstacles) do
     local area = rect_intersection_area(rect, obs)
     if area > 0 then
@@ -591,9 +633,15 @@ local function candidate_penalty(rect, obstacles, editor_h, editor_w)
     end
   end
 
-  penalty = penalty + rect.dist
-
   return penalty
+end
+
+local function candidate_penalty(rect, obstacles, editor_h, editor_w)
+  local bounds_penalty = candidate_bounds_penalty(rect, editor_h, editor_w)
+  local obstacle_penalty = candidate_obstacle_penalty(rect, obstacles)
+  rect.bounds_penalty = bounds_penalty
+  rect.obstacle_penalty = obstacle_penalty
+  return bounds_penalty + obstacle_penalty + rect.dist
 end
 
 local function choose_preview_rect(bufnr, width, height, exclude_winid)
@@ -601,33 +649,42 @@ local function choose_preview_rect(bufnr, width, height, exclude_winid)
   if anchor == nil then
     return nil
   end
+  local bs = state.get_buf_state(bufnr)
   local obstacles = list_nearby_float_obstacles(exclude_winid, anchor)
 
   local editor_h = vim.o.lines - vim.o.cmdheight
   local editor_w = vim.o.columns
+  local preferred_vertical = (bs.preview_float and bs.preview_float.vertical) or "below"
 
   local candidates = {
-    make_candidate_rect(anchor, width, height, anchor.row + 1, anchor.col + 1),
-    make_candidate_rect(anchor, width, height, anchor.row + 1, anchor.col - width - 1),
-    make_candidate_rect(anchor, width, height, anchor.row - height, anchor.col + 1),
-    make_candidate_rect(anchor, width, height, anchor.row - height, anchor.col - width - 1),
-    make_candidate_rect(anchor, width, height, anchor.row + 2, anchor.col),
-    make_candidate_rect(anchor, width, height, anchor.row - height - 1, anchor.col),
-    make_candidate_rect(anchor, width, height, anchor.row, anchor.col + 2),
-    make_candidate_rect(anchor, width, height, anchor.row, anchor.col - width - 2),
+    make_candidate_rect(anchor, width, height, anchor.row + 1, anchor.col + 1, "below"),
+    make_candidate_rect(anchor, width, height, anchor.row + 1, anchor.col - width - 1, "below"),
+    make_candidate_rect(anchor, width, height, anchor.row - height, anchor.col + 1, "above"),
+    make_candidate_rect(anchor, width, height, anchor.row - height, anchor.col - width - 1, "above"),
+    make_candidate_rect(anchor, width, height, anchor.row + 2, anchor.col, "below"),
+    make_candidate_rect(anchor, width, height, anchor.row - height - 1, anchor.col, "above"),
+    make_candidate_rect(anchor, width, height, anchor.row, anchor.col + 2, preferred_vertical),
+    make_candidate_rect(anchor, width, height, anchor.row, anchor.col - width - 2, preferred_vertical),
   }
 
   local best = nil
   local best_penalty = math.huge
+  local preferred_best = nil
+  local preferred_best_penalty = math.huge
 
   for _, rect in ipairs(candidates) do
     local p = candidate_penalty(rect, obstacles, editor_h, editor_w)
+    if rect.vertical == preferred_vertical and rect.bounds_penalty == 0 and rect.obstacle_penalty == 0 and p < preferred_best_penalty then
+      preferred_best = rect
+      preferred_best_penalty = p
+    end
     if p < best_penalty then
       best = rect
       best_penalty = p
     end
   end
 
+  best = preferred_best or best
   best.top = clamp(best.top, 0, math.max(0, editor_h - height))
   best.left = clamp(best.left, 0, math.max(0, editor_w - width))
 
@@ -640,6 +697,13 @@ local function preview_win_config(bufnr, width, height, for_create)
   local rect = choose_preview_rect(bufnr, math.max(1, width or 1), math.max(1, height or 1), preview_winid)
   if rect == nil then
     return nil
+  end
+  if
+    bs.preview_float ~= nil
+    and rect.bounds_penalty == 0
+    and rect.obstacle_penalty == 0
+  then
+    bs.preview_float.vertical = rect.vertical or bs.preview_float.vertical or "below"
   end
 
   local config = {
@@ -691,6 +755,21 @@ local function ensure_live_preview_float(bufnr)
   return pf
 end
 
+local function ensure_preview_float_lines(bufnr, line_count)
+  local bs = state.get_buf_state(bufnr)
+  local pf = bs.preview_float
+  if pf.bufnr == nil or not vim.api.nvim_buf_is_valid(pf.bufnr) then
+    return
+  end
+
+  local count = math.max(PREVIEW_FLOAT_LINE_COUNT, line_count or 1)
+  local lines = {}
+  for _ = 1, count do
+    lines[#lines + 1] = ""
+  end
+  vim.api.nvim_buf_set_lines(pf.bufnr, 0, -1, false, lines)
+end
+
 local function close_live_preview_float(bufnr)
   local bs = state.get_buf_state(bufnr)
   local pf = bs.preview_float
@@ -707,6 +786,7 @@ local function close_live_preview_float(bufnr)
     winid = nil,
     width = 1,
     height = 1,
+    vertical = "below",
   }
 end
 
@@ -759,50 +839,110 @@ local function get_typst_block_at_cursor(bufnr)
   return nil
 end
 
+local function same_range(a, b)
+  if a == nil or b == nil then
+    return false
+  end
+  return a[1] == b[1] and a[2] == b[2] and a[3] == b[3] and a[4] == b[4]
+end
+
+local function find_full_item_for_range(bufnr, range)
+  local bstate = state.buffer_render_state[bufnr]
+  if bstate == nil or bstate.full_items == nil then
+    return nil
+  end
+
+  for _, item in ipairs(bstate.full_items) do
+    if item.node_type == "math" and same_range(item.range, range) then
+      return item
+    end
+  end
+
+  return nil
+end
+
+local function present_preview_item(bufnr, item)
+  if item == nil then
+    close_live_preview_float(bufnr)
+    cleanup_preview_image(bufnr)
+    return
+  end
+
+  local bs = state.get_buf_state(bufnr)
+  if item.page_path == nil or item.natural_cols == nil or item.natural_rows == nil then
+    if bs.preview_source_image_id == item.image_id and bs.preview_image ~= nil then
+      return
+    end
+    close_live_preview_float(bufnr)
+    cleanup_preview_image(bufnr)
+    return
+  end
+
+  local pf = ensure_live_preview_float(bufnr)
+  if pf == nil then
+    cleanup_preview_image(bufnr)
+    return
+  end
+
+  if
+    bs.preview_source_image_id == item.image_id
+    and bs.preview_source_page_stamp == item.page_stamp
+    and bs.preview_image ~= nil
+  then
+    M.sync_live_preview_float(bufnr, item.natural_cols, item.natural_rows)
+    return
+  end
+
+  cleanup_preview_image(bufnr)
+  ensure_preview_float_lines(bufnr, item.natural_rows)
+
+  local sem = {
+    constraint_kind = "intrinsic",
+    display_kind = "block",
+    source_kind = "math",
+  }
+  local extmark = require("typst-concealer.extmark")
+  local target_range = { 0, 0, math.max(0, item.natural_rows - 1), 0 }
+  local preview_image_id = new_image_id(bufnr)
+  local extmark_id = extmark.place_render_extmark(pf.bufnr, preview_image_id, target_range, nil, nil, sem)
+  local preview_item = {
+    bufnr = bufnr,
+    image_id = preview_image_id,
+    extmark_id = extmark_id,
+    range = item.range,
+    str = item.str,
+    node_type = "math",
+    semantics = sem,
+    render_target = "float",
+    source_image_id = item.image_id,
+    target_bufnr = pf.bufnr,
+    target_range = target_range,
+  }
+
+  state.item_by_image_id[preview_image_id] = preview_item
+  extmark.conceal_existing_image(pf.bufnr, extmark_id, item.image_id, item.natural_cols, item.natural_rows, 1, preview_item)
+  M.sync_live_preview_float(bufnr, item.natural_cols, item.natural_rows)
+
+  bs.preview_image = {
+    image_id = preview_image_id,
+    extmark_id = extmark_id,
+    target_bufnr = pf.bufnr,
+  }
+  bs.preview_source_image_id = item.image_id
+  bs.preview_source_page_stamp = item.page_stamp
+end
+
 --- Stop the live preview session and remove its extmark/image.
 --- @param bufnr integer
 function M.clear_live_typst_preview(bufnr)
-  local bs = state.get_buf_state(bufnr)
-  if bs.live_preview_timer then
-    if not bs.live_preview_timer:is_closing() then
-      bs.live_preview_timer:stop()
-      bs.live_preview_timer:close()
-    end
-    bs.live_preview_timer = nil
-  end
-  bs.last_preview_str = nil
+  cleanup_preview_image(bufnr)
   close_live_preview_float(bufnr)
-
-  local session = require("typst-concealer.session")
-  session.stop_watch_session(bufnr, "preview")
-
-  if bs.preview_image ~= nil then
-    local extmark = require("typst-concealer.extmark")
-    local target_bufnr = bs.preview_image.target_bufnr or bufnr
-    state.prepare_extmark_reuse(target_bufnr, bs.preview_image.extmark_id)
-    pcall(vim.api.nvim_buf_del_extmark, target_bufnr, state.ns_id, bs.preview_image.extmark_id)
-    extmark.clear_image(bs.preview_image.image_id)
-    state.image_id_to_extmark[bs.preview_image.image_id] = nil
-    state.item_by_image_id[bs.preview_image.image_id] = nil
-    bs.preview_image = nil
-  end
-  if bs.pending_preview_image ~= nil then
-    local extmark = require("typst-concealer.extmark")
-    local target_bufnr = bs.pending_preview_image.target_bufnr or bufnr
-    state.prepare_extmark_reuse(target_bufnr, bs.pending_preview_image.extmark_id)
-    pcall(vim.api.nvim_buf_del_extmark, target_bufnr, state.ns_id, bs.pending_preview_image.extmark_id)
-    extmark.clear_image(bs.pending_preview_image.image_id)
-    state.image_id_to_extmark[bs.pending_preview_image.image_id] = nil
-    state.item_by_image_id[bs.pending_preview_image.image_id] = nil
-    bs.pending_preview_image = nil
-  end
 end
 
 --- Render a live preview float of the math node under the cursor.
 --- @param bufnr integer
 function M.render_live_typst_preview(bufnr)
   local main = require("typst-concealer")
-  local bs = state.get_buf_state(bufnr)
   if main._enabled_buffers[bufnr] ~= true or not main.is_render_allowed(bufnr) then
     M.clear_live_typst_preview(bufnr)
     return
@@ -817,106 +957,7 @@ function M.render_live_typst_preview(bufnr)
   M.sync_live_preview_float(bufnr)
 
   local range = { start_row, start_col, end_row, end_col }
-  local str = range_to_string(range, bufnr)
-
-  if bs.last_preview_str == str then
-    return
-  end
-
-  -- Debounce: cancel previous timer before starting a new one
-  if bs.live_preview_timer then
-    if not bs.live_preview_timer:is_closing() then
-      bs.live_preview_timer:stop()
-      bs.live_preview_timer:close()
-    end
-  end
-
-  bs.live_preview_timer = vim.uv.new_timer()
-  bs.live_preview_timer:start(
-    require("typst-concealer").config.live_preview_debounce,
-    0,
-    vim.schedule_wrap(function()
-      if bs.live_preview_timer then
-        if not bs.live_preview_timer:is_closing() then
-          bs.live_preview_timer:stop()
-          bs.live_preview_timer:close()
-        end
-        bs.live_preview_timer = nil
-      end
-
-      bs.last_preview_str = str
-
-      local sem = {
-        constraint_kind = "intrinsic",
-        display_kind = "block",
-        source_kind = "math",
-      }
-      local extmark = require("typst-concealer.extmark")
-      local session = require("typst-concealer.session")
-      local pf = ensure_live_preview_float(bufnr)
-      if pf == nil then
-        M.clear_live_typst_preview(bufnr)
-        return
-      end
-      local target_bufnr = pf.bufnr
-      local target_range = PREVIEW_FLOAT_TARGET_RANGE
-
-      local image_id = new_image_id(bufnr)
-      local ext_id = extmark.place_render_extmark(target_bufnr, image_id, target_range, nil, nil, sem)
-
-      local item = {
-        bufnr = bufnr,
-        image_id = image_id,
-        extmark_id = ext_id,
-        range = range,
-        str = str,
-        prelude_count = 0,
-        node_type = "math",
-        semantics = sem,
-        render_target = "float",
-        target_bufnr = target_bufnr,
-        target_range = target_range,
-      }
-      -- Register in the O(1) index so conceal_for_image_id can find the semantics
-      state.item_by_image_id[image_id] = item
-      session.render_items_via_watch(bufnr, { item }, "preview")
-      bs.pending_preview_image = {
-        image_id = image_id,
-        extmark_id = ext_id,
-        target_bufnr = target_bufnr,
-        str = str,
-      }
-    end)
-  )
-end
-
-function M.commit_live_typst_preview(bufnr, image_id, extmark_id, natural_cols, natural_rows)
-  local bs = state.get_buf_state(bufnr)
-  local pending = bs.pending_preview_image
-  local extmark = require("typst-concealer.extmark")
-
-  if pending == nil or pending.image_id ~= image_id or pending.extmark_id ~= extmark_id then
-    pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id, extmark_id)
-    extmark.clear_image(image_id)
-    state.image_id_to_extmark[image_id] = nil
-    state.item_by_image_id[image_id] = nil
-    return
-  end
-
-  M.sync_live_preview_float(bufnr, natural_cols, natural_rows)
-
-  local old = bs.preview_image
-  if old ~= nil then
-    local old_target_bufnr = old.target_bufnr or bufnr
-    state.prepare_extmark_reuse(old_target_bufnr, old.extmark_id)
-    pcall(vim.api.nvim_buf_del_extmark, old_target_bufnr, state.ns_id, old.extmark_id)
-    extmark.clear_image(old.image_id)
-    state.image_id_to_extmark[old.image_id] = nil
-    state.item_by_image_id[old.image_id] = nil
-  end
-
-  bs.preview_image = pending
-  bs.pending_preview_image = nil
+  present_preview_item(bufnr, find_full_item_for_range(bufnr, range))
 end
 
 return M
