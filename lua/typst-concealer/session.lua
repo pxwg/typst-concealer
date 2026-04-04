@@ -125,6 +125,13 @@ local function normalize_path(path)
   return vim.fs.normalize(vim.fn.fnamemodify(path, ":p"))
 end
 
+local function normalize_root(path)
+  if path == nil or path == "" then
+    return nil
+  end
+  return normalize_path(path):gsub("/$", "")
+end
+
 --- Determine whether a Typst-reported path refers to this session's generated
 --- temporary input file. Typst may report the path as absolute or relative.
 --- @param session typst_watch_session
@@ -144,8 +151,11 @@ local function is_session_input_path(session, file)
   if session.buf_dir then
     candidates[#candidates + 1] = session.buf_dir .. "/" .. file
   end
-  if session.project_root then
-    candidates[#candidates + 1] = session.project_root .. "/" .. file
+  if session.source_root then
+    candidates[#candidates + 1] = session.source_root .. "/" .. file
+  end
+  if session.effective_root then
+    candidates[#candidates + 1] = session.effective_root .. "/" .. file
   end
 
   for _, candidate in ipairs(candidates) do
@@ -217,7 +227,8 @@ local function resolve_typst_source_path(session, file)
   end
 
   if file:sub(1, 1) == "/" then
-    return file
+    local path_rewrite = require("typst-concealer.path-rewrite")
+    return path_rewrite.resolve_to_absolute(file, session.buf_dir, session.source_root) or file
   end
 
   local namespace, pkg, ver, rest = file:match("^@([^/]+)/([^:]+):([^/]+)/(.*)$")
@@ -234,8 +245,11 @@ local function resolve_typst_source_path(session, file)
   if session.buf_dir then
     relative_candidates[#relative_candidates + 1] = session.buf_dir .. "/" .. file
   end
-  if session.project_root then
-    relative_candidates[#relative_candidates + 1] = session.project_root .. "/" .. file
+  if session.source_root then
+    relative_candidates[#relative_candidates + 1] = session.source_root .. "/" .. file
+  end
+  if session.effective_root then
+    relative_candidates[#relative_candidates + 1] = session.effective_root .. "/" .. file
   end
 
   for _, path in ipairs(relative_candidates) do
@@ -321,6 +335,10 @@ local function write_file_in_place(path, text)
   return true
 end
 
+--- Write debugging artifacts next to the generated watch input so path rewrite
+--- issues can be inspected from the exact Typst source that was compiled.
+--- @param session typst_watch_session
+--- @param doc_str string
 --- Remove previously rendered page images so a new watch cycle never consumes
 --- stale pages before Typst finishes writing the current generation.
 --- @param prefix string
@@ -437,10 +455,13 @@ local function get_buf_dir(bufnr)
   return vim.fn.fnamemodify(buf_file, ":h")
 end
 
---- Returns (and creates) a per-buffer cache directory under stdpath("cache").
+--- Returns (and creates) a per-buffer cache directory.
+--- Prefer placing it inside source_root so generated watch inputs stay within
+--- the same Typst project root as real source files.
 --- @param bufnr integer
+--- @param source_root string|nil
 --- @return string
-local function get_cache_dir(bufnr)
+local function get_cache_dir(bufnr, source_root)
   local buf_file = vim.api.nvim_buf_get_name(bufnr)
   local safe_name
   if buf_file == nil or buf_file == "" then
@@ -457,7 +478,13 @@ local function get_cache_dir(bufnr)
   for i = 1, #hash_input do
     h = (h * 31 + hash_input:byte(i)) % 0xFFFF
   end
-  local dir = vim.fn.stdpath("cache") .. "/typst-concealer/" .. safe_name .. "-" .. string.format("%04x", h)
+  local base_dir
+  if source_root ~= nil and source_root ~= "" then
+    base_dir = source_root .. "/.typst-concealer"
+  else
+    base_dir = vim.fn.stdpath("cache") .. "/typst-concealer"
+  end
+  local dir = base_dir .. "/" .. safe_name .. "-" .. string.format("%04x", h)
   vim.fn.mkdir(dir, "p")
   return dir
 end
@@ -465,9 +492,10 @@ end
 --- Generates the fixed input path for a watch session.
 --- @param bufnr integer
 --- @param kind  'full' | 'preview'
+--- @param source_root string|nil
 --- @return string
-local function session_input_path(bufnr, kind)
-  local dir = get_cache_dir(bufnr)
+local function session_input_path(bufnr, kind, source_root)
+  local dir = get_cache_dir(bufnr, source_root)
   local suffix = kind == "preview" and "-preview" or ""
   return dir .. "/.typst-concealer-" .. state.full_pid .. "-" .. bufnr .. suffix .. ".typ"
 end
@@ -758,22 +786,16 @@ function M.ensure_watch_session(bufnr, kind)
   local path_rewrite = require("typst-concealer.path-rewrite")
   local buf_dir = get_buf_dir(bufnr)
   local project_root = path_rewrite.get_project_root(buf_dir)
-  local cache_base = vim.fn.stdpath("cache") .. "/typst-concealer"
-
-  -- Strip any --root from compiler_args (typst rejects duplicates).
-  -- Use the user-supplied root (if present) as the base for effective_root,
-  -- so their intended project boundary is still respected.
-  local user_root = nil
+  -- Strip any --root from compiler_args (typst rejects duplicates). Source root
+  -- comes only from get_root or project auto-detection.
   local filtered_compiler_args = {}
   if config.compiler_args then
     local i = 1
     while i <= #config.compiler_args do
       local arg = config.compiler_args[i]
       if arg == "--root" and i + 1 <= #config.compiler_args then
-        user_root = config.compiler_args[i + 1]
         i = i + 2
       elseif arg:sub(1, 7) == "--root=" then
-        user_root = arg:sub(8)
         i = i + 1
       else
         filtered_compiler_args[#filtered_compiler_args + 1] = arg
@@ -782,19 +804,45 @@ function M.ensure_watch_session(bufnr, kind)
     end
   end
 
-  -- effective_root = common ancestor of the intended project root and the
-  -- cache directory, so the temp file (in cache) is always within --root.
-  local base_root = user_root or project_root
-  local effective_root = path_rewrite.common_ancestor(base_root, cache_base)
+  local buf_path = vim.api.nvim_buf_get_name(bufnr)
+  local cwd = vim.fn.getcwd()
+  local configured_root = nil
+  if type(config.get_root) == "function" then
+    local ok, result = pcall(config.get_root, bufnr, buf_path, cwd, kind)
+    if ok and type(result) == "string" and result ~= "" then
+      configured_root = result
+    end
+  end
 
-  local input_path = session_input_path(bufnr, kind)
+  local source_root = normalize_root(configured_root or project_root)
+  local input_path = session_input_path(bufnr, kind, source_root)
+  local cache_base = vim.fn.fnamemodify(input_path, ":h")
+  -- effective_root = common ancestor of the intended project root and the
+  -- actual generated input directory. When the cache lives under source_root,
+  -- this stays equal to source_root and preserves rooted-path semantics for
+  -- real project files imported by context helpers.
+  local base_root = source_root or project_root
+  local effective_root = path_rewrite.common_ancestor(base_root, cache_base)
   local template, prefix = session_output_template(bufnr, kind)
+
+  -- Collect extra --input pairs from get_inputs.
+  local extra_inputs = {}
+  if type(config.get_inputs) == "function" then
+    local ok, result = pcall(config.get_inputs, bufnr, buf_path, cwd, kind)
+    if ok and type(result) == "table" then
+      extra_inputs = result
+    end
+  end
 
   local args = { "watch", input_path, template, "--ppi=" .. (state._render_ppi or config.ppi) }
   for _, arg in ipairs(filtered_compiler_args) do
     args[#args + 1] = arg
   end
   args[#args + 1] = "--root=" .. effective_root
+  for _, s in ipairs(extra_inputs) do
+    args[#args + 1] = "--input"
+    args[#args + 1] = s
+  end
 
   -- typst watch expects the input file to exist before startup.
   local ok, err = write_file_in_place(input_path, main._styling_prelude)
@@ -825,7 +873,8 @@ function M.ensure_watch_session(bufnr, kind)
     stderr_debounce = nil,
     dead = false,
     buf_dir = buf_dir,
-    project_root = effective_root,
+    source_root = source_root,
+    effective_root = effective_root,
   }
 
   local handle
@@ -943,13 +992,15 @@ function M.render_items_via_watch(bufnr, items, kind)
   end
 
   local wrapper = require("typst-concealer.wrapper")
-  local doc_str, line_map = wrapper.build_batch_document(items, session.buf_dir, session.project_root)
+  local doc_str, line_map =
+    wrapper.build_batch_document(items, session.buf_dir, session.source_root, session.effective_root, session.kind)
   session.line_map = line_map
   local ok, err = write_file_in_place(session.input_path, doc_str)
   if not ok then
     vim.schedule(function()
       vim.notify("[typst-concealer] failed to update watch input: " .. tostring(err), vim.log.levels.ERROR)
     end)
+    return
   end
 end
 

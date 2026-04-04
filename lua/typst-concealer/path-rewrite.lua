@@ -1,7 +1,45 @@
 --- Path rewriting utilities for typst-concealer.
---- Rewrites relative paths in Typst source to root-relative paths so that
---- temp files placed in the cache directory can resolve imports/images correctly.
+--- Resolve asset paths against the source/project root first, then encode them
+--- for the effective Typst `--root` used by the watch session.
 local M = {}
+
+local state = require("typst-concealer.state")
+
+local function normalize_path(path)
+  if path == nil or path == "" then
+    return nil
+  end
+  return vim.fs.normalize(vim.fn.fnamemodify(path, ":p")):gsub("/$", "")
+end
+
+local function starts_with_path(path, base)
+  if path == nil or base == nil then
+    return false
+  end
+  return path == base or path:sub(1, #base + 1) == (base .. "/")
+end
+
+local function get_cache_bucket(bufnr, opts)
+  if bufnr == nil or bufnr <= 0 then
+    return nil
+  end
+  local signature = table.concat({
+    opts.buf_dir or "",
+    opts.source_root or "",
+    opts.effective_root or "",
+  }, "\0")
+  local by_buf = state.path_rewrite_cache[bufnr]
+  if by_buf == nil then
+    by_buf = {}
+    state.path_rewrite_cache[bufnr] = by_buf
+  end
+  local bucket = by_buf[signature]
+  if bucket == nil then
+    bucket = {}
+    by_buf[signature] = bucket
+  end
+  return bucket
+end
 
 --- Return the longest common ancestor directory of dir1 and dir2.
 --- Both must be absolute paths. Returns "/" if they share only the root.
@@ -48,54 +86,100 @@ function M.get_project_root(buf_dir)
   return buf_dir
 end
 
---- Convert a relative path to a root-relative path (leading "/").
---- Absolute paths and @-package paths are returned unchanged.
---- Paths that resolve outside project_root are returned unchanged.
---- @param path string
+--- Resolve a raw Typst path string into a filesystem path when possible.
+--- @param raw_path string
 --- @param buf_dir string
---- @param project_root string
---- @return string
-function M.make_root_relative(path, buf_dir, project_root)
-  if path:sub(1, 1) == "/" or path:sub(1, 1) == "@" then
-    return path
+--- @param source_root string
+--- @return string|nil abs_fs_path
+--- @return "package"|"fs"|nil kind
+function M.resolve_to_absolute(raw_path, buf_dir, source_root)
+  if raw_path == nil or raw_path == "" then
+    return nil, nil
   end
-  local abs = vim.fn.fnamemodify(buf_dir .. "/" .. path, ":p"):gsub("/$", "")
-  local prefix = project_root .. "/"
-  if abs:sub(1, #prefix) ~= prefix then
-    return path
+  if raw_path:sub(1, 1) == "@" then
+    return raw_path, "package"
   end
-  return "/" .. abs:sub(#prefix + 1)
+
+  if raw_path:sub(1, 1) ~= "/" then
+    return normalize_path((buf_dir or "") .. "/" .. raw_path), "fs"
+  end
+
+  local source_candidate = source_root and normalize_path(source_root .. raw_path) or nil
+  if source_candidate ~= nil then
+    return source_candidate, "fs"
+  end
+  return normalize_path(raw_path), "fs"
 end
 
---- Rewrite all relative path strings in a Typst text fragment.
---- Handles: #import, #include, image(), json(), toml(), yaml(), read(), csv(),
----           bibliography() first arg and style: named arg.
---- @param text string
---- @param buf_dir string
---- @param project_root string
+--- Encode a filesystem path for the effective Typst root.
+--- Paths under the effective root are emitted as Typst root-relative strings.
+--- @param abs_path string
+--- @param effective_root string
 --- @return string
-function M.rewrite_paths(text, buf_dir, project_root)
+function M.encode_root_relative(abs_path, effective_root)
+  local normalized_abs = normalize_path(abs_path)
+  local normalized_root = normalize_path(effective_root)
+  if normalized_abs == nil or normalized_root == nil then
+    return abs_path
+  end
+  if not starts_with_path(normalized_abs, normalized_root) then
+    return normalized_abs
+  end
+  if normalized_abs == normalized_root then
+    return "/"
+  end
+  return "/" .. normalized_abs:sub(#normalized_root + 2)
+end
+
+--- Rewrite one Typst path literal according to source/effective roots.
+--- @param raw_path string
+--- @param opts { bufnr?: integer, buf_dir: string, source_root: string, effective_root: string }
+--- @return string
+function M.rewrite_path(raw_path, opts)
+  local bucket = get_cache_bucket(opts.bufnr, opts)
+  if bucket ~= nil and bucket[raw_path] ~= nil then
+    return bucket[raw_path]
+  end
+
+  local abs_path, kind = M.resolve_to_absolute(raw_path, opts.buf_dir, opts.source_root)
+  local rewritten = raw_path
+  if kind == "package" then
+    rewritten = raw_path
+  elseif kind == "fs" and abs_path ~= nil then
+    rewritten = M.encode_root_relative(abs_path, opts.effective_root)
+  end
+
+  if bucket ~= nil then
+    bucket[raw_path] = rewritten
+  end
+  return rewritten
+end
+
+--- Rewrite all relevant path strings in a Typst text fragment.
+--- Handles: #import, #include, image(), json(), toml(), yaml(), read(), csv(),
+---          bibliography() first arg and style: named arg.
+--- @param text string
+--- @param opts { bufnr?: integer, buf_dir: string, source_root: string, effective_root: string }
+--- @return string
+function M.rewrite_paths(text, opts)
   local function rw(p)
-    return M.make_root_relative(p, buf_dir, project_root)
+    return M.rewrite_path(p, opts)
   end
   local function sub(a, p, b)
     return a .. rw(p) .. b
   end
 
-  -- #import / #include keywords
   for _, kw in ipairs({ "import", "include" }) do
     text = text:gsub("(#" .. kw .. '%s+")([^"]*)(")', sub)
     text = text:gsub("(#" .. kw .. "%s+')" .. "([^']*)" .. "(')", sub)
   end
 
-  -- Function calls: first positional string argument
-  local FIRST_ARG_FNS = { "image", "json", "toml", "yaml", "read", "csv", "bibliography" }
-  for _, fn in ipairs(FIRST_ARG_FNS) do
+  local first_arg_fns = { "image", "json", "toml", "yaml", "read", "csv", "bibliography" }
+  for _, fn in ipairs(first_arg_fns) do
     text = text:gsub("(" .. fn .. '%s*%(%s*")([^"]*)(")', sub)
     text = text:gsub("(" .. fn .. "%s*%(%s*')" .. "([^']*)" .. "(')", sub)
   end
 
-  -- bibliography(style: "path.csl") named argument
   text = text:gsub('(style%s*:%s*")([^"]*)(")', sub)
   text = text:gsub("(style%s*:%s*')" .. "([^']*)" .. "(')", sub)
 

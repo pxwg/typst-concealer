@@ -184,20 +184,31 @@ end
 --- Build multi-page Typst source for a batch render session.
 --- @param items table[]
 --- @param buf_dir string|nil   source buffer directory (for path rewriting)
---- @param project_root string|nil  project root (for path rewriting)
+--- @param source_root string|nil  source/project root used for `/...` semantics
+--- @param effective_root string|nil  actual Typst `--root` used by the watch session
+--- @param kind "full"|"preview"|nil  session kind forwarded to get_preamble_file
 --- @return string, table
-function M.build_batch_document(items, buf_dir, project_root)
+function M.build_batch_document(items, buf_dir, source_root, effective_root, kind)
   local main = require("typst-concealer")
   local config = main.config
   local doc = {}
   local line_map = {}
   local cur_line = 1
   local cur_col = 1
+  local rep_bufnr = (items[1] and items[1].bufnr) or 0
 
-  local do_rewrite = buf_dir ~= nil and project_root ~= nil
+  local do_rewrite = buf_dir ~= nil and source_root ~= nil and effective_root ~= nil
   local pr = do_rewrite and require("typst-concealer.path-rewrite") or nil
   local function maybe_rewrite(text)
-    return pr and pr.rewrite_paths(text, buf_dir, project_root) or text
+    if pr == nil then
+      return text
+    end
+    return pr.rewrite_paths(text, {
+      bufnr = rep_bufnr,
+      buf_dir = buf_dir,
+      source_root = source_root,
+      effective_root = effective_root,
+    })
   end
   local function append_chunk(chunk)
     doc[#doc + 1] = chunk
@@ -209,6 +220,20 @@ function M.build_batch_document(items, buf_dir, project_root)
   end
 
   append_chunk(main._styling_prelude)
+
+  -- Inject project-level context via get_preamble_file.
+  -- The returned filesystem path is converted to a Typst root-relative path so
+  -- that `#include` resolves correctly regardless of where the temp file lives.
+  if type(config.get_preamble_file) == "function" and pr ~= nil then
+    local buf_path_for_pf = (items[1] and vim.api.nvim_buf_get_name(items[1].bufnr)) or ""
+    local cwd_for_pf = vim.fn.getcwd()
+    local ok, pf = pcall(config.get_preamble_file, rep_bufnr, buf_path_for_pf, cwd_for_pf, kind or "full")
+    if ok and type(pf) == "string" and pf ~= "" then
+      local abs = vim.fs.normalize(vim.fn.fnamemodify(pf, ":p")):gsub("/$", "")
+      local typst_path = pr.encode_root_relative(abs, effective_root)
+      append_chunk('#include "' .. typst_path .. '"\n')
+    end
+  end
 
   for idx, item in ipairs(items) do
     if idx > 1 then

@@ -30,7 +30,8 @@ M.image_ids_in_use = {}
 --- @field stderr_chunks string[]
 --- @field dead boolean|nil
 --- @field buf_dir string
---- @field project_root string
+--- @field source_root string
+--- @field effective_root string
 
 --- @type { [integer]: { full?: typst_watch_session, preview?: typst_watch_session } }
 M.watch_sessions = {}
@@ -85,6 +86,10 @@ M.item_by_image_id = {}
 --- Prelude strings accumulated during the current render_buf pass
 --- @type string[]
 M.runtime_preludes = {}
+
+--- Cached path rewrite results, partitioned by buffer and root signature.
+--- @type table<integer, table<string, table<string, string>>>
+M.path_rewrite_cache = {}
 
 --- Terminal cell pixel dimensions (nil until refresh_cell_px_size is called)
 M._cell_px_w = nil

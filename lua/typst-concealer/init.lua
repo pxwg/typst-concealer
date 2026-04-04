@@ -100,6 +100,16 @@ end
 --- @field cursor_hover_throttle_ms? number  Throttle delay for CursorMoved hover in ms. Default 0 (disabled).
 --- @field render_paths?          { include?: (string|fun(path: string, bufnr: integer): boolean)[], exclude?: (string|fun(path: string, bufnr: integer): boolean)[] }
 ---                                     Optional path rules. `include` acts as a whitelist when non-empty; `exclude` always wins.
+--- @field get_root?              fun(bufnr: integer, path: string, cwd: string, kind: "full"|"preview"): string|nil
+---                                     Return the source/project root used to interpret rooted Typst paths like `/fig/a.png`.
+---                                     Must be an absolute filesystem path. `nil` falls back to detected project root.
+--- @field get_inputs?            fun(bufnr: integer, path: string, cwd: string, kind: "full"|"preview"): string[]|nil
+---                                     Return extra `--input` values, e.g. `{"focus=123", "preview=true"}`. `nil`/`{}` appends nothing.
+--- @field get_preamble_file?     fun(bufnr: integer, path: string, cwd: string, kind: "full"|"preview"): string|nil
+---                                     Return an absolute path to a `.typ` file that is `#include`d at the top of every
+---                                     batch document for this buffer. Use this to inject project-level context
+---                                     (bibliography, imports, show rules) so that snippets compile under the correct
+---                                     project scope. The file must be within `--root`. `nil` skips injection.
 
 local function default(val, default_val)
   if val == nil then
@@ -221,6 +231,9 @@ function M.setup(cfg)
     live_preview_debounce = default(cfg.live_preview_debounce, 100),
     cursor_hover_throttle_ms = default(cfg.cursor_hover_throttle_ms, 0),
     render_paths = default(cfg.render_paths, {}),
+    get_root = cfg.get_root,
+    get_inputs = cfg.get_inputs,
+    get_preamble_file = cfg.get_preamble_file,
   }
 
   if not vim.list_contains({ "none", "simple", "colorscheme" }, M.config.styling_type) then
@@ -229,6 +242,10 @@ function M.setup(cfg)
         .. M.config.styling_type
         .. " is not a valid option. Please use 'none', 'simple' or 'colorscheme'"
     )
+  end
+
+  if M.config.get_root ~= nil and type(M.config.get_root) ~= "function" then
+    error("typst get_root must be a function when provided")
   end
 
   setup_prelude()
