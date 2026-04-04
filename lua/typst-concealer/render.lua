@@ -1287,8 +1287,9 @@ local function find_full_item_at_cursor(bufnr, row, col)
     return nil
   end
 
+  local candidates = bstate.line_to_items and bstate.line_to_items[row] or bstate.full_items
   local best_item = nil
-  for _, item in ipairs(bstate.full_items) do
+  for _, item in ipairs(candidates) do
     if item.node_type == "math" and cursor_engages_inline_item(item.range, row, col) then
       if best_item == nil then
         best_item = item
