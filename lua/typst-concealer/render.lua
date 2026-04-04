@@ -15,6 +15,7 @@ local PREVIEW_FLOAT_LINE_COUNT = 2
 local candidate_bounds_penalty
 local candidate_obstacle_penalty
 local list_nearby_float_obstacles
+local cursor_in_range
 
 --- Extract the text contained within a buffer range.
 --- @param range Range4
@@ -262,6 +263,21 @@ local function cleanup_preview_image(bufnr)
   local bs = state.get_buf_state(bufnr)
   local preview = bs.preview_image
   if preview == nil then
+    if bs.preview_item ~= nil then
+      if bs.preview_item.extmark_id ~= nil then
+        state.prepare_extmark_reuse(bufnr, bs.preview_item.extmark_id)
+        pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id, bs.preview_item.extmark_id)
+      end
+    end
+    if bs.preview_item ~= nil and bs.preview_item.image_id ~= nil then
+      local extmark = require("typst-concealer.extmark")
+      extmark.clear_image(bs.preview_item.image_id)
+      state.image_id_to_extmark[bs.preview_item.image_id] = nil
+      state.item_by_image_id[bs.preview_item.image_id] = nil
+      state.image_ids_in_use[bs.preview_item.image_id] = nil
+    end
+    bs.preview_item = nil
+    bs.preview_render_key = nil
     bs.preview_source_image_id = nil
     bs.preview_source_page_stamp = nil
     bs.preview_source_range = nil
@@ -278,13 +294,192 @@ local function cleanup_preview_image(bufnr)
     state.item_by_image_id[preview.image_id] = nil
     state.image_ids_in_use[preview.image_id] = nil
   end
+  if bs.preview_item ~= nil and bs.preview_item.image_id ~= nil and bs.preview_item.image_id ~= preview.image_id then
+    extmark.clear_image(bs.preview_item.image_id)
+    state.image_id_to_extmark[bs.preview_item.image_id] = nil
+    state.item_by_image_id[bs.preview_item.image_id] = nil
+    state.image_ids_in_use[bs.preview_item.image_id] = nil
+  end
   bs.preview_image = nil
+  bs.preview_item = nil
+  bs.preview_render_key = nil
   bs.preview_source_image_id = nil
   bs.preview_source_page_stamp = nil
   bs.preview_source_range = nil
 end
 
-local function cursor_in_range(range, row, col, opts)
+local function cleanup_preview_item_request(bufnr, item, opts)
+  if item == nil then
+    return
+  end
+
+  opts = opts or {}
+  if item.image_id ~= nil then
+    local extmark = require("typst-concealer.extmark")
+    extmark.clear_image(item.image_id)
+    state.image_id_to_extmark[item.image_id] = nil
+    state.item_by_image_id[item.image_id] = nil
+    state.image_ids_in_use[item.image_id] = nil
+  end
+
+  if opts.keep_extmark ~= true and item.extmark_id ~= nil then
+    state.prepare_extmark_reuse(bufnr, item.extmark_id)
+    pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id, item.extmark_id)
+  end
+end
+
+local function get_text_slice(bufnr, start_row, start_col, end_row, end_col)
+  if start_row > end_row or (start_row == end_row and start_col > end_col) then
+    return ""
+  end
+  return table.concat(vim.api.nvim_buf_get_text(bufnr, start_row, start_col, end_row, end_col, {}), "\n")
+end
+
+local function get_math_symbol_span_at_pos(item, row, col)
+  local line = vim.fn.getbufline(item.bufnr, row + 1)[1] or ""
+  if line == "" then
+    return nil
+  end
+
+  local parser = vim.treesitter.get_parser(item.bufnr, "typst")
+  local root = parser:parse()[1]:root()
+  local end_col = math.min(#line, col + 1)
+  local node = root:named_descendant_for_range(row, col, row, end_col)
+  if node == nil then
+    return nil
+  end
+
+  local formula_node = nil
+  local target = node
+  while target ~= nil do
+    local t = target:type()
+    if t == "formula" then
+      formula_node = target
+      break
+    end
+    target = target:parent()
+  end
+  if formula_node == nil then
+    return nil
+  end
+
+  target = node
+  while target ~= nil do
+    local parent = target:parent()
+    if parent == nil then
+      return nil
+    end
+    if parent:id() == formula_node:id() then
+      break
+    end
+    target = parent
+  end
+
+  local sr, sc, er, ec = target:range()
+  if not cursor_in_range(item.range, sr, sc, { include_right_edge = false }) then
+    return nil
+  end
+  if er < sr or (er == sr and ec < sc) then
+    return nil
+  end
+  local text = get_text_slice(item.bufnr, sr, sc, er, ec)
+  if text == nil or text == "" or text:match("^%s+$") then
+    return nil
+  end
+
+  return {
+    start_row = sr,
+    start_col = sc,
+    end_row = er,
+    end_col = ec,
+    text = text,
+  }
+end
+
+local function get_math_symbol_span_at_cursor(item, row, col, mode)
+  if item == nil or item.node_type ~= "math" or type(item.str) ~= "string" then
+    return nil
+  end
+
+  local line = vim.fn.getbufline(item.bufnr, row + 1)[1] or ""
+  if line == "" then
+    return nil
+  end
+
+  local candidates = {}
+  if col >= 0 and col < #line then
+    candidates[#candidates + 1] = col
+  end
+
+  if is_insert_like_mode(mode) and col > 0 then
+    local left_col = col - 1
+    if left_col >= 0 and left_col < #line then
+      candidates[#candidates + 1] = left_col
+    end
+  end
+
+  for _, candidate_col in ipairs(candidates) do
+    local span = get_math_symbol_span_at_pos(item, row, candidate_col)
+    if span ~= nil then
+      return span
+    end
+  end
+
+  return nil
+end
+
+local function make_highlighted_preview_math(item, cursor_row, cursor_col, mode)
+  if item == nil or item.node_type ~= "math" or type(item.str) ~= "string" then
+    return nil, nil, nil
+  end
+
+  local source_text = range_to_string(item.range, item.bufnr)
+  if source_text == nil then
+    return nil, nil, nil
+  end
+
+  local span = get_math_symbol_span_at_cursor(item, cursor_row, cursor_col, mode)
+  if span == nil then
+    local key = table.concat(item.range, ":")
+      .. ":plain:"
+      .. tostring(cursor_row)
+      .. ":"
+      .. tostring(cursor_col)
+      .. ":"
+      .. source_text
+    return source_text, key, source_text
+  end
+
+  if not cursor_in_range(item.range, span.start_row, span.start_col, { include_right_edge = false }) then
+    local key = table.concat(item.range, ":")
+      .. ":plain:"
+      .. tostring(cursor_row)
+      .. ":"
+      .. tostring(cursor_col)
+      .. ":"
+      .. source_text
+    return source_text, key, source_text
+  end
+
+  local prefix = get_text_slice(item.bufnr, item.range[1], item.range[2], span.start_row, span.start_col)
+  local suffix = get_text_slice(item.bufnr, span.end_row, span.end_col, item.range[3], item.range[4])
+  local replacement = "#text(red)[$" .. span.text .. "$]"
+  local rendered = prefix .. replacement .. suffix
+  local key = table.concat(item.range, ":")
+    .. ":"
+    .. tostring(span.start_row)
+    .. ":"
+    .. tostring(span.start_col)
+    .. ":"
+    .. tostring(span.end_row)
+    .. ":"
+    .. tostring(span.end_col)
+    .. ":"
+    .. source_text
+  return rendered, key, source_text
+end
+
+cursor_in_range = function(range, row, col, opts)
   opts = opts or {}
   local sr, sc, er, ec = range[1], range[2], range[3], range[4]
   local include_right_edge = opts.include_right_edge == true
@@ -443,6 +638,7 @@ end
 function M.hard_reset_buf(bufnr)
   local extmark = require("typst-concealer.extmark")
   state.clear_hover_timer(bufnr)
+  state.clear_preview_timer(bufnr)
   local bstate = state.buffer_render_state[bufnr]
   if bstate and bstate.full_items then
     for _, item in ipairs(bstate.full_items) do
@@ -1130,12 +1326,20 @@ local function present_preview_item(bufnr, item, cursor_row, cursor_col)
   local extmark = require("typst-concealer.extmark")
   local vertical = choose_preview_vertical(bufnr, item.range, item.natural_cols, item.natural_rows)
   local anchor_row = vertical == "above" and item.range[1] or item.range[3]
+  local prev_visible_image_id = bs.preview_image and bs.preview_image.image_id or nil
   local extmark_id = bs.preview_image and bs.preview_image.extmark_id or nil
   extmark_id =
     extmark.show_virtual_image(bufnr, extmark_id, anchor_row, item.image_id, item.natural_cols, item.natural_rows, {
       above = vertical == "above",
       left_pad_cols = preview_left_pad_cols(bufnr, item.range),
     })
+
+  if prev_visible_image_id ~= nil and prev_visible_image_id ~= item.image_id then
+    extmark.clear_image(prev_visible_image_id)
+    state.image_id_to_extmark[prev_visible_image_id] = nil
+    state.item_by_image_id[prev_visible_image_id] = nil
+    state.image_ids_in_use[prev_visible_image_id] = nil
+  end
 
   bs.preview_image = {
     extmark_id = extmark_id,
@@ -1148,10 +1352,98 @@ local function present_preview_item(bufnr, item, cursor_row, cursor_col)
   bs.preview_source_range = vim.deepcopy(item.range)
 end
 
+function M.present_rendered_preview_item(bufnr, item)
+  if item == nil then
+    cleanup_preview_image(bufnr)
+    return
+  end
+
+  local bs = state.get_buf_state(bufnr)
+  if not item_has_stable_render(item) then
+    return
+  end
+
+  local extmark = require("typst-concealer.extmark")
+  local vertical = choose_preview_vertical(bufnr, item.range, item.natural_cols, item.natural_rows)
+  local anchor_row = vertical == "above" and item.range[1] or item.range[3]
+  local prev_visible_image_id = bs.preview_image and bs.preview_image.image_id or nil
+  local extmark_id = bs.preview_image and bs.preview_image.extmark_id or item.extmark_id
+  extmark_id =
+    extmark.show_virtual_image(bufnr, extmark_id, anchor_row, item.image_id, item.natural_cols, item.natural_rows, {
+      above = vertical == "above",
+      left_pad_cols = preview_left_pad_cols(bufnr, item.range),
+    })
+
+  item.extmark_id = extmark_id
+  state.image_id_to_extmark[item.image_id] = extmark_id
+  if prev_visible_image_id ~= nil and prev_visible_image_id ~= item.image_id then
+    extmark.clear_image(prev_visible_image_id)
+    state.image_id_to_extmark[prev_visible_image_id] = nil
+    state.item_by_image_id[prev_visible_image_id] = nil
+    state.image_ids_in_use[prev_visible_image_id] = nil
+  end
+  bs.preview_image = {
+    extmark_id = extmark_id,
+    target_bufnr = bufnr,
+    natural_cols = item.natural_cols,
+    natural_rows = item.natural_rows,
+    image_id = item.image_id,
+  }
+  bs.preview_item = item
+  bs.preview_source_image_id = item.source_image_id or item.image_id
+  bs.preview_source_page_stamp = item.page_stamp
+  bs.preview_source_range = vim.deepcopy(item.range)
+end
+
 --- Stop the live preview session and remove its extmark/image.
 --- @param bufnr integer
 function M.clear_live_typst_preview(bufnr)
+  require("typst-concealer.session").render_preview_item_via_watch(bufnr, nil, "full")
   cleanup_preview_image(bufnr)
+end
+
+--- Coalesce insert-mode text/cursor churn into a single preview sync pipeline.
+--- @param bufnr integer
+--- @param opts table|nil { refresh_full?: boolean, immediate?: boolean }
+function M.schedule_live_preview_sync(bufnr, opts)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  opts = opts or {}
+  local main = require("typst-concealer")
+  local bs = state.get_buf_state(bufnr)
+  local tick = vim.api.nvim_buf_get_changedtick(bufnr)
+  bs.preview_sync_tick = tick
+  bs.preview_sync_needs_full = bs.preview_sync_needs_full or opts.refresh_full == true
+
+  if bs.preview_sync_timer == nil or bs.preview_sync_timer:is_closing() then
+    bs.preview_sync_timer = vim.uv.new_timer()
+  end
+
+  local delay = opts.immediate == true and 0 or (main.config.live_preview_debounce or 100)
+  bs.preview_sync_timer:stop()
+  bs.preview_sync_timer:start(
+    delay,
+    0,
+    vim.schedule_wrap(function()
+      local current_bs = state.get_buf_state(bufnr)
+      local scheduled_tick = current_bs.preview_sync_tick
+      local needs_full = current_bs.preview_sync_needs_full
+      current_bs.preview_sync_tick = nil
+      current_bs.preview_sync_needs_full = false
+
+      if not vim.api.nvim_buf_is_valid(bufnr) then
+        return
+      end
+
+      if needs_full or scheduled_tick ~= vim.api.nvim_buf_get_changedtick(bufnr) then
+        M.render_buf(bufnr)
+      end
+      M.render_live_typst_preview(bufnr)
+      M.hide_extmarks_at_cursor(bufnr)
+    end)
+  )
 end
 
 --- Render a live preview image in virtual lines around the math node under the cursor.
@@ -1176,6 +1468,7 @@ function M.render_live_typst_preview(bufnr)
   local cursor = vim.api.nvim_win_get_cursor(winid)
   local cursor_row = cursor[1] - 1
   local cursor_col = cursor[2]
+  local mode = vim.api.nvim_get_mode().mode or ""
 
   -- Live preview must target the same maximal math units as full rendering.
   -- Reusing the full-item index avoids previewing nested descendants that are
@@ -1183,7 +1476,46 @@ function M.render_live_typst_preview(bufnr)
   -- under the cursor while anchoring the float to the wrong range.
   local item = find_full_item_at_cursor(bufnr, cursor_row, cursor_col)
   if item ~= nil then
-    present_preview_item(bufnr, item, cursor_row, cursor_col)
+    local preview_str, render_key, source_str = make_highlighted_preview_math(item, cursor_row, cursor_col, mode)
+    local bs = state.get_buf_state(bufnr)
+    if bs.preview_item ~= nil and bs.preview_render_key == render_key and item_has_stable_render(bs.preview_item) then
+      M.present_rendered_preview_item(bufnr, bs.preview_item)
+      return
+    end
+    if bs.preview_render_key == render_key then
+      return
+    end
+
+    local shared_extmark_id = bs.preview_image and bs.preview_image.extmark_id or nil
+    if
+      bs.preview_item ~= nil and (bs.preview_image == nil or bs.preview_item.image_id ~= bs.preview_image.image_id)
+    then
+      cleanup_preview_item_request(bufnr, bs.preview_item, { keep_extmark = shared_extmark_id ~= nil })
+    end
+
+    local extmark_id = shared_extmark_id
+    if extmark_id == nil then
+      extmark_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, item.range[3], 0, { invalidate = true })
+    end
+    local preview_item = {
+      bufnr = bufnr,
+      image_id = new_image_id(bufnr),
+      extmark_id = extmark_id,
+      range = vim.deepcopy(item.range),
+      str = preview_str,
+      source_str = source_str,
+      prelude_count = item.prelude_count,
+      node_type = "math",
+      semantics = item.semantics,
+      render_target = "preview_float",
+      source_image_id = item.image_id,
+    }
+    state.image_id_to_extmark[preview_item.image_id] = extmark_id
+    state.item_by_image_id[preview_item.image_id] = preview_item
+    bs.preview_item = preview_item
+    bs.preview_render_key = render_key
+
+    require("typst-concealer.session").render_preview_item_via_watch(bufnr, preview_item, "full")
     return
   end
 

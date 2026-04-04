@@ -514,6 +514,49 @@ local function get_watch_session(bufnr, kind)
   return bucket and bucket[kind] or nil
 end
 
+local function compose_session_items(session)
+  local items = {}
+  for _, item in ipairs(session.base_items or {}) do
+    items[#items + 1] = item
+  end
+  if session.preview_item ~= nil then
+    items[#items + 1] = session.preview_item
+  end
+  return items
+end
+
+local function write_session_document(session)
+  local items = compose_session_items(session)
+  if #items == 0 then
+    M.stop_watch_session(session.bufnr, session.kind)
+    return
+  end
+
+  session.items = items
+  session.page_state = {}
+  session.line_map = nil
+  session.last_page_count = #items
+  clear_session_output_pages(session.output_prefix)
+
+  if require("typst-concealer").config.do_diagnostics then
+    session.stderr_chunks = {}
+    session.stderr_text = ""
+    session.stderr_line_buffer = ""
+    clear_quickfix(session.bufnr, session.kind)
+  end
+
+  local wrapper = require("typst-concealer.wrapper")
+  local doc_str, line_map =
+    wrapper.build_batch_document(items, session.buf_dir, session.source_root, session.effective_root, session.kind)
+  session.line_map = line_map
+  local ok, err = write_file_in_place(session.input_path, doc_str)
+  if not ok then
+    vim.schedule(function()
+      vim.notify("[typst-concealer] failed to update watch input: " .. tostring(err), vim.log.levels.ERROR)
+    end)
+  end
+end
+
 --- @param bufnr integer
 --- @param range table
 --- @return string|nil
@@ -641,7 +684,8 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
   if not ok_mark or mark == nil or #mark == 0 then
     return
   end
-  if item.str ~= nil and range_to_string(item.bufnr, item.range) ~= item.str then
+  local expected_str = item.source_str or item.str
+  if expected_str ~= nil and range_to_string(item.bufnr, item.range) ~= expected_str then
     return
   end
 
@@ -698,6 +742,10 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
   end
 
   extmark.create_image(page_path, image_id, natural_cols, natural_rows)
+  if item ~= nil and item.render_target == "preview_float" then
+    require("typst-concealer.render").present_rendered_preview_item(target_bufnr, item)
+    return
+  end
   extmark.conceal_for_image_id(target_bufnr, image_id, natural_cols, natural_rows, source_rows)
   -- A fresh page render repaints extmarks asynchronously after the last cursor
   -- hover decision may already have been cached. Force hover recomputation so a
@@ -861,6 +909,8 @@ function M.ensure_watch_session(bufnr, kind)
     output_template = template,
     poll_timer = nil,
     items = {},
+    base_items = {},
+    preview_item = nil,
     page_state = {},
     last_page_count = 0,
     line_map = nil,
@@ -966,39 +1016,32 @@ end
 --- @param items table[]
 --- @param kind  'full'
 function M.render_items_via_watch(bufnr, items, kind)
-  if #items == 0 then
-    M.stop_watch_session(bufnr, kind)
-    return
-  end
-
   local session = M.ensure_watch_session(bufnr, kind)
   if session == nil then
     return
   end
-  session.items = items
-  session.page_state = {}
-  session.line_map = nil
-  session.last_page_count = #items
-  clear_session_output_pages(session.output_prefix)
+  session.base_items = items or {}
+  write_session_document(session)
+end
 
-  if require("typst-concealer").config.do_diagnostics then
-    session.stderr_chunks = {}
-    session.stderr_text = ""
-    session.stderr_line_buffer = ""
-    clear_quickfix(bufnr, kind)
+--- Update the transient preview overlay that shares the main watch session.
+--- @param bufnr integer
+--- @param item table|nil
+--- @param kind 'full'
+function M.render_preview_item_via_watch(bufnr, item, kind)
+  local session = get_watch_session(bufnr, kind)
+  if session == nil then
+    if item == nil then
+      return
+    end
+    session = M.ensure_watch_session(bufnr, kind)
+    if session == nil then
+      return
+    end
   end
 
-  local wrapper = require("typst-concealer.wrapper")
-  local doc_str, line_map =
-    wrapper.build_batch_document(items, session.buf_dir, session.source_root, session.effective_root, session.kind)
-  session.line_map = line_map
-  local ok, err = write_file_in_place(session.input_path, doc_str)
-  if not ok then
-    vim.schedule(function()
-      vim.notify("[typst-concealer] failed to update watch input: " .. tostring(err), vim.log.levels.ERROR)
-    end)
-    return
-  end
+  session.preview_item = item
+  write_session_document(session)
 end
 
 return M

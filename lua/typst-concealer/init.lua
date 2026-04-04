@@ -387,9 +387,7 @@ function M.setup(cfg)
     pattern = "*.typ",
     desc = "keep float preview synced while moving in insert mode",
     callback = function(ev)
-      local render = require("typst-concealer.render")
-      render.render_live_typst_preview(ev.buf)
-      render.hide_extmarks_at_cursor(ev.buf)
+      require("typst-concealer.render").schedule_live_preview_sync(ev.buf, { immediate = true })
     end,
   })
 
@@ -409,11 +407,7 @@ function M.setup(cfg)
     group = augroup,
     desc = "render live preview float when insert-mode text changes",
     callback = function(ev)
-      vim.schedule(function()
-        local render = require("typst-concealer.render")
-        render.render_buf(ev.buf)
-        render.render_live_typst_preview(ev.buf)
-      end)
+      require("typst-concealer.render").schedule_live_preview_sync(ev.buf, { refresh_full = true })
     end,
   })
 
@@ -464,6 +458,7 @@ function M.setup(cfg)
     callback = function(ev)
       local session = require("typst-concealer.session")
       session.stop_watch_sessions_for_buf(ev.buf)
+      require("typst-concealer.state").clear_preview_timer(ev.buf)
       require("typst-concealer.render").hard_reset_buf(ev.buf)
     end,
   })

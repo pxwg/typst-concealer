@@ -54,6 +54,11 @@ function M.get_buf_state(bufnr)
   if not M.buffers[bufnr] then
     M.buffers[bufnr] = {
       preview_image = nil,
+      preview_item = nil,
+      preview_render_key = nil,
+      preview_sync_timer = nil,
+      preview_sync_tick = nil,
+      preview_sync_needs_full = false,
       preview_source_image_id = nil,
       preview_source_page_stamp = nil,
       preview_source_range = nil,
@@ -128,6 +133,26 @@ function M.clear_hover_timer(bufnr)
     timer:close()
   end
   bs.hover.throttle_timer = nil
+end
+
+--- Stop and release the per-buffer preview sync timer if it exists.
+--- @param bufnr integer
+function M.clear_preview_timer(bufnr)
+  local bs = M.buffers[bufnr]
+  if bs == nil then
+    return
+  end
+  local timer = bs.preview_sync_timer
+  if timer == nil then
+    return
+  end
+  if not timer:is_closing() then
+    timer:stop()
+    timer:close()
+  end
+  bs.preview_sync_timer = nil
+  bs.preview_sync_tick = nil
+  bs.preview_sync_needs_full = false
 end
 
 --- Release sub-extmarks (ns_id2) attached to extmark_id before reuse or deletion.
