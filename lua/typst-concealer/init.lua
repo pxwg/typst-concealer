@@ -387,7 +387,9 @@ function M.setup(cfg)
     pattern = "*.typ",
     desc = "keep float preview synced while moving in insert mode",
     callback = function(ev)
-      require("typst-concealer.render").render_live_typst_preview(ev.buf)
+      local render = require("typst-concealer.render")
+      render.render_live_typst_preview(ev.buf)
+      render.hide_extmarks_at_cursor(ev.buf)
     end,
   })
 
@@ -396,7 +398,9 @@ function M.setup(cfg)
     pattern = "*.typ",
     desc = "sync float preview when entering a typst buffer",
     callback = function(ev)
-      require("typst-concealer.render").render_live_typst_preview(ev.buf)
+      local render = require("typst-concealer.render")
+      render.render_live_typst_preview(ev.buf)
+      render.hide_extmarks_at_cursor(ev.buf)
     end,
   })
 

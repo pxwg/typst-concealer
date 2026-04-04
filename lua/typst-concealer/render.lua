@@ -158,6 +158,70 @@ local function clear_diagnostics(bufnr)
   end)
 end
 
+local function row_overlap_len(a, b)
+  local top = math.max(a[1], b[1])
+  local bottom = math.min(a[3], b[3])
+  if bottom < top then
+    return 0
+  end
+  return bottom - top + 1
+end
+
+local function row_gap_len(a, b)
+  if a[3] < b[1] then
+    return b[1] - a[3]
+  end
+  if b[3] < a[1] then
+    return a[1] - b[3]
+  end
+  return 0
+end
+
+local function col_delta_len(a, b)
+  return math.abs(a[2] - b[2]) + math.abs(a[4] - b[4])
+end
+
+--- Match a fresh render entry to the most plausible previous item.
+--- Reusing by raw list index is unsafe while the parser is in an error state:
+--- a disappearing leading math block can shift later code/math items left and
+--- make them inherit the wrong extmark/image, which shows up as duplicated
+--- images at the wrong location while editing.
+--- @param prev_items table[]
+--- @param entry table
+--- @param used_prev table<integer, boolean>
+--- @return table|nil
+local function find_matching_prev_item(prev_items, entry, used_prev)
+  local best_idx = nil
+  local best_item = nil
+  local best_overlap = -1
+  local best_gap = math.huge
+  local best_col_delta = math.huge
+
+  for idx, prev_item in ipairs(prev_items) do
+    if not used_prev[idx] and prev_item.node_type == entry.node_type then
+      local overlap = row_overlap_len(prev_item.range, entry.range)
+      local gap = row_gap_len(prev_item.range, entry.range)
+      local col_delta = col_delta_len(prev_item.range, entry.range)
+      if
+        overlap > best_overlap
+        or (overlap == best_overlap and gap < best_gap)
+        or (overlap == best_overlap and gap == best_gap and col_delta < best_col_delta)
+      then
+        best_idx = idx
+        best_item = prev_item
+        best_overlap = overlap
+        best_gap = gap
+        best_col_delta = col_delta
+      end
+    end
+  end
+
+  if best_idx ~= nil then
+    used_prev[best_idx] = true
+  end
+  return best_item
+end
+
 --- Release all resources for a single render item.
 --- @param bufnr   integer
 --- @param item    table|nil
@@ -352,6 +416,7 @@ function M.render_buf(bufnr)
 
   local prev_items = (state.buffer_render_state[bufnr] and state.buffer_render_state[bufnr].full_items) or {}
   local batch_items = {}
+  local used_prev = {}
 
   for idx, entry in ipairs(sorted_entries) do
     local range, prelude_count, node_type = entry.range, entry.prelude_count, entry.node_type
@@ -359,7 +424,7 @@ function M.render_buf(bufnr)
     local sem = semantics_mod.classify(range, bufnr, node_type)
     local str = range_to_string(range, bufnr)
 
-    local prev_item = prev_items[idx]
+    local prev_item = find_matching_prev_item(prev_items, entry, used_prev)
     local image_id, ext_id
 
     if prev_item ~= nil then
@@ -398,8 +463,10 @@ function M.render_buf(bufnr)
   end
 
   -- Release extmarks/images for items that no longer exist
-  for i = #batch_items + 1, #prev_items do
-    cleanup_item(bufnr, prev_items[i])
+  for idx, prev_item in ipairs(prev_items) do
+    if not used_prev[idx] then
+      cleanup_item(bufnr, prev_item)
+    end
   end
 
   state.buffer_render_state[bufnr] = state.buffer_render_state[bufnr] or {}
@@ -503,7 +570,9 @@ local function restore_one_extmark(bufnr, extmark_id)
   )
 end
 
-local function cursor_in_range(range, row, col)
+local cursor_in_range
+
+cursor_in_range = function(range, row, col)
   local sr, sc, er, ec = range[1], range[2], range[3], range[4]
 
   if row < sr or row > er then
@@ -959,59 +1028,28 @@ function M.sync_live_preview_float(bufnr, width, height)
   end
 end
 
---- Find the outermost math/code block under the cursor in bufnr.
---- @param bufnr integer
---- @return string|nil node_type, integer|nil start_row, integer start_col, integer end_row, integer end_col
-local function get_typst_block_at_cursor(bufnr)
-  local winid = vim.fn.bufwinid(bufnr)
-  if winid == -1 then
-    return nil
-  end
-  local parser = vim.treesitter.get_parser(bufnr, "typst")
-  local tree = parser:parse()[1]:root()
-  local cursor = vim.api.nvim_win_get_cursor(winid)
-  local crow, ccol = cursor[1] - 1, cursor[2]
-  local element = tree:named_descendant_for_range(crow, ccol, crow, ccol)
-  local outermost = nil
-  while true do
-    if element == nil then
-      break
-    end
-    local t = element:type()
-    if t == "math" or t == "code" then
-      outermost = element
-    elseif t == "ERROR" then
-      return nil
-    end
-    element = element:parent()
-  end
-  if outermost ~= nil then
-    local node_type = outermost:type()
-    return node_type, outermost:range()
-  end
-  return nil
-end
-
-local function same_range(a, b)
-  if a == nil or b == nil then
-    return false
-  end
-  return a[1] == b[1] and a[2] == b[2] and a[3] == b[3] and a[4] == b[4]
-end
-
-local function find_full_item_for_range(bufnr, range)
+local function find_full_item_at_cursor(bufnr, row, col)
   local bstate = state.buffer_render_state[bufnr]
   if bstate == nil or bstate.full_items == nil then
     return nil
   end
 
+  local best_item = nil
   for _, item in ipairs(bstate.full_items) do
-    if item.node_type == "math" and same_range(item.range, range) then
-      return item
+    if item.node_type == "math" and cursor_in_range(item.range, row, col) then
+      if best_item == nil then
+        best_item = item
+      else
+        local best_span = (best_item.range[3] - best_item.range[1]) * 100000 + (best_item.range[4] - best_item.range[2])
+        local item_span = (item.range[3] - item.range[1]) * 100000 + (item.range[4] - item.range[2])
+        if item_span < best_span then
+          best_item = item
+        end
+      end
     end
   end
 
-  return nil
+  return best_item
 end
 
 local function present_preview_item(bufnr, item)
@@ -1049,36 +1087,6 @@ local function present_preview_item(bufnr, item)
   bs.preview_source_page_stamp = item.page_stamp
 end
 
-local function present_cached_preview(bufnr, range)
-  local bs = state.get_buf_state(bufnr)
-  local preview = bs.preview_image
-  if preview == nil or bs.preview_source_image_id == nil then
-    return false
-  end
-  if preview.natural_cols == nil or preview.natural_rows == nil then
-    return false
-  end
-
-  local extmark = require("typst-concealer.extmark")
-  local vertical = choose_preview_vertical(bufnr, range, preview.natural_cols, preview.natural_rows)
-  local anchor_row = vertical == "above" and range[1] or range[3]
-  local extmark_id = extmark.show_virtual_image(
-    bufnr,
-    preview.extmark_id,
-    anchor_row,
-    bs.preview_source_image_id,
-    preview.natural_cols,
-    preview.natural_rows,
-    {
-      above = vertical == "above",
-      left_pad_cols = preview_left_pad_cols(bufnr, range),
-    }
-  )
-  preview.extmark_id = extmark_id
-  preview.target_bufnr = bufnr
-  return true
-end
-
 --- Stop the live preview session and remove its extmark/image.
 --- @param bufnr integer
 function M.clear_live_typst_preview(bufnr)
@@ -1097,20 +1105,24 @@ function M.render_live_typst_preview(bufnr)
     M.clear_live_typst_preview(bufnr)
     return
   end
-  local node_type, start_row, start_col, end_row, end_col = get_typst_block_at_cursor(bufnr)
-  if start_row == nil or node_type ~= "math" then
+
+  local winid = vim.fn.bufwinid(bufnr)
+  if winid == -1 then
     M.clear_live_typst_preview(bufnr)
     return
   end
 
-  local range = { start_row, start_col, end_row, end_col }
-  local item = find_full_item_for_range(bufnr, range)
+  local cursor = vim.api.nvim_win_get_cursor(winid)
+  local cursor_row = cursor[1] - 1
+  local cursor_col = cursor[2]
+
+  -- Live preview must target the same maximal math units as full rendering.
+  -- Reusing the full-item index avoids previewing nested descendants that are
+  -- not independently rendered, which could otherwise duplicate the formula
+  -- under the cursor while anchoring the float to the wrong range.
+  local item = find_full_item_at_cursor(bufnr, cursor_row, cursor_col)
   if item ~= nil then
     present_preview_item(bufnr, item)
-    return
-  end
-
-  if present_cached_preview(bufnr, range) then
     return
   end
 

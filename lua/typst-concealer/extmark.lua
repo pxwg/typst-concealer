@@ -487,6 +487,10 @@ end
 --- @param source_rows  integer
 function M.conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, source_rows)
   local extmark_id = state.image_id_to_extmark[image_id]
+  local bs = state.get_buf_state(bufnr)
+  if extmark_id ~= nil and bs.currently_hidden_extmark_ids[extmark_id] then
+    return
+  end
   local item = state.get_item_by_image_id(image_id)
   conceal_extmark_with_image(bufnr, extmark_id, image_id, natural_cols, natural_rows, source_rows, item)
 end

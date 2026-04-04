@@ -699,6 +699,11 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
 
   extmark.create_image(page_path, image_id, natural_cols, natural_rows)
   extmark.conceal_for_image_id(target_bufnr, image_id, natural_cols, natural_rows, source_rows)
+  -- A fresh page render repaints extmarks asynchronously after the last cursor
+  -- hover decision may already have been cached. Force hover recomputation so a
+  -- block currently under the cursor is hidden again instead of briefly
+  -- coexisting with the live preview / source text.
+  require("typst-concealer.state").get_buf_state(bufnr).hover.invalidated = true
   require("typst-concealer.render").hide_extmarks_at_cursor(bufnr)
   require("typst-concealer.render").render_live_typst_preview(bufnr)
 end
