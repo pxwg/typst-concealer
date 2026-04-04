@@ -1398,7 +1398,7 @@ end
 --- Stop the live preview session and remove its extmark/image.
 --- @param bufnr integer
 function M.clear_live_typst_preview(bufnr)
-  require("typst-concealer.session").render_preview_item_via_watch(bufnr, nil, "full")
+  require("typst-concealer.session").render_preview_item_via_watch(bufnr, nil, "preview")
   cleanup_preview_image(bufnr)
 end
 
@@ -1515,7 +1515,7 @@ function M.render_live_typst_preview(bufnr)
     bs.preview_item = preview_item
     bs.preview_render_key = render_key
 
-    require("typst-concealer.session").render_preview_item_via_watch(bufnr, preview_item, "full")
+    require("typst-concealer.session").render_preview_item_via_watch(bufnr, preview_item, "preview")
     return
   end
 

@@ -525,6 +525,39 @@ local function compose_session_items(session)
   return items
 end
 
+local function session_render_start_index(session)
+  local total = #(session.items or {})
+  if total == 0 then
+    return 1
+  end
+  local start_idx = tonumber(session.render_start_index) or 1
+  return math.max(1, math.min(start_idx, total))
+end
+
+--- Snapshot full-render items into a context-only batch for preview rendering.
+--- This preserves the exact Typst document assembly order and prelude counts
+--- without reusing full-render runtime objects such as extmark/image state.
+--- @param bufnr integer
+--- @return table[]
+local function snapshot_full_context_items(bufnr)
+  local bstate = state.buffer_render_state[bufnr]
+  local full_items = (bstate and bstate.full_items) or {}
+  local items = {}
+
+  for _, item in ipairs(full_items) do
+    items[#items + 1] = {
+      bufnr = item.bufnr,
+      range = vim.deepcopy(item.range),
+      str = item.str,
+      prelude_count = item.prelude_count,
+      node_type = item.node_type,
+      semantics = item.semantics,
+    }
+  end
+
+  return items
+end
+
 local function write_session_document(session)
   local items = compose_session_items(session)
   if #items == 0 then
@@ -647,6 +680,7 @@ end
 --- @param bufnr integer
 function M.stop_watch_sessions_for_buf(bufnr)
   M.stop_watch_session(bufnr, "full")
+  M.stop_watch_session(bufnr, "preview")
 end
 
 --- Called when a rendered page file is stable and ready to display.
@@ -781,7 +815,6 @@ local function try_render_session_page(session, i, item)
   if page_state.rendered == stamp then
     return
   end
-  page_state.rendered = stamp
   session.page_state[i] = page_state
 
   vim.schedule(function()
@@ -789,7 +822,14 @@ local function try_render_session_page(session, i, item)
     if current ~= session then
       return
     end
+    local before_item = state.get_item_by_image_id(item.image_id)
+    local before_stamp = before_item and before_item.page_stamp or nil
     on_page_rendered(session.bufnr, page_path, item.image_id, item.extmark_id, item.range, stamp)
+    local after_item = state.get_item_by_image_id(item.image_id)
+    if after_item ~= nil and after_item.page_stamp == stamp and before_stamp ~= stamp then
+      page_state.rendered = stamp
+      session.page_state[i] = page_state
+    end
   end)
 end
 
@@ -806,7 +846,9 @@ local function ensure_session_poller(session)
       if session.dead then
         return
       end
-      for i, item in ipairs(session.items or {}) do
+      local start_idx = session_render_start_index(session)
+      for i = start_idx, #(session.items or {}) do
+        local item = session.items[i]
         try_render_session_page(session, i, item)
       end
     end)
@@ -912,6 +954,7 @@ function M.ensure_watch_session(bufnr, kind)
     base_items = {},
     preview_item = nil,
     page_state = {},
+    render_start_index = 1,
     last_page_count = 0,
     line_map = nil,
     stderr_chunks = {},
@@ -1021,14 +1064,20 @@ function M.render_items_via_watch(bufnr, items, kind)
     return
   end
   session.base_items = items or {}
+  session.render_start_index = 1
   write_session_document(session)
 end
 
---- Update the transient preview overlay that shares the main watch session.
+--- Update the transient preview overlay.
 --- @param bufnr integer
 --- @param item table|nil
---- @param kind 'full'
+--- @param kind 'full'|'preview'
 function M.render_preview_item_via_watch(bufnr, item, kind)
+  if kind == "preview" and item == nil then
+    M.stop_watch_session(bufnr, kind)
+    return
+  end
+
   local session = get_watch_session(bufnr, kind)
   if session == nil then
     if item == nil then
@@ -1040,6 +1089,10 @@ function M.render_preview_item_via_watch(bufnr, item, kind)
     end
   end
 
+  if kind == "preview" then
+    session.base_items = snapshot_full_context_items(bufnr)
+    session.render_start_index = #session.base_items + 1
+  end
   session.preview_item = item
   write_session_document(session)
 end
