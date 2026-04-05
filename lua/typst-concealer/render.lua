@@ -1282,7 +1282,7 @@ function M.sync_live_preview_float(bufnr, width, height)
   end
 end
 
-local function find_full_item_at_cursor(bufnr, row, col)
+local function find_full_item_at_cursor(bufnr, row, col, mode)
   local bstate = state.buffer_render_state[bufnr]
   if bstate == nil or bstate.full_items == nil then
     return nil
@@ -1291,7 +1291,7 @@ local function find_full_item_at_cursor(bufnr, row, col)
   local candidates = bstate.line_to_items and bstate.line_to_items[row] or bstate.full_items
   local best_item = nil
   for _, item in ipairs(candidates) do
-    if item.node_type == "math" and cursor_engages_inline_item(item.range, row, col) then
+    if item.node_type == "math" and cursor_engages_inline_item(item.range, row, col, mode) then
       if best_item == nil then
         best_item = item
       else
@@ -1476,7 +1476,7 @@ function M.render_live_typst_preview(bufnr)
   -- Reusing the full-item index avoids previewing nested descendants that are
   -- not independently rendered, which could otherwise duplicate the formula
   -- under the cursor while anchoring the float to the wrong range.
-  local item = find_full_item_at_cursor(bufnr, cursor_row, cursor_col)
+  local item = find_full_item_at_cursor(bufnr, cursor_row, cursor_col, mode)
   if item ~= nil then
     local preview_str, render_key, source_str = make_highlighted_preview_math(item, cursor_row, cursor_col, mode)
     if type(preview_str) ~= "string" or type(render_key) ~= "string" or type(source_str) ~= "string" then
