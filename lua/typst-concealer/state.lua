@@ -25,7 +25,15 @@ M.image_ids_in_use = {}
 --- @field output_template string
 --- @field poll_timer uv_timer_t|nil
 --- @field items table[]
+--- @field base_items table[]
+--- @field preview_tail_item table|nil
+--- @field preview_sidecar_item table|nil
+--- @field preview_sidecar_path string
+--- @field preview_sidecar_root_relative_path string
+--- @field preview_active boolean
+--- @field prelude_chunks string[]
 --- @field page_state table
+--- @field render_start_index integer
 --- @field last_page_count integer
 --- @field stderr_chunks string[]
 --- @field dead boolean|nil

@@ -766,7 +766,7 @@ function M.render_buf(bufnr)
   state.buffer_render_state[bufnr].extmark_to_item = extmark_to_item
 
   vim.schedule(function()
-    session.render_items_via_watch(bufnr, batch_items, "full")
+    session.render_items_via_watch(bufnr, batch_items)
   end)
   -- Reset hover guard so hide_extmarks_at_cursor re-evaluates after render
   state.get_buf_state(bufnr).hover.last_cursor_row = nil
@@ -1397,10 +1397,10 @@ function M.present_rendered_preview_item(bufnr, item)
   bs.preview_source_range = vim.deepcopy(item.range)
 end
 
---- Stop the live preview session and remove its extmark/image.
+--- Stop the live preview tail page and remove its extmark/image.
 --- @param bufnr integer
 function M.clear_live_typst_preview(bufnr)
-  require("typst-concealer.session").render_preview_item_via_watch(bufnr, nil, "preview")
+  require("typst-concealer.session").clear_preview_tail(bufnr)
   cleanup_preview_image(bufnr)
 end
 
@@ -1524,7 +1524,7 @@ function M.render_live_typst_preview(bufnr)
     bs.preview_item = preview_item
     bs.preview_render_key = render_key
 
-    require("typst-concealer.session").render_preview_item_via_watch(bufnr, preview_item, "preview")
+    require("typst-concealer.session").render_preview_tail(bufnr, preview_item)
     return
   end
 

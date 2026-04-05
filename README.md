@@ -112,10 +112,7 @@ Two other project hooks are available:
 
 ```lua
 require("typst-concealer").setup({
-  get_inputs = function(_bufnr, _path, _cwd, kind)
-    if kind == "preview" then
-      return { "concealed=true", "preview=true" }
-    end
+  get_inputs = function(_bufnr, _path, _cwd, _kind)
     return { "concealed=true" }
   end,
   get_preamble_file = function(_bufnr, path, _cwd, _kind)

@@ -4,6 +4,7 @@
 ---
 --- TypstBackend interface (current: Typst only)
 ---   M.build_batch_document(items) -> string    assembled multi-page Typst source
+---   M.build_item_fragment(item, ...)           assembled single-item fragment for inclusion
 ---   M.build_wrapper(item, source_rows)         per-item wrapper dispatch
 ---   M.make_inline_sizing_wrap(source_rows)     intrinsic-constraint wrapper
 ---   M.make_flow_block_wrap(bufnr)              flow-constraint wrapper
@@ -177,6 +178,9 @@ end
 --- @param source_rows integer
 --- @return string prefix, string suffix
 function M.build_wrapper(item, source_rows)
+  if item.skip_wrapper == true then
+    return "", ""
+  end
   if item.semantics.constraint_kind == "flow" then
     return M.make_flow_block_wrap(item.bufnr)
   else
@@ -184,12 +188,57 @@ function M.build_wrapper(item, source_rows)
   end
 end
 
+--- Build a single item fragment suitable for `#include` into an existing Typst document.
+--- Unlike build_batch_document, this omits document-level header/preamble/page setup.
+--- @param item table
+--- @param buf_dir string|nil
+--- @param source_root string|nil
+--- @param effective_root string|nil
+--- @param prelude_chunks string[]|nil
+--- @return string
+function M.build_item_fragment(item, buf_dir, source_root, effective_root, prelude_chunks)
+  prelude_chunks = prelude_chunks or state.runtime_preludes
+
+  local do_rewrite = buf_dir ~= nil and source_root ~= nil and effective_root ~= nil
+  local pr = do_rewrite and require("typst-concealer.path-rewrite") or nil
+  local function maybe_rewrite(text)
+    if pr == nil then
+      return text
+    end
+    return pr.rewrite_paths(text, {
+      bufnr = item.bufnr,
+      buf_dir = buf_dir,
+      source_root = source_root,
+      effective_root = effective_root,
+    })
+  end
+
+  local parts = {}
+  for i = 1, item.prelude_count or 0 do
+    parts[#parts + 1] = maybe_rewrite(prelude_chunks[i] or "")
+  end
+
+  local source_rows = item.range[3] - item.range[1] + 1
+  local wrap_prefix, wrap_suffix = M.build_wrapper(item, source_rows)
+  if wrap_prefix ~= "" then
+    parts[#parts + 1] = wrap_prefix
+  end
+  parts[#parts + 1] = maybe_rewrite(normalize_item_str(item))
+  if wrap_suffix ~= "" then
+    parts[#parts + 1] = wrap_suffix
+  else
+    parts[#parts + 1] = "\n"
+  end
+
+  return table.concat(parts)
+end
+
 --- Build multi-page Typst source for a batch render session.
 --- @param items table[]
 --- @param buf_dir string|nil   source buffer directory (for path rewriting)
 --- @param source_root string|nil  source/project root used for `/...` semantics
 --- @param effective_root string|nil  actual Typst `--root` used by the watch session
---- @param kind "full"|"preview"|nil  session kind forwarded to get_preamble_file
+--- @param kind "full"|nil  session kind forwarded to get_preamble_file
 --- @param prelude_chunks string[]|nil  snapshot of runtime preludes aligned with item.prelude_count
 --- @return string, table
 function M.build_batch_document(items, buf_dir, source_root, effective_root, kind, prelude_chunks)

@@ -101,12 +101,12 @@ end
 --- @field cursor_hover_throttle_ms? number  Throttle delay for CursorMoved hover in ms. Default 0 (disabled).
 --- @field render_paths?          { include?: (string|fun(path: string, bufnr: integer): boolean)[], exclude?: (string|fun(path: string, bufnr: integer): boolean)[] }
 ---                                     Optional path rules. `include` acts as a whitelist when non-empty; `exclude` always wins.
---- @field get_root?              fun(bufnr: integer, path: string, cwd: string, kind: "full"|"preview"): string|nil
+--- @field get_root?              fun(bufnr: integer, path: string, cwd: string, kind: "full"): string|nil
 ---                                     Return the source/project root used to interpret rooted Typst paths like `/fig/a.png`.
 ---                                     Must be an absolute filesystem path. `nil` falls back to detected project root.
---- @field get_inputs?            fun(bufnr: integer, path: string, cwd: string, kind: "full"|"preview"): string[]|nil
+--- @field get_inputs?            fun(bufnr: integer, path: string, cwd: string, kind: "full"): string[]|nil
 ---                                     Return extra `--input` values, e.g. `{"focus=123", "preview=true"}`. `nil`/`{}` appends nothing.
---- @field get_preamble_file?     fun(bufnr: integer, path: string, cwd: string, kind: "full"|"preview"): string|nil
+--- @field get_preamble_file?     fun(bufnr: integer, path: string, cwd: string, kind: "full"): string|nil
 ---                                     Return an absolute path to a `.typ` file that is `#include`d at the top of every
 ---                                     batch document for this buffer. Use this to inject project-level context
 ---                                     (bibliography, imports, show rules) so that snippets compile under the correct

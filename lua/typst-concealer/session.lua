@@ -3,8 +3,10 @@
 --- and calling into the extmark layer when a page is ready.
 ---
 --- TypstBackend interface (current: Typst only)
----   M.render_items_via_watch(bufnr, items, kind)    dispatch items to a watch session
----   M.ensure_watch_session(bufnr, kind)             start/reuse a watch session
+---   M.render_items_via_watch(bufnr, items)          dispatch full items to the watch session
+---   M.render_preview_tail(bufnr, item)              update the preview tail page
+---   M.clear_preview_tail(bufnr)                     disable the preview tail page
+---   M.ensure_watch_session(bufnr)                   start/reuse the full watch session
 ---   M.stop_watch_session(bufnr, kind)               kill and clean up a session
 ---   M.stop_watch_sessions_for_buf(bufnr)            kill the buffer session
 
@@ -353,6 +355,15 @@ local function clear_session_output_pages(prefix)
   end
 end
 
+--- @param prefix string
+--- @param page_idx integer
+local function clear_session_output_page(prefix, page_idx)
+  if type(page_idx) ~= "number" or page_idx < 1 then
+    return
+  end
+  safe_unlink(prefix .. "-" .. page_idx .. ".png")
+end
+
 local function parse_typst_stderr(session, text)
   local items = {}
   local current_msg = nil
@@ -490,23 +501,27 @@ end
 
 --- Generates the fixed input path for a watch session.
 --- @param bufnr integer
---- @param kind  'full' | 'preview'
 --- @param source_root string|nil
 --- @return string
-local function session_input_path(bufnr, kind, source_root)
+local function session_input_path(bufnr, source_root)
   local dir = get_cache_dir(bufnr, source_root)
-  local suffix = kind == "preview" and "-preview" or ""
-  return dir .. "/.typst-concealer-" .. state.full_pid .. "-" .. bufnr .. suffix .. ".typ"
+  return dir .. "/.typst-concealer-" .. state.full_pid .. "-" .. bufnr .. ".typ"
 end
 
 --- Generates the fixed output template/prefix for a watch session.
 --- @param bufnr integer
---- @param kind  'full' | 'preview'
 --- @return string template, string prefix
-local function session_output_template(bufnr, kind)
-  local suffix = kind == "preview" and "-preview" or ""
-  local prefix = "/tmp/tty-graphics-protocol-typst-concealer-" .. state.full_pid .. "-" .. bufnr .. suffix
+local function session_output_template(bufnr)
+  local prefix = "/tmp/tty-graphics-protocol-typst-concealer-" .. state.full_pid .. "-" .. bufnr
   return prefix .. "-{p}.png", prefix
+end
+
+--- @param bufnr integer
+--- @param source_root string|nil
+--- @return string
+local function session_preview_sidecar_path(bufnr, source_root)
+  local dir = get_cache_dir(bufnr, source_root)
+  return dir .. "/.typst-concealer-" .. state.full_pid .. "-" .. bufnr .. "-preview.typ"
 end
 
 local function get_watch_session(bufnr, kind)
@@ -519,8 +534,8 @@ local function compose_session_items(session)
   for _, item in ipairs(session.base_items or {}) do
     items[#items + 1] = item
   end
-  if session.preview_item ~= nil then
-    items[#items + 1] = session.preview_item
+  if session.preview_tail_item ~= nil then
+    items[#items + 1] = session.preview_tail_item
   end
   return items
 end
@@ -531,7 +546,26 @@ local function session_render_start_index(session)
     return 1
   end
   local start_idx = tonumber(session.render_start_index) or 1
-  return math.max(1, math.min(start_idx, total))
+  if start_idx > total then
+    return total + 1
+  end
+  return math.max(1, start_idx)
+end
+
+--- @param session typst_watch_session
+--- @return boolean
+local function full_pages_have_stable_renders(session)
+  local total = #(session.base_items or {})
+  if total == 0 then
+    return false
+  end
+  for i = 1, total do
+    local page_state = session.page_state[i]
+    if page_state == nil or page_state.rendered == nil then
+      return false
+    end
+  end
+  return true
 end
 
 --- @param bufnr integer
@@ -541,18 +575,95 @@ local function snapshot_full_context_preludes(bufnr)
   return vim.deepcopy((bstate and bstate.runtime_preludes) or {})
 end
 
-local function write_session_document(session)
+--- @param session typst_watch_session
+--- @param item table|nil
+--- @return string
+local function build_preview_sidecar_document(session, item)
+  local wrapper = require("typst-concealer.wrapper")
+  local preview_item = item
+  if preview_item == nil then
+    preview_item = {
+      bufnr = session.bufnr,
+      range = { 0, 0, 0, 0 },
+      str = "[]",
+      prelude_count = 0,
+      node_type = "math",
+      semantics = { constraint_kind = "inline" },
+    }
+  else
+    preview_item = vim.tbl_extend("force", preview_item, {
+      prelude_count = preview_item.prelude_count or 0,
+    })
+  end
+
+  local doc_str = wrapper.build_item_fragment(
+    preview_item,
+    session.buf_dir,
+    session.source_root,
+    session.effective_root,
+    session.prelude_chunks
+  )
+  return doc_str
+end
+
+--- @param session typst_watch_session
+--- @param item table|nil
+--- @return boolean, string?
+local function write_preview_sidecar(session, item)
+  return write_file_in_place(session.preview_sidecar_path, build_preview_sidecar_document(session, item))
+end
+
+local function preview_tail_include_text(session)
+  return '#include "' .. session.preview_sidecar_root_relative_path .. '"'
+end
+
+--- @param session typst_watch_session
+--- @param item table|nil
+--- @return table
+local function make_preview_tail_item(session, item)
+  local source = item or {}
+  return {
+    bufnr = session.bufnr,
+    image_id = source.image_id,
+    extmark_id = source.extmark_id,
+    range = source.range and vim.deepcopy(source.range) or { 0, 0, 0, 0 },
+    str = preview_tail_include_text(session),
+    source_str = source.source_str,
+    prelude_count = 0,
+    node_type = source.node_type or "math",
+    semantics = source.semantics or { constraint_kind = "inline" },
+    skip_wrapper = true,
+    render_target = source.render_target or "preview_tail_inactive",
+    source_image_id = source.source_image_id,
+  }
+end
+
+--- @param session typst_watch_session
+--- @param mode '"full"' | '"preview"'
+local function write_session_document(session, mode)
   local items = compose_session_items(session)
   if #items == 0 then
     M.stop_watch_session(session.bufnr, session.kind)
     return
   end
 
+  local old_page_count = session.last_page_count or 0
   session.items = items
-  session.page_state = {}
   session.line_map = nil
   session.last_page_count = #items
-  clear_session_output_pages(session.output_prefix)
+
+  if mode == "preview" then
+    local tail_idx = #session.base_items + 1
+    clear_session_output_page(session.output_prefix, tail_idx)
+    session.page_state[tail_idx] = nil
+    if old_page_count > #items then
+      clear_session_output_page(session.output_prefix, old_page_count)
+      session.page_state[old_page_count] = nil
+    end
+  else
+    session.page_state = {}
+    clear_session_output_pages(session.output_prefix)
+  end
 
   if require("typst-concealer").config.do_diagnostics then
     session.stderr_chunks = {}
@@ -567,7 +678,7 @@ local function write_session_document(session)
     session.buf_dir,
     session.source_root,
     session.effective_root,
-    session.kind,
+    "full",
     session.prelude_chunks
   )
   session.line_map = line_map
@@ -649,6 +760,7 @@ function M.stop_watch_session(bufnr, kind)
   end
 
   safe_unlink(session.input_path)
+  safe_unlink(session.preview_sidecar_path)
   for i = 1, session.last_page_count or 0 do
     safe_unlink(session.output_prefix .. "-" .. i .. ".png")
   end
@@ -669,7 +781,6 @@ end
 --- @param bufnr integer
 function M.stop_watch_sessions_for_buf(bufnr)
   M.stop_watch_session(bufnr, "full")
-  M.stop_watch_session(bufnr, "preview")
 end
 
 --- Called when a rendered page file is stable and ready to display.
@@ -784,6 +895,9 @@ end
 --- @param i       integer
 --- @param item    table
 local function try_render_session_page(session, i, item)
+  if item == nil or item.image_id == nil or item.extmark_id == nil or item.render_target == "preview_tail_inactive" then
+    return
+  end
   local page_path = session.output_prefix .. "-" .. i .. ".png"
   local stat = vim.uv.fs_stat(page_path)
   if stat == nil or stat.size == 0 then
@@ -846,9 +960,9 @@ end
 
 --- Start or reuse a `typst watch` session for bufnr.
 --- @param bufnr integer
---- @param kind  'full'
 --- @return typst_watch_session|nil
-function M.ensure_watch_session(bufnr, kind)
+function M.ensure_watch_session(bufnr)
+  local kind = "full"
   local existing = get_watch_session(bufnr, kind)
   if existing ~= nil and existing.handle ~= nil and not existing.dead then
     return existing
@@ -891,7 +1005,7 @@ function M.ensure_watch_session(bufnr, kind)
   end
 
   local source_root = normalize_root(configured_root or project_root)
-  local input_path = session_input_path(bufnr, kind, source_root)
+  local input_path = session_input_path(bufnr, source_root)
   local cache_base = vim.fn.fnamemodify(input_path, ":h")
   -- effective_root = common ancestor of the intended project root and the
   -- actual generated input directory. When the cache lives under source_root,
@@ -899,7 +1013,8 @@ function M.ensure_watch_session(bufnr, kind)
   -- real project files imported by context helpers.
   local base_root = source_root or project_root
   local effective_root = path_rewrite.common_ancestor(base_root, cache_base)
-  local template, prefix = session_output_template(bufnr, kind)
+  local template, prefix = session_output_template(bufnr)
+  local preview_sidecar_path = session_preview_sidecar_path(bufnr, source_root)
 
   -- Collect extra --input pairs from get_inputs.
   local extra_inputs = {}
@@ -929,6 +1044,22 @@ function M.ensure_watch_session(bufnr, kind)
     return nil
   end
 
+  local preview_sidecar_root_relative_path = path_rewrite.encode_root_relative(preview_sidecar_path, effective_root)
+  local ok_preview, preview_err = write_preview_sidecar({
+    bufnr = bufnr,
+    buf_dir = buf_dir,
+    source_root = source_root,
+    effective_root = effective_root,
+    preview_sidecar_path = preview_sidecar_path,
+    prelude_chunks = {},
+  }, nil)
+  if not ok_preview then
+    vim.schedule(function()
+      vim.notify("[typst-concealer] failed to create preview sidecar: " .. tostring(preview_err), vim.log.levels.ERROR)
+    end)
+    return nil
+  end
+
   local session = {
     kind = kind,
     bufnr = bufnr,
@@ -941,7 +1072,11 @@ function M.ensure_watch_session(bufnr, kind)
     poll_timer = nil,
     items = {},
     base_items = {},
-    preview_item = nil,
+    preview_tail_item = nil,
+    preview_sidecar_item = nil,
+    preview_sidecar_path = preview_sidecar_path,
+    preview_sidecar_root_relative_path = preview_sidecar_root_relative_path,
+    preview_active = false,
     prelude_chunks = {},
     page_state = {},
     render_start_index = 1,
@@ -956,6 +1091,7 @@ function M.ensure_watch_session(bufnr, kind)
     source_root = source_root,
     effective_root = effective_root,
   }
+  session.preview_tail_item = make_preview_tail_item(session, nil)
 
   local handle
   handle = vim.uv.spawn(config.typst_location, {
@@ -1044,51 +1180,82 @@ function M.ensure_watch_session(bufnr, kind)
   return session
 end
 
---- Send a batch of items to a watch session for rendering.
+--- Send a batch of items to the full watch session for rendering.
 --- @param bufnr integer
 --- @param items table[]
---- @param kind  'full'
-function M.render_items_via_watch(bufnr, items, kind)
-  local session = M.ensure_watch_session(bufnr, kind)
+function M.render_items_via_watch(bufnr, items)
+  local session = M.ensure_watch_session(bufnr)
   if session == nil then
     return
   end
   session.base_items = items or {}
   session.prelude_chunks = snapshot_full_context_preludes(bufnr)
+  if session.preview_active and session.preview_sidecar_item ~= nil then
+    session.preview_tail_item = make_preview_tail_item(session, session.preview_sidecar_item)
+  else
+    session.preview_tail_item = make_preview_tail_item(session, nil)
+  end
+  local ok_preview, preview_err = write_preview_sidecar(session, session.preview_sidecar_item)
+  if not ok_preview then
+    vim.schedule(function()
+      vim.notify("[typst-concealer] failed to refresh preview sidecar: " .. tostring(preview_err), vim.log.levels.ERROR)
+    end)
+  end
   session.render_start_index = 1
-  write_session_document(session)
+  write_session_document(session, "full")
 end
 
---- Update the transient preview overlay.
+--- Update the transient preview tail page on the full watch session.
 --- @param bufnr integer
---- @param item table|nil
---- @param kind 'full'|'preview'
-function M.render_preview_item_via_watch(bufnr, item, kind)
-  if kind == "preview" and item == nil then
-    M.stop_watch_session(bufnr, kind)
+--- @param item table
+function M.render_preview_tail(bufnr, item)
+  local session = get_watch_session(bufnr, "full")
+  if session == nil or #(session.base_items or {}) == 0 then
     return
   end
 
-  local session = get_watch_session(bufnr, kind)
-  if session == nil then
-    if item == nil then
-      return
-    end
-    session = M.ensure_watch_session(bufnr, kind)
-    if session == nil then
-      return
-    end
+  session.preview_sidecar_item = vim.deepcopy(item)
+  local ok, err = write_preview_sidecar(session, session.preview_sidecar_item)
+  if not ok then
+    vim.schedule(function()
+      vim.notify("[typst-concealer] failed to update preview sidecar: " .. tostring(err), vim.log.levels.ERROR)
+    end)
+    return
   end
 
-  if kind == "preview" then
-    -- Keep preview watch sessions lightweight: only preserve semantic preludes
-    -- and the transient preview item, not the full rendered item list.
-    session.base_items = {}
-    session.prelude_chunks = snapshot_full_context_preludes(bufnr)
+  session.preview_active = true
+  session.preview_tail_item = make_preview_tail_item(session, item)
+  if full_pages_have_stable_renders(session) then
+    session.render_start_index = #session.base_items + 1
+  else
     session.render_start_index = 1
   end
-  session.preview_item = item
-  write_session_document(session)
+  write_session_document(session, "preview")
+end
+
+--- Disable the transient preview tail page on the full watch session.
+--- @param bufnr integer
+function M.clear_preview_tail(bufnr)
+  local session = get_watch_session(bufnr, "full")
+  if session == nil then
+    return
+  end
+
+  local had_preview = session.preview_active
+  session.preview_active = false
+  session.preview_sidecar_item = nil
+  session.preview_tail_item = make_preview_tail_item(session, nil)
+  local ok, err = write_preview_sidecar(session, nil)
+  if not ok then
+    vim.schedule(function()
+      vim.notify("[typst-concealer] failed to clear preview sidecar: " .. tostring(err), vim.log.levels.ERROR)
+    end)
+  end
+
+  if had_preview then
+    session.render_start_index = #session.base_items + 1
+    write_session_document(session, "preview")
+  end
 end
 
 return M
