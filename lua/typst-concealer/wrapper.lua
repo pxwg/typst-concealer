@@ -317,41 +317,41 @@ function M.build_batch_document(
 
     local source_rows = item.range[3] - item.range[1] + 1
     local wrap_prefix, wrap_suffix = M.build_wrapper(item, source_rows)
+    local suffix_text = wrap_suffix ~= "" and wrap_suffix or "\n"
     local item_key = table.concat({
       tostring(prelude_chunks),
       tostring(item.prelude_count or 0),
       wrap_prefix,
-      wrap_suffix,
+      suffix_text,
       normalize_item_str(item),
     }, "\0")
     local item_cache = cache.item_fragments[item_key]
     if item_cache == nil then
-      local parts = {}
+      local prefix_parts = {}
       for i = 1, item.prelude_count do
-        parts[#parts + 1] = maybe_rewrite(prelude_chunks[i] or "")
+        prefix_parts[#prefix_parts + 1] = maybe_rewrite(prelude_chunks[i] or "")
       end
       if wrap_prefix ~= "" then
-        parts[#parts + 1] = wrap_prefix
+        prefix_parts[#prefix_parts + 1] = wrap_prefix
       end
       local item_text = maybe_rewrite(normalize_item_str(item))
-      parts[#parts + 1] = item_text
-      if wrap_suffix ~= "" then
-        parts[#parts + 1] = wrap_suffix
-      else
-        parts[#parts + 1] = "\n"
-      end
       item_cache = {
-        fragment = table.concat(parts),
+        prefix = table.concat(prefix_parts),
         item_text = item_text,
+        suffix = suffix_text,
       }
       cache.item_fragments[item_key] = item_cache
+    end
+
+    if item_cache.prefix ~= "" then
+      append_chunk(item_cache.prefix)
     end
 
     local gen_start = cur_line
     local gen_start_col = cur_col
     local gen_end_line, gen_end_col_next = advance_pos(item_cache.item_text, gen_start, gen_start_col)
     local gen_end = gen_end_line
-    append_chunk(item_cache.fragment)
+    append_chunk(item_cache.item_text)
 
     local src_start_col = item.range[2] + 1
     local src_end_col = item.range[4] + 1
@@ -372,11 +372,7 @@ function M.build_batch_document(
       }
     end
 
-    if wrap_suffix ~= "" then
-      append_chunk(wrap_suffix)
-    else
-      append_chunk("\n")
-    end
+    append_chunk(item_cache.suffix)
   end
 
   return table.concat(doc), line_map
