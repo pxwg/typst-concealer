@@ -360,6 +360,7 @@ end
 local function cleanup_preview_image(bufnr)
   local bs = state.get_buf_state(bufnr)
   local preview = bs.preview_image
+  local last_rendered = bs.preview_last_rendered_item
   if preview == nil then
     if bs.preview_item ~= nil then
       if bs.preview_item.extmark_id ~= nil then
@@ -375,6 +376,15 @@ local function cleanup_preview_image(bufnr)
       state.image_ids_in_use[bs.preview_item.image_id] = nil
     end
     bs.preview_item = nil
+    if last_rendered ~= nil and last_rendered.image_id ~= nil then
+      local extmark = require("typst-concealer.extmark")
+      extmark.clear_image(last_rendered.image_id)
+      state.image_id_to_extmark[last_rendered.image_id] = nil
+      state.item_by_image_id[last_rendered.image_id] = nil
+      state.image_ids_in_use[last_rendered.image_id] = nil
+    end
+    bs.preview_last_rendered_item = nil
+    bs.preview_last_render_key = nil
     bs.preview_render_key = nil
     bs.preview_source_image_id = nil
     bs.preview_source_page_stamp = nil
@@ -398,8 +408,21 @@ local function cleanup_preview_image(bufnr)
     state.item_by_image_id[bs.preview_item.image_id] = nil
     state.image_ids_in_use[bs.preview_item.image_id] = nil
   end
+  if
+    last_rendered ~= nil
+    and last_rendered.image_id ~= nil
+    and last_rendered.image_id ~= preview.image_id
+    and (bs.preview_item == nil or last_rendered.image_id ~= bs.preview_item.image_id)
+  then
+    extmark.clear_image(last_rendered.image_id)
+    state.image_id_to_extmark[last_rendered.image_id] = nil
+    state.item_by_image_id[last_rendered.image_id] = nil
+    state.image_ids_in_use[last_rendered.image_id] = nil
+  end
   bs.preview_image = nil
   bs.preview_item = nil
+  bs.preview_last_rendered_item = nil
+  bs.preview_last_render_key = nil
   bs.preview_render_key = nil
   bs.preview_source_image_id = nil
   bs.preview_source_page_stamp = nil
@@ -1422,6 +1445,10 @@ local function present_preview_item(bufnr, item, cursor_row, cursor_col)
     if bs.preview_source_image_id == item.image_id and bs.preview_image ~= nil then
       return
     end
+    if item_has_stable_render(bs.preview_last_rendered_item) then
+      M.present_rendered_preview_item(bufnr, bs.preview_last_rendered_item)
+      return
+    end
     if should_preserve_preview(bufnr, cursor_row, cursor_col) then
       return
     end
@@ -1496,6 +1523,8 @@ function M.present_rendered_preview_item(bufnr, item)
     image_id = item.image_id,
   }
   bs.preview_item = item
+  bs.preview_last_rendered_item = item
+  bs.preview_last_render_key = bs.preview_render_key
   bs.preview_source_image_id = item.source_image_id or item.image_id
   bs.preview_source_page_stamp = item.page_stamp
   bs.preview_source_range = vim.deepcopy(item.range)
@@ -1597,6 +1626,10 @@ function M.render_live_typst_preview(bufnr)
       return
     end
 
+    if item_has_stable_render(bs.preview_item) then
+      bs.preview_last_rendered_item = bs.preview_item
+      bs.preview_last_render_key = bs.preview_render_key
+    end
     present_preview_item(bufnr, item, cursor_row, cursor_col)
 
     local shared_extmark_id = bs.preview_image and bs.preview_image.extmark_id or nil

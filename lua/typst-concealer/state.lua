@@ -68,6 +68,8 @@ function M.get_buf_state(bufnr)
     M.buffers[bufnr] = {
       preview_image = nil,
       preview_item = nil,
+      preview_last_rendered_item = nil,
+      preview_last_render_key = nil,
       preview_render_key = nil,
       preview_sync_timer = nil,
       preview_sync_tick = nil,
