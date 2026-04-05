@@ -69,6 +69,18 @@ local function normalize_item_str(item)
   return ""
 end
 
+local function build_header_text(config, main, maybe_rewrite, preamble_include_line)
+  local parts = {}
+  if config.header and config.header ~= "" then
+    parts[#parts + 1] = maybe_rewrite(config.header) .. "\n"
+  end
+  parts[#parts + 1] = main._styling_prelude
+  if preamble_include_line ~= nil and preamble_include_line ~= "" then
+    parts[#parts + 1] = preamble_include_line
+  end
+  return table.concat(parts)
+end
+
 --- Returns the column width of the window displaying bufnr (falls back to current window).
 --- @param bufnr integer
 --- @return integer
@@ -242,6 +254,7 @@ end
 --- @param prelude_chunks string[]|nil  snapshot of runtime preludes aligned with item.prelude_count
 --- @param preamble_include_line string|nil
 --- @param build_line_map boolean|nil
+--- @param cache table|nil
 --- @return string, table
 function M.build_batch_document(
   items,
@@ -251,7 +264,8 @@ function M.build_batch_document(
   kind,
   prelude_chunks,
   preamble_include_line,
-  build_line_map
+  build_line_map,
+  cache
 )
   local main = require("typst-concealer")
   local config = main.config
@@ -280,50 +294,64 @@ function M.build_batch_document(
     cur_line, cur_col = advance_pos(chunk, cur_line, cur_col)
   end
 
-  if config.header and config.header ~= "" then
-    append_chunk(maybe_rewrite(config.header) .. "\n")
-  end
+  cache = cache or {}
+  cache.item_fragments = cache.item_fragments or {}
 
-  append_chunk(main._styling_prelude)
-
-  -- Inject project-level context via get_preamble_file.
-  -- The returned filesystem path is converted to a Typst root-relative path so
-  -- that `#include` resolves correctly regardless of where the temp file lives.
-  if preamble_include_line ~= nil and preamble_include_line ~= "" then
-    append_chunk(preamble_include_line)
-  elseif type(config.get_preamble_file) == "function" and pr ~= nil then
-    local buf_path_for_pf = (items[1] and vim.api.nvim_buf_get_name(items[1].bufnr)) or ""
-    local cwd_for_pf = vim.fn.getcwd()
-    local ok, pf = pcall(config.get_preamble_file, rep_bufnr, buf_path_for_pf, cwd_for_pf, kind or "full")
-    if ok and type(pf) == "string" and pf ~= "" then
-      local abs = vim.fs.normalize(vim.fn.fnamemodify(pf, ":p")):gsub("/$", "")
-      local typst_path = pr.encode_root_relative(abs, effective_root)
-      append_chunk('#include "' .. typst_path .. '"\n')
-    end
+  local header_key = table.concat({
+    config.header or "",
+    main._styling_prelude or "",
+    preamble_include_line or "",
+  }, "\0")
+  local header_text = cache.header_key == header_key and cache.header_text or nil
+  if header_text == nil then
+    header_text = build_header_text(config, main, maybe_rewrite, preamble_include_line)
+    cache.header_key = header_key
+    cache.header_text = header_text
   end
+  append_chunk(header_text)
 
   for idx, item in ipairs(items) do
     if idx > 1 then
       append_chunk("#pagebreak()\n")
     end
 
-    for i = 1, item.prelude_count do
-      append_chunk(maybe_rewrite(prelude_chunks[i] or ""))
-    end
-
     local source_rows = item.range[3] - item.range[1] + 1
     local wrap_prefix, wrap_suffix = M.build_wrapper(item, source_rows)
-
-    if wrap_prefix ~= "" then
-      append_chunk(wrap_prefix)
+    local item_key = table.concat({
+      tostring(prelude_chunks),
+      tostring(item.prelude_count or 0),
+      wrap_prefix,
+      wrap_suffix,
+      normalize_item_str(item),
+    }, "\0")
+    local item_cache = cache.item_fragments[item_key]
+    if item_cache == nil then
+      local parts = {}
+      for i = 1, item.prelude_count do
+        parts[#parts + 1] = maybe_rewrite(prelude_chunks[i] or "")
+      end
+      if wrap_prefix ~= "" then
+        parts[#parts + 1] = wrap_prefix
+      end
+      local item_text = maybe_rewrite(normalize_item_str(item))
+      parts[#parts + 1] = item_text
+      if wrap_suffix ~= "" then
+        parts[#parts + 1] = wrap_suffix
+      else
+        parts[#parts + 1] = "\n"
+      end
+      item_cache = {
+        fragment = table.concat(parts),
+        item_text = item_text,
+      }
+      cache.item_fragments[item_key] = item_cache
     end
 
-    local item_text = maybe_rewrite(normalize_item_str(item))
     local gen_start = cur_line
     local gen_start_col = cur_col
-    local gen_end_line, gen_end_col_next = advance_pos(item_text, gen_start, gen_start_col)
+    local gen_end_line, gen_end_col_next = advance_pos(item_cache.item_text, gen_start, gen_start_col)
     local gen_end = gen_end_line
-    append_chunk(item_text)
+    append_chunk(item_cache.fragment)
 
     local src_start_col = item.range[2] + 1
     local src_end_col = item.range[4] + 1

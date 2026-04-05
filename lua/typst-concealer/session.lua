@@ -718,7 +718,8 @@ local function write_session_document(session, mode)
     "full",
     session.prelude_chunks,
     session.preamble_include_line,
-    do_diagnostics
+    do_diagnostics,
+    session.wrapper_cache
   )
   session.line_map = line_map
   if session.last_input_text == doc_str then
@@ -1203,6 +1204,9 @@ function M.ensure_watch_session(bufnr)
     last_page_count = 0,
     last_input_text = nil,
     last_preview_sidecar_text = nil,
+    wrapper_cache = {
+      item_fragments = {},
+    },
     line_map = nil,
     stderr_chunks = {},
     stderr_text = "",
