@@ -534,30 +534,6 @@ local function session_render_start_index(session)
   return math.max(1, math.min(start_idx, total))
 end
 
---- Snapshot full-render items into a context-only batch for preview rendering.
---- This preserves the exact Typst document assembly order and prelude counts
---- without reusing full-render runtime objects such as extmark/image state.
---- @param bufnr integer
---- @return table[]
-local function snapshot_full_context_items(bufnr)
-  local bstate = state.buffer_render_state[bufnr]
-  local full_items = (bstate and bstate.full_items) or {}
-  local items = {}
-
-  for _, item in ipairs(full_items) do
-    items[#items + 1] = {
-      bufnr = item.bufnr,
-      range = vim.deepcopy(item.range),
-      str = item.str,
-      prelude_count = item.prelude_count,
-      node_type = item.node_type,
-      semantics = item.semantics,
-    }
-  end
-
-  return items
-end
-
 --- @param bufnr integer
 --- @return string[]
 local function snapshot_full_context_preludes(bufnr)
@@ -1105,9 +1081,11 @@ function M.render_preview_item_via_watch(bufnr, item, kind)
   end
 
   if kind == "preview" then
-    session.base_items = snapshot_full_context_items(bufnr)
+    -- Keep preview watch sessions lightweight: only preserve semantic preludes
+    -- and the transient preview item, not the full rendered item list.
+    session.base_items = {}
     session.prelude_chunks = snapshot_full_context_preludes(bufnr)
-    session.render_start_index = #session.base_items + 1
+    session.render_start_index = 1
   end
   session.preview_item = item
   write_session_document(session)
