@@ -241,6 +241,7 @@ end
 --- @param kind "full"|nil  session kind forwarded to get_preamble_file
 --- @param prelude_chunks string[]|nil  snapshot of runtime preludes aligned with item.prelude_count
 --- @param preamble_include_line string|nil
+--- @param build_line_map boolean|nil
 --- @return string, table
 function M.build_batch_document(
   items,
@@ -249,12 +250,13 @@ function M.build_batch_document(
   effective_root,
   kind,
   prelude_chunks,
-  preamble_include_line
+  preamble_include_line,
+  build_line_map
 )
   local main = require("typst-concealer")
   local config = main.config
   local doc = {}
-  local line_map = {}
+  local line_map = build_line_map == false and nil or {}
   local cur_line = 1
   local cur_col = 1
   local rep_bufnr = (items[1] and items[1].bufnr) or 0
@@ -327,18 +329,20 @@ function M.build_batch_document(
     local src_end_col = item.range[4] + 1
     local gen_end_col = math.max(1, gen_end_col_next - 1)
 
-    line_map[#line_map + 1] = {
-      gen_start = gen_start,
-      gen_end = gen_end,
-      gen_start_col = gen_start_col,
-      gen_end_col = gen_end_col,
-      bufnr = item.bufnr,
-      src_start = item.range[1] + 1,
-      src_end = item.range[3] + 1,
-      src_start_col = src_start_col,
-      src_end_col = src_end_col,
-      item_idx = idx,
-    }
+    if line_map ~= nil then
+      line_map[#line_map + 1] = {
+        gen_start = gen_start,
+        gen_end = gen_end,
+        gen_start_col = gen_start_col,
+        gen_end_col = gen_end_col,
+        bufnr = item.bufnr,
+        src_start = item.range[1] + 1,
+        src_end = item.range[3] + 1,
+        src_start_col = src_start_col,
+        src_end_col = src_end_col,
+        item_idx = idx,
+      }
+    end
 
     if wrap_suffix ~= "" then
       append_chunk(wrap_suffix)

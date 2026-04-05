@@ -709,6 +709,7 @@ local function write_session_document(session, mode)
   end
 
   local wrapper = require("typst-concealer.wrapper")
+  local do_diagnostics = require("typst-concealer").config.do_diagnostics
   local doc_str, line_map = wrapper.build_batch_document(
     items,
     session.buf_dir,
@@ -716,7 +717,8 @@ local function write_session_document(session, mode)
     session.effective_root,
     "full",
     session.prelude_chunks,
-    session.preamble_include_line
+    session.preamble_include_line,
+    do_diagnostics
   )
   session.line_map = line_map
   if session.last_input_text == doc_str then
