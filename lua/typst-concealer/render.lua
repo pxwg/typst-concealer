@@ -11,6 +11,7 @@ local diagnostics = {}
 
 local PREVIEW_FLOAT_TARGET_RANGE = { 0, 0, 0, 0 }
 local PREVIEW_FLOAT_LINE_COUNT = 2
+local MAX_LINGER_MISSES = 2
 
 local candidate_bounds_penalty
 local candidate_obstacle_penalty
@@ -766,6 +767,11 @@ function M.hard_reset_buf(bufnr)
       cleanup_item(bufnr, item)
     end
   end
+  if bstate and bstate.lingering_items then
+    for _, item in ipairs(bstate.lingering_items) do
+      cleanup_item(bufnr, item)
+    end
+  end
   state.buffer_render_state[bufnr] = nil
 
   vim.api.nvim_buf_clear_namespace(bufnr, state.ns_id, 0, -1)
@@ -813,6 +819,13 @@ function M.render_buf(bufnr)
   local session = require("typst-concealer.session")
   local bs = state.get_buf_state(bufnr)
   local prev_state = state.buffer_render_state[bufnr] or {}
+  local prev_visible_items = {}
+  for _, item in ipairs(prev_state.full_items or {}) do
+    prev_visible_items[#prev_visible_items + 1] = item
+  end
+  for _, item in ipairs(prev_state.lingering_items or {}) do
+    prev_visible_items[#prev_visible_items + 1] = item
+  end
 
   local parser = vim.treesitter.get_parser(bufnr, "typst")
   local tree = parser:parse()[1]:root()
@@ -823,8 +836,9 @@ function M.render_buf(bufnr)
   bs.pending_change = nil
   local sorted_entries = build_render_entries_from_units(bufnr, units)
 
-  local prev_items = prev_state.full_items or {}
+  local prev_items = prev_visible_items
   local batch_items = {}
+  local lingering_items = {}
   local used_prev = {}
 
   for idx, entry in ipairs(sorted_entries) do
@@ -855,6 +869,7 @@ function M.render_buf(bufnr)
       semantics = sem, -- unified: replaces layout_kind/is_block/display_as_block
       needs_swap = prev_item ~= nil,
     }
+    item.linger_misses = nil
 
     -- Preserve the last stable rendered page metadata while a fresh watch update
     -- is in flight. This prevents both concealed block renders and inline live
@@ -868,19 +883,32 @@ function M.render_buf(bufnr)
   -- Release extmarks/images for items that no longer exist
   for idx, prev_item in ipairs(prev_items) do
     if not used_prev[idx] then
-      cleanup_item(bufnr, prev_item)
+      if item_has_stable_render(prev_item) and (prev_item.linger_misses or 0) < MAX_LINGER_MISSES then
+        prev_item.linger_misses = (prev_item.linger_misses or 0) + 1
+        lingering_items[#lingering_items + 1] = prev_item
+      else
+        cleanup_item(bufnr, prev_item)
+      end
     end
   end
 
   state.buffer_render_state[bufnr] = state.buffer_render_state[bufnr] or {}
   state.buffer_render_state[bufnr].full_units = units
   state.buffer_render_state[bufnr].full_items = batch_items
+  state.buffer_render_state[bufnr].lingering_items = lingering_items
   state.buffer_render_state[bufnr].runtime_preludes = state.runtime_preludes
 
   -- Rebuild per-line item index for O(1) hover lookup
   local line_to_items = {}
   local extmark_to_item = {}
+  local visible_items = {}
   for _, item in ipairs(batch_items) do
+    visible_items[#visible_items + 1] = item
+  end
+  for _, item in ipairs(lingering_items) do
+    visible_items[#visible_items + 1] = item
+  end
+  for _, item in ipairs(visible_items) do
     extmark_to_item[item.extmark_id] = item
     for row = item.range[1], item.range[3] do
       if not line_to_items[row] then
