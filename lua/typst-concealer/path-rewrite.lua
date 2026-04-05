@@ -171,6 +171,16 @@ function M.rewrite_paths(text, opts)
   if type(text) ~= "string" then
     return text
   end
+  local bucket = get_cache_bucket(opts.bufnr, opts)
+  local text_cache = bucket and (bucket.__text_rewrites or {}) or nil
+  if bucket ~= nil and bucket.__text_rewrites == nil then
+    bucket.__text_rewrites = text_cache
+  end
+  if text_cache ~= nil and text_cache[text] ~= nil then
+    return text_cache[text]
+  end
+
+  local original_text = text
 
   local function rw(p)
     return M.rewrite_path(p, opts)
@@ -193,6 +203,9 @@ function M.rewrite_paths(text, opts)
   text = text:gsub('(style%s*:%s*")([^"]*)(")', sub)
   text = text:gsub("(style%s*:%s*')" .. "([^']*)" .. "(')", sub)
 
+  if text_cache ~= nil then
+    text_cache[original_text] = text
+  end
   return text
 end
 
