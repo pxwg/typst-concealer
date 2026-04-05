@@ -697,8 +697,14 @@ local function write_session_document(session, mode)
       session.page_state[old_page_count] = nil
     end
   else
-    session.page_state = {}
-    clear_session_output_pages(session.output_prefix)
+    -- Keep the previous full render visible until replacement pages arrive.
+    -- Only prune stale tail pages when the new document shrinks.
+    if old_page_count > #items then
+      for i = #items + 1, old_page_count do
+        clear_session_output_page(session.output_prefix, i)
+        session.page_state[i] = nil
+      end
+    end
   end
 
   if require("typst-concealer").config.do_diagnostics then
