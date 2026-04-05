@@ -1545,7 +1545,11 @@ local function find_full_item_at_cursor(bufnr, row, col, mode)
   local best_item = nil
   for _, item in ipairs(candidates) do
     local effective_range = get_item_effective_range(item)
-    if effective_range ~= nil and item.node_type == "math" and cursor_engages_inline_item(effective_range, row, col, mode) then
+    if
+      effective_range ~= nil
+      and item.node_type == "math"
+      and cursor_engages_inline_item(effective_range, row, col, mode)
+    then
       if best_item == nil then
         best_item = item
       else
