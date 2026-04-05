@@ -34,6 +34,7 @@ M.image_ids_in_use = {}
 --- @field prelude_chunks string[]
 --- @field page_state table
 --- @field render_start_index integer
+--- @field poll_interval_ms integer|nil
 --- @field last_page_count integer
 --- @field stderr_chunks string[]
 --- @field dead boolean|nil

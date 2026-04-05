@@ -552,6 +552,10 @@ local function session_render_start_index(session)
   return math.max(1, start_idx)
 end
 
+local FAST_POLL_INTERVAL_MS = 30
+local IDLE_POLL_INTERVAL_MS = 80
+local try_render_session_page
+
 --- @param session typst_watch_session
 --- @return boolean
 local function full_pages_have_stable_renders(session)
@@ -890,36 +894,79 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
   require("typst-concealer.render").render_live_typst_preview(bufnr)
 end
 
---- Attempt to render page i of session if the file is stable (two consecutive equal stamps).
 --- @param session typst_watch_session
---- @param i       integer
---- @param item    table
-local function try_render_session_page(session, i, item)
-  if item == nil or item.image_id == nil or item.extmark_id == nil or item.render_target == "preview_tail_inactive" then
+--- @param interval_ms integer
+local function set_session_poll_interval(session, interval_ms)
+  if session.poll_timer == nil or session.poll_timer:is_closing() then
     return
   end
+  if session.poll_interval_ms == interval_ms then
+    return
+  end
+  session.poll_interval_ms = interval_ms
+  session.poll_timer:stop()
+  session.poll_timer:start(
+    interval_ms,
+    interval_ms,
+    vim.schedule_wrap(function()
+      if session.dead then
+        return
+      end
+      local start_idx = session_render_start_index(session)
+      for i = start_idx, #(session.items or {}) do
+        local item = session.items[i]
+        try_render_session_page(session, i, item)
+      end
+    end)
+  )
+end
+
+--- @param session typst_watch_session
+--- @param i integer
+--- @param item table|nil
+--- @return boolean
+local function session_page_needs_render(session, i, item)
+  if item == nil or item.image_id == nil or item.extmark_id == nil or item.render_target == "preview_tail_inactive" then
+    return false
+  end
+
+  local page_state = session.page_state[i]
+  if page_state == nil or page_state.rendered == nil then
+    return true
+  end
+
   local page_path = session.output_prefix .. "-" .. i .. ".png"
   local stat = vim.uv.fs_stat(page_path)
   if stat == nil or stat.size == 0 then
-    return
+    return true
   end
 
   local stamp = tostring(stat.mtime.sec) .. ":" .. tostring(stat.mtime.nsec) .. ":" .. tostring(stat.size)
+  return page_state.rendered ~= stamp
+end
+
+--- @param session typst_watch_session
+local function refresh_session_poll_interval(session)
+  local start_idx = session_render_start_index(session)
+  local has_pending = false
+  for i = start_idx, #(session.items or {}) do
+    if session_page_needs_render(session, i, session.items[i]) then
+      has_pending = true
+      break
+    end
+  end
+  set_session_poll_interval(session, has_pending and FAST_POLL_INTERVAL_MS or IDLE_POLL_INTERVAL_MS)
+end
+
+--- Schedule a page render attempt once the poller decides the current stamp is ready enough.
+--- @param session typst_watch_session
+--- @param i integer
+--- @param item table
+--- @param page_path string
+--- @param stamp string
+local function schedule_session_page_render(session, i, item, page_path, stamp)
   local page_state = session.page_state[i] or {}
-
-  -- First sighting: remember only, do not render yet
-  if page_state.last_seen ~= stamp then
-    page_state.last_seen = stamp
-    session.page_state[i] = page_state
-    return
-  end
-
-  -- Second consecutive sighting of same stamp: assume write is stable
-  if page_state.rendered == stamp then
-    return
-  end
   session.page_state[i] = page_state
-
   vim.schedule(function()
     local current = get_watch_session(session.bufnr, session.kind)
     if current ~= session then
@@ -932,8 +979,49 @@ local function try_render_session_page(session, i, item)
     if after_item ~= nil and after_item.page_stamp == stamp and before_stamp ~= stamp then
       page_state.rendered = stamp
       session.page_state[i] = page_state
+      refresh_session_poll_interval(session)
     end
   end)
+end
+
+--- Attempt to render page i of session.
+--- First paint goes through immediately once the file exists and is non-empty.
+--- Subsequent updates still require two consecutive equal stamps.
+--- @param session typst_watch_session
+--- @param i       integer
+--- @param item    table
+try_render_session_page = function(session, i, item)
+  if item == nil or item.image_id == nil or item.extmark_id == nil or item.render_target == "preview_tail_inactive" then
+    return
+  end
+  local page_path = session.output_prefix .. "-" .. i .. ".png"
+  local stat = vim.uv.fs_stat(page_path)
+  if stat == nil or stat.size == 0 then
+    return
+  end
+
+  local stamp = tostring(stat.mtime.sec) .. ":" .. tostring(stat.mtime.nsec) .. ":" .. tostring(stat.size)
+  local page_state = session.page_state[i] or {}
+
+  -- First paint fast path: try immediately once a non-empty page appears.
+  if page_state.rendered == nil and page_state.last_seen == nil then
+    page_state.last_seen = stamp
+    session.page_state[i] = page_state
+    schedule_session_page_render(session, i, item, page_path, stamp)
+    return
+  end
+
+  -- Subsequent updates stay conservative and wait for a repeated stamp.
+  if page_state.last_seen ~= stamp then
+    page_state.last_seen = stamp
+    session.page_state[i] = page_state
+    return
+  end
+
+  if page_state.rendered == stamp then
+    return
+  end
+  schedule_session_page_render(session, i, item, page_path, stamp)
 end
 
 --- @param session typst_watch_session
@@ -942,20 +1030,8 @@ local function ensure_session_poller(session)
     return
   end
   session.poll_timer = vim.uv.new_timer()
-  session.poll_timer:start(
-    80,
-    80,
-    vim.schedule_wrap(function()
-      if session.dead then
-        return
-      end
-      local start_idx = session_render_start_index(session)
-      for i = start_idx, #(session.items or {}) do
-        local item = session.items[i]
-        try_render_session_page(session, i, item)
-      end
-    end)
-  )
+  session.poll_interval_ms = nil
+  refresh_session_poll_interval(session)
 end
 
 --- Start or reuse a `typst watch` session for bufnr.
@@ -1080,6 +1156,7 @@ function M.ensure_watch_session(bufnr)
     prelude_chunks = {},
     page_state = {},
     render_start_index = 1,
+    poll_interval_ms = nil,
     last_page_count = 0,
     line_map = nil,
     stderr_chunks = {},
@@ -1203,6 +1280,7 @@ function M.render_items_via_watch(bufnr, items)
   end
   session.render_start_index = 1
   write_session_document(session, "full")
+  refresh_session_poll_interval(session)
 end
 
 --- Update the transient preview tail page on the full watch session.
@@ -1231,6 +1309,7 @@ function M.render_preview_tail(bufnr, item)
     session.render_start_index = 1
   end
   write_session_document(session, "preview")
+  refresh_session_poll_interval(session)
 end
 
 --- Disable the transient preview tail page on the full watch session.
@@ -1255,6 +1334,7 @@ function M.clear_preview_tail(bufnr)
   if had_preview then
     session.render_start_index = #session.base_items + 1
     write_session_document(session, "preview")
+    refresh_session_poll_interval(session)
   end
 end
 
