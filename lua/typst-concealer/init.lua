@@ -148,6 +148,50 @@ local function matches_any_path_rule(rules, path, bufnr)
   return false
 end
 
+local function buf_has_visible_window(bufnr)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+  for _, winid in ipairs(vim.fn.win_findbuf(bufnr)) do
+    if vim.api.nvim_win_is_valid(winid) then
+      return true
+    end
+  end
+  return false
+end
+
+local function maybe_stop_hidden_full_watch(bufnr)
+  if
+    not vim.api.nvim_buf_is_valid(bufnr)
+    or vim.api.nvim_buf_get_name(bufnr):match(".*%.typ$") == nil
+    or M._enabled_buffers[bufnr] ~= true
+  then
+    return
+  end
+  if buf_has_visible_window(bufnr) then
+    return
+  end
+  require("typst-concealer.session").stop_watch_session(bufnr, "full")
+end
+
+local function maybe_resume_visible_full_watch(bufnr)
+  if
+    not vim.api.nvim_buf_is_valid(bufnr)
+    or vim.api.nvim_buf_get_name(bufnr):match(".*%.typ$") == nil
+    or M._enabled_buffers[bufnr] ~= true
+    or not M.is_render_allowed(bufnr)
+    or not buf_has_visible_window(bufnr)
+  then
+    return
+  end
+
+  local session = require("typst-concealer.session")
+  if session.has_watch_session(bufnr, "full") then
+    return
+  end
+  require("typst-concealer.render").render_buf(bufnr)
+end
+
 function M.is_render_allowed(bufnr)
   bufnr = bufnr or vim.fn.bufnr()
   local path = normalize_path(vim.api.nvim_buf_get_name(bufnr))
@@ -431,9 +475,23 @@ function M.setup(cfg)
     pattern = "*.typ",
     desc = "sync float preview when entering a typst buffer",
     callback = function(ev)
-      local render = require("typst-concealer.render")
-      render.render_live_typst_preview(ev.buf)
-      render.hide_extmarks_at_cursor(ev.buf)
+      vim.schedule(function()
+        maybe_resume_visible_full_watch(ev.buf)
+        local render = require("typst-concealer.render")
+        render.render_live_typst_preview(ev.buf)
+        render.hide_extmarks_at_cursor(ev.buf)
+      end)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("WinEnter", {
+    group = augroup,
+    pattern = "*.typ",
+    desc = "resume full watch when a typst buffer becomes visible",
+    callback = function(ev)
+      vim.schedule(function()
+        maybe_resume_visible_full_watch(ev.buf)
+      end)
     end,
   })
 
@@ -483,6 +541,21 @@ function M.setup(cfg)
     desc = "clear live preview when leaving a typst buffer",
     callback = function(ev)
       require("typst-concealer.render").clear_live_typst_preview(ev.buf)
+      vim.schedule(function()
+        maybe_stop_hidden_full_watch(ev.buf)
+      end)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("WinClosed", {
+    group = augroup,
+    desc = "stop full watch when a typst buffer is no longer visible",
+    callback = function()
+      vim.schedule(function()
+        for bufnr in pairs(M._enabled_buffers) do
+          maybe_stop_hidden_full_watch(bufnr)
+        end
+      end)
     end,
   })
 

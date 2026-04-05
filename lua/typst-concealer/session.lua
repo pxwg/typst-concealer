@@ -565,6 +565,15 @@ local function get_watch_session(bufnr, kind)
   return bucket and bucket[kind] or nil
 end
 
+--- Report whether a watch session exists and is still alive.
+--- @param bufnr integer
+--- @param kind "full"
+--- @return boolean
+function M.has_watch_session(bufnr, kind)
+  local session = get_watch_session(bufnr, kind)
+  return session ~= nil and session.dead ~= true
+end
+
 local function compose_session_items(session)
   local items = {}
   for _, item in ipairs(session.base_items or {}) do
