@@ -748,7 +748,7 @@ function M.render_buf(bufnr)
 
   state.buffer_render_state[bufnr] = state.buffer_render_state[bufnr] or {}
   state.buffer_render_state[bufnr].full_items = batch_items
-  state.buffer_render_state[bufnr].runtime_preludes = vim.deepcopy(state.runtime_preludes)
+  state.buffer_render_state[bufnr].runtime_preludes = state.runtime_preludes
 
   -- Rebuild per-line item index for O(1) hover lookup
   local line_to_items = {}

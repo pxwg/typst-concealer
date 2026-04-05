@@ -600,7 +600,7 @@ end
 --- @return string[]
 local function snapshot_full_context_preludes(bufnr)
   local bstate = state.buffer_render_state[bufnr]
-  return vim.deepcopy((bstate and bstate.runtime_preludes) or {})
+  return (bstate and bstate.runtime_preludes) or {}
 end
 
 --- @param session typst_watch_session
