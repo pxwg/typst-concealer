@@ -62,7 +62,10 @@ local function normalize_item_str(item)
   if type(item.str) == "table" then
     return table.concat(item.str)
   end
-  return item.str
+  if type(item.str) == "string" then
+    return item.str
+  end
+  return ""
 end
 
 --- Returns the column width of the window displaying bufnr (falls back to current window).
@@ -187,8 +190,9 @@ end
 --- @param source_root string|nil  source/project root used for `/...` semantics
 --- @param effective_root string|nil  actual Typst `--root` used by the watch session
 --- @param kind "full"|"preview"|nil  session kind forwarded to get_preamble_file
+--- @param prelude_chunks string[]|nil  snapshot of runtime preludes aligned with item.prelude_count
 --- @return string, table
-function M.build_batch_document(items, buf_dir, source_root, effective_root, kind)
+function M.build_batch_document(items, buf_dir, source_root, effective_root, kind, prelude_chunks)
   local main = require("typst-concealer")
   local config = main.config
   local doc = {}
@@ -196,6 +200,7 @@ function M.build_batch_document(items, buf_dir, source_root, effective_root, kin
   local cur_line = 1
   local cur_col = 1
   local rep_bufnr = (items[1] and items[1].bufnr) or 0
+  prelude_chunks = prelude_chunks or state.runtime_preludes
 
   local do_rewrite = buf_dir ~= nil and source_root ~= nil and effective_root ~= nil
   local pr = do_rewrite and require("typst-concealer.path-rewrite") or nil
@@ -241,7 +246,7 @@ function M.build_batch_document(items, buf_dir, source_root, effective_root, kin
     end
 
     for i = 1, item.prelude_count do
-      append_chunk(maybe_rewrite(state.runtime_preludes[i]))
+      append_chunk(maybe_rewrite(prelude_chunks[i] or ""))
     end
 
     local source_rows = item.range[3] - item.range[1] + 1

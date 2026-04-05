@@ -429,12 +429,12 @@ local function get_math_symbol_span_at_cursor(item, row, col, mode)
 end
 
 local function make_highlighted_preview_math(item, cursor_row, cursor_col, mode)
-  if item == nil or item.node_type ~= "math" or type(item.str) ~= "string" then
+  if item == nil or item.node_type ~= "math" then
     return nil, nil, nil
   end
 
   local source_text = range_to_string(item.range, item.bufnr)
-  if source_text == nil then
+  if source_text == nil or source_text == "" then
     return nil, nil, nil
   end
 
@@ -748,6 +748,7 @@ function M.render_buf(bufnr)
 
   state.buffer_render_state[bufnr] = state.buffer_render_state[bufnr] or {}
   state.buffer_render_state[bufnr].full_items = batch_items
+  state.buffer_render_state[bufnr].runtime_preludes = vim.deepcopy(state.runtime_preludes)
 
   -- Rebuild per-line item index for O(1) hover lookup
   local line_to_items = {}
@@ -1478,6 +1479,10 @@ function M.render_live_typst_preview(bufnr)
   local item = find_full_item_at_cursor(bufnr, cursor_row, cursor_col)
   if item ~= nil then
     local preview_str, render_key, source_str = make_highlighted_preview_math(item, cursor_row, cursor_col, mode)
+    if type(preview_str) ~= "string" or type(render_key) ~= "string" or type(source_str) ~= "string" then
+      M.clear_live_typst_preview(bufnr)
+      return
+    end
     local bs = state.get_buf_state(bufnr)
     if bs.preview_item ~= nil and bs.preview_render_key == render_key and item_has_stable_render(bs.preview_item) then
       M.present_rendered_preview_item(bufnr, bs.preview_item)

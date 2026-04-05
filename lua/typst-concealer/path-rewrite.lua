@@ -162,6 +162,10 @@ end
 --- @param opts { bufnr?: integer, buf_dir: string, source_root: string, effective_root: string }
 --- @return string
 function M.rewrite_paths(text, opts)
+  if type(text) ~= "string" then
+    return text
+  end
+
   local function rw(p)
     return M.rewrite_path(p, opts)
   end

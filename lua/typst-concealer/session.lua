@@ -558,6 +558,13 @@ local function snapshot_full_context_items(bufnr)
   return items
 end
 
+--- @param bufnr integer
+--- @return string[]
+local function snapshot_full_context_preludes(bufnr)
+  local bstate = state.buffer_render_state[bufnr]
+  return vim.deepcopy((bstate and bstate.runtime_preludes) or {})
+end
+
 local function write_session_document(session)
   local items = compose_session_items(session)
   if #items == 0 then
@@ -579,8 +586,14 @@ local function write_session_document(session)
   end
 
   local wrapper = require("typst-concealer.wrapper")
-  local doc_str, line_map =
-    wrapper.build_batch_document(items, session.buf_dir, session.source_root, session.effective_root, session.kind)
+  local doc_str, line_map = wrapper.build_batch_document(
+    items,
+    session.buf_dir,
+    session.source_root,
+    session.effective_root,
+    session.kind,
+    session.prelude_chunks
+  )
   session.line_map = line_map
   local ok, err = write_file_in_place(session.input_path, doc_str)
   if not ok then
@@ -953,6 +966,7 @@ function M.ensure_watch_session(bufnr, kind)
     items = {},
     base_items = {},
     preview_item = nil,
+    prelude_chunks = {},
     page_state = {},
     render_start_index = 1,
     last_page_count = 0,
@@ -1064,6 +1078,7 @@ function M.render_items_via_watch(bufnr, items, kind)
     return
   end
   session.base_items = items or {}
+  session.prelude_chunks = snapshot_full_context_preludes(bufnr)
   session.render_start_index = 1
   write_session_document(session)
 end
@@ -1091,6 +1106,7 @@ function M.render_preview_item_via_watch(bufnr, item, kind)
 
   if kind == "preview" then
     session.base_items = snapshot_full_context_items(bufnr)
+    session.prelude_chunks = snapshot_full_context_preludes(bufnr)
     session.render_start_index = #session.base_items + 1
   end
   session.preview_item = item
