@@ -240,8 +240,17 @@ end
 --- @param effective_root string|nil  actual Typst `--root` used by the watch session
 --- @param kind "full"|nil  session kind forwarded to get_preamble_file
 --- @param prelude_chunks string[]|nil  snapshot of runtime preludes aligned with item.prelude_count
+--- @param preamble_include_line string|nil
 --- @return string, table
-function M.build_batch_document(items, buf_dir, source_root, effective_root, kind, prelude_chunks)
+function M.build_batch_document(
+  items,
+  buf_dir,
+  source_root,
+  effective_root,
+  kind,
+  prelude_chunks,
+  preamble_include_line
+)
   local main = require("typst-concealer")
   local config = main.config
   local doc = {}
@@ -278,7 +287,9 @@ function M.build_batch_document(items, buf_dir, source_root, effective_root, kin
   -- Inject project-level context via get_preamble_file.
   -- The returned filesystem path is converted to a Typst root-relative path so
   -- that `#include` resolves correctly regardless of where the temp file lives.
-  if type(config.get_preamble_file) == "function" and pr ~= nil then
+  if preamble_include_line ~= nil and preamble_include_line ~= "" then
+    append_chunk(preamble_include_line)
+  elseif type(config.get_preamble_file) == "function" and pr ~= nil then
     local buf_path_for_pf = (items[1] and vim.api.nvim_buf_get_name(items[1].bufnr)) or ""
     local cwd_for_pf = vim.fn.getcwd()
     local ok, pf = pcall(config.get_preamble_file, rep_bufnr, buf_path_for_pf, cwd_for_pf, kind or "full")

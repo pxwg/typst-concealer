@@ -4,6 +4,7 @@
 local M = {}
 
 local state = require("typst-concealer.state")
+local project_root_cache = {}
 
 local function normalize_path(path)
   if path == nil or path == "" then
@@ -72,9 +73,13 @@ end
 --- @param buf_dir string
 --- @return string
 function M.get_project_root(buf_dir)
+  if project_root_cache[buf_dir] ~= nil then
+    return project_root_cache[buf_dir]
+  end
   local dir = buf_dir
   while true do
     if vim.uv.fs_stat(dir .. "/typst.toml") ~= nil then
+      project_root_cache[buf_dir] = dir
       return dir
     end
     local parent = vim.fn.fnamemodify(dir, ":h")
@@ -83,6 +88,7 @@ function M.get_project_root(buf_dir)
     end
     dir = parent
   end
+  project_root_cache[buf_dir] = buf_dir
   return buf_dir
 end
 

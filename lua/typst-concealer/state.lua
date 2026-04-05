@@ -30,12 +30,15 @@ M.image_ids_in_use = {}
 --- @field preview_sidecar_item table|nil
 --- @field preview_sidecar_path string
 --- @field preview_sidecar_root_relative_path string
+--- @field preamble_include_line string
 --- @field preview_active boolean
 --- @field prelude_chunks string[]
 --- @field page_state table
 --- @field render_start_index integer
 --- @field poll_interval_ms integer|nil
 --- @field last_page_count integer
+--- @field last_input_text string|nil
+--- @field last_preview_sidecar_text string|nil
 --- @field stderr_chunks string[]
 --- @field dead boolean|nil
 --- @field buf_dir string

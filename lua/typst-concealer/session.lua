@@ -336,6 +336,30 @@ local function write_file_in_place(path, text)
   return true
 end
 
+--- @param bufnr integer
+--- @param effective_root string
+--- @param kind "full"
+--- @return string
+local function resolve_preamble_include_line(bufnr, effective_root, kind)
+  local main = require("typst-concealer")
+  local config = main.config
+  if type(config.get_preamble_file) ~= "function" then
+    return ""
+  end
+
+  local buf_path = vim.api.nvim_buf_get_name(bufnr)
+  local cwd = vim.fn.getcwd()
+  local ok, pf = pcall(config.get_preamble_file, bufnr, buf_path, cwd, kind)
+  if not ok or type(pf) ~= "string" or pf == "" then
+    return ""
+  end
+
+  local path_rewrite = require("typst-concealer.path-rewrite")
+  local abs = vim.fs.normalize(vim.fn.fnamemodify(pf, ":p")):gsub("/$", "")
+  local typst_path = path_rewrite.encode_root_relative(abs, effective_root)
+  return '#include "' .. typst_path .. '"\n'
+end
+
 --- Write debugging artifacts next to the generated watch input so path rewrite
 --- issues can be inspected from the exact Typst source that was compiled.
 --- @param session typst_watch_session
@@ -614,7 +638,15 @@ end
 --- @param item table|nil
 --- @return boolean, string?
 local function write_preview_sidecar(session, item)
-  return write_file_in_place(session.preview_sidecar_path, build_preview_sidecar_document(session, item))
+  local text = build_preview_sidecar_document(session, item)
+  if session.last_preview_sidecar_text == text then
+    return true
+  end
+  local ok, err = write_file_in_place(session.preview_sidecar_path, text)
+  if ok then
+    session.last_preview_sidecar_text = text
+  end
+  return ok, err
 end
 
 local function preview_tail_include_text(session)
@@ -683,15 +715,21 @@ local function write_session_document(session, mode)
     session.source_root,
     session.effective_root,
     "full",
-    session.prelude_chunks
+    session.prelude_chunks,
+    session.preamble_include_line
   )
   session.line_map = line_map
+  if session.last_input_text == doc_str then
+    return
+  end
   local ok, err = write_file_in_place(session.input_path, doc_str)
   if not ok then
     vim.schedule(function()
       vim.notify("[typst-concealer] failed to update watch input: " .. tostring(err), vim.log.levels.ERROR)
     end)
+    return
   end
+  session.last_input_text = doc_str
 end
 
 --- @param bufnr integer
@@ -1121,6 +1159,7 @@ function M.ensure_watch_session(bufnr)
   end
 
   local preview_sidecar_root_relative_path = path_rewrite.encode_root_relative(preview_sidecar_path, effective_root)
+  local preamble_include_line = resolve_preamble_include_line(bufnr, effective_root, kind)
   local ok_preview, preview_err = write_preview_sidecar({
     bufnr = bufnr,
     buf_dir = buf_dir,
@@ -1128,6 +1167,7 @@ function M.ensure_watch_session(bufnr)
     effective_root = effective_root,
     preview_sidecar_path = preview_sidecar_path,
     prelude_chunks = {},
+    last_preview_sidecar_text = nil,
   }, nil)
   if not ok_preview then
     vim.schedule(function()
@@ -1152,12 +1192,15 @@ function M.ensure_watch_session(bufnr)
     preview_sidecar_item = nil,
     preview_sidecar_path = preview_sidecar_path,
     preview_sidecar_root_relative_path = preview_sidecar_root_relative_path,
+    preamble_include_line = preamble_include_line,
     preview_active = false,
     prelude_chunks = {},
     page_state = {},
     render_start_index = 1,
     poll_interval_ms = nil,
     last_page_count = 0,
+    last_input_text = nil,
+    last_preview_sidecar_text = nil,
     line_map = nil,
     stderr_chunks = {},
     stderr_text = "",
