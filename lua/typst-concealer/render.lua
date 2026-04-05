@@ -34,6 +34,40 @@ local function range_to_string(range, bufnr)
   return table.concat(content, "\n")
 end
 
+local function clamp_range_to_buffer(bufnr, range)
+  if range == nil or not vim.api.nvim_buf_is_valid(bufnr) then
+    return nil
+  end
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+  if line_count <= 0 then
+    return nil
+  end
+
+  local start_row = math.max(0, math.min(range[1], line_count - 1))
+  local end_row = math.max(start_row, math.min(range[3], line_count - 1))
+  local lines = vim.api.nvim_buf_get_lines(bufnr, start_row, end_row + 1, false)
+  if #lines == 0 then
+    return nil
+  end
+
+  local start_col = math.max(0, math.min(range[2], #(lines[1] or "")))
+  local end_col
+  if start_row == end_row then
+    end_col = math.max(start_col, math.min(range[4], #(lines[#lines] or "")))
+  else
+    end_col = math.max(0, math.min(range[4], #(lines[#lines] or "")))
+  end
+
+  return { start_row, start_col, end_row, end_col }
+end
+
+local function get_item_effective_range(item)
+  if item == nil then
+    return nil
+  end
+  return clamp_range_to_buffer(item.bufnr, item.range)
+end
+
 --- Build an index of query-matched block nodes keyed by TSNode:id().
 --- This index is used only for semantic annotation; actual top-level selection
 --- is performed by AST traversal with subtree pruning.
@@ -276,8 +310,12 @@ local function item_blocked_by_error_diagnostics(bufnr, item)
   end
 
   local item_file = normalize_buf_path(vim.api.nvim_buf_get_name(item.bufnr))
-  local start_row = item.range[1] + 1
-  local end_row = item.range[3] + 1
+  local effective_range = get_item_effective_range(item)
+  if effective_range == nil then
+    return false
+  end
+  local start_row = effective_range[1] + 1
+  local end_row = effective_range[3] + 1
   local item_idx = item.item_idx
   for _, diag in ipairs(diagnostics_items) do
     if diag.type == "E" and diag.item_idx ~= nil and item_idx ~= nil and diag.item_idx == item_idx then
@@ -958,12 +996,15 @@ function M.render_buf(bufnr)
     visible_items[#visible_items + 1] = item
   end
   for _, item in ipairs(visible_items) do
-    extmark_to_item[item.extmark_id] = item
-    for row = item.range[1], item.range[3] do
-      if not line_to_items[row] then
-        line_to_items[row] = {}
+    local effective_range = get_item_effective_range(item)
+    if effective_range ~= nil then
+      extmark_to_item[item.extmark_id] = item
+      for row = effective_range[1], effective_range[3] do
+        if not line_to_items[row] then
+          line_to_items[row] = {}
+        end
+        line_to_items[row][#line_to_items[row] + 1] = item
       end
-      line_to_items[row][#line_to_items[row] + 1] = item
     end
   end
   state.buffer_render_state[bufnr].line_to_items = line_to_items
@@ -1042,27 +1083,35 @@ local function restore_one_extmark(bufnr, extmark_id)
   if item == nil or item.natural_cols == nil or item.natural_rows == nil then
     return
   end
+  local effective_range = get_item_effective_range(item)
+  if effective_range == nil then
+    return
+  end
   bs.currently_hidden_extmark_ids[extmark_id] = nil
   require("typst-concealer.extmark").conceal_for_image_id(
     bufnr,
     item.image_id,
     item.natural_cols,
     item.natural_rows,
-    item.source_rows or (item.range[3] - item.range[1] + 1)
+    item.source_rows or (effective_range[3] - effective_range[1] + 1)
   )
 end
 
 local function should_unconceal_item_for_row(item, row, cursor_row, cursor_col)
+  local effective_range = get_item_effective_range(item)
+  if effective_range == nil then
+    return false
+  end
   local sem = item.semantics or {}
   local source_kind = sem.source_kind or item.node_type
   local display_kind = sem.display_kind
-  local sr, _, er, _ = item.range[1], item.range[2], item.range[3], item.range[4]
+  local sr, _, er, _ = effective_range[1], effective_range[2], effective_range[3], effective_range[4]
 
   if sr == er and display_kind == "inline" then
     if row ~= cursor_row then
       return false
     end
-    return cursor_engages_inline_item(item.range, cursor_row, cursor_col)
+    return cursor_engages_inline_item(effective_range, cursor_row, cursor_col)
   end
 
   if source_kind == "math" or source_kind == "code" then
@@ -1495,12 +1544,14 @@ local function find_full_item_at_cursor(bufnr, row, col, mode)
   local candidates = bstate.line_to_items and bstate.line_to_items[row] or bstate.full_items
   local best_item = nil
   for _, item in ipairs(candidates) do
-    if item.node_type == "math" and cursor_engages_inline_item(item.range, row, col, mode) then
+    local effective_range = get_item_effective_range(item)
+    if effective_range ~= nil and item.node_type == "math" and cursor_engages_inline_item(effective_range, row, col, mode) then
       if best_item == nil then
         best_item = item
       else
-        local best_span = (best_item.range[3] - best_item.range[1]) * 100000 + (best_item.range[4] - best_item.range[2])
-        local item_span = (item.range[3] - item.range[1]) * 100000 + (item.range[4] - item.range[2])
+        local best_range = get_item_effective_range(best_item)
+        local best_span = (best_range[3] - best_range[1]) * 100000 + (best_range[4] - best_range[2])
+        local item_span = (effective_range[3] - effective_range[1]) * 100000 + (effective_range[4] - effective_range[2])
         if item_span < best_span then
           best_item = item
         end
@@ -1518,6 +1569,11 @@ local function present_preview_item(bufnr, item, cursor_row, cursor_col)
   end
 
   local bs = state.get_buf_state(bufnr)
+  local effective_range = get_item_effective_range(item)
+  if effective_range == nil then
+    cleanup_preview_image(bufnr)
+    return
+  end
   if not item_has_stable_render(item) then
     if bs.preview_source_image_id == item.image_id and bs.preview_image ~= nil then
       return
@@ -1534,14 +1590,14 @@ local function present_preview_item(bufnr, item, cursor_row, cursor_col)
   end
 
   local extmark = require("typst-concealer.extmark")
-  local vertical = choose_preview_vertical(bufnr, item.range, item.natural_cols, item.natural_rows)
-  local anchor_row = vertical == "above" and item.range[1] or item.range[3]
+  local vertical = choose_preview_vertical(bufnr, effective_range, item.natural_cols, item.natural_rows)
+  local anchor_row = vertical == "above" and effective_range[1] or effective_range[3]
   local prev_visible_image_id = bs.preview_image and bs.preview_image.image_id or nil
   local extmark_id = bs.preview_image and bs.preview_image.extmark_id or nil
   extmark_id =
     extmark.show_virtual_image(bufnr, extmark_id, anchor_row, item.image_id, item.natural_cols, item.natural_rows, {
       above = vertical == "above",
-      left_pad_cols = preview_left_pad_cols(bufnr, item.range),
+      left_pad_cols = preview_left_pad_cols(bufnr, effective_range),
     })
 
   if prev_visible_image_id ~= nil and prev_visible_image_id ~= item.image_id then
@@ -1559,7 +1615,7 @@ local function present_preview_item(bufnr, item, cursor_row, cursor_col)
   }
   bs.preview_source_image_id = item.image_id
   bs.preview_source_page_stamp = item.page_stamp
-  bs.preview_source_range = vim.deepcopy(item.range)
+  bs.preview_source_range = vim.deepcopy(effective_range)
 end
 
 function M.present_rendered_preview_item(bufnr, item)
@@ -1569,19 +1625,24 @@ function M.present_rendered_preview_item(bufnr, item)
   end
 
   local bs = state.get_buf_state(bufnr)
+  local effective_range = get_item_effective_range(item)
+  if effective_range == nil then
+    cleanup_preview_image(bufnr)
+    return
+  end
   if not item_has_stable_render(item) then
     return
   end
 
   local extmark = require("typst-concealer.extmark")
-  local vertical = choose_preview_vertical(bufnr, item.range, item.natural_cols, item.natural_rows)
-  local anchor_row = vertical == "above" and item.range[1] or item.range[3]
+  local vertical = choose_preview_vertical(bufnr, effective_range, item.natural_cols, item.natural_rows)
+  local anchor_row = vertical == "above" and effective_range[1] or effective_range[3]
   local prev_visible_image_id = bs.preview_image and bs.preview_image.image_id or nil
   local extmark_id = bs.preview_image and bs.preview_image.extmark_id or item.extmark_id
   extmark_id =
     extmark.show_virtual_image(bufnr, extmark_id, anchor_row, item.image_id, item.natural_cols, item.natural_rows, {
       above = vertical == "above",
-      left_pad_cols = preview_left_pad_cols(bufnr, item.range),
+      left_pad_cols = preview_left_pad_cols(bufnr, effective_range),
     })
 
   item.extmark_id = extmark_id
@@ -1604,7 +1665,7 @@ function M.present_rendered_preview_item(bufnr, item)
   bs.preview_last_render_key = bs.preview_render_key
   bs.preview_source_image_id = item.source_image_id or item.image_id
   bs.preview_source_page_stamp = item.page_stamp
-  bs.preview_source_range = vim.deepcopy(item.range)
+  bs.preview_source_range = vim.deepcopy(effective_range)
 end
 
 --- Stop the live preview tail page and remove its extmark/image.
