@@ -97,6 +97,9 @@ local function map_generated_pos(line_map, gen_lnum, gen_col)
         lnum = src_lnum,
         col = src_col,
         exact = true,
+        item_idx = seg.item_idx,
+        src_start = seg.src_start,
+        src_end = seg.src_end,
       }
     end
     if gen_lnum < seg.gen_start then
@@ -112,6 +115,9 @@ local function map_generated_pos(line_map, gen_lnum, gen_col)
       lnum = nearest.src_start,
       col = nearest.src_start_col or 1,
       exact = false,
+      item_idx = nearest.item_idx,
+      src_start = nearest.src_start,
+      src_end = nearest.src_end,
     }
   end
 end
@@ -280,6 +286,9 @@ local function resolve_report_location(session, file, lnum, col)
         col = mapped.col,
         exact = true,
         generated = false,
+        item_idx = mapped.item_idx,
+        src_start = mapped.src_start,
+        src_end = mapped.src_end,
       }
     end
 
@@ -287,11 +296,14 @@ local function resolve_report_location(session, file, lnum, col)
     -- original item body. Jump directly to the generated cache file so the
     -- user can inspect the real failing Typst source.
     return {
-      filename = session.input_path,
-      lnum = lnum,
-      col = col,
+      filename = mapped and mapped.filename or session.input_path,
+      lnum = mapped and mapped.lnum or lnum,
+      col = mapped and mapped.col or col,
       exact = true,
       generated = true,
+      item_idx = mapped and mapped.item_idx or nil,
+      src_start = mapped and mapped.src_start or nil,
+      src_end = mapped and mapped.src_end or nil,
     }
   end
 

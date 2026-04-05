@@ -278,7 +278,11 @@ local function item_blocked_by_error_diagnostics(bufnr, item)
   local item_file = normalize_buf_path(vim.api.nvim_buf_get_name(item.bufnr))
   local start_row = item.range[1] + 1
   local end_row = item.range[3] + 1
+  local item_idx = item.item_idx
   for _, diag in ipairs(diagnostics_items) do
+    if diag.type == "E" and diag.item_idx ~= nil and item_idx ~= nil and diag.item_idx == item_idx then
+      return true
+    end
     if diag.type == "E" and normalize_buf_path(diag.filename) == item_file then
       local lnum = tonumber(diag.lnum)
       if lnum ~= nil and lnum >= start_row and lnum <= end_row then
@@ -894,6 +898,7 @@ function M.render_buf(bufnr)
       bufnr = bufnr,
       image_id = image_id,
       extmark_id = ext_id,
+      item_idx = idx,
       range = range,
       str = str,
       prelude_count = prelude_count,
