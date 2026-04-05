@@ -258,6 +258,37 @@ local function clear_diagnostics(bufnr)
   end)
 end
 
+local function normalize_buf_path(path)
+  if path == nil or path == "" then
+    return ""
+  end
+  return vim.fs.normalize(vim.fn.fnamemodify(path, ":p"))
+end
+
+local function item_blocked_by_error_diagnostics(bufnr, item)
+  if item == nil then
+    return false
+  end
+  local bucket = state.watch_diagnostics[bufnr]
+  local diagnostics_items = bucket and bucket.full or nil
+  if diagnostics_items == nil or #diagnostics_items == 0 then
+    return false
+  end
+
+  local item_file = normalize_buf_path(vim.api.nvim_buf_get_name(item.bufnr))
+  local start_row = item.range[1] + 1
+  local end_row = item.range[3] + 1
+  for _, diag in ipairs(diagnostics_items) do
+    if diag.type == "E" and normalize_buf_path(diag.filename) == item_file then
+      local lnum = tonumber(diag.lnum)
+      if lnum ~= nil and lnum >= start_row and lnum <= end_row then
+        return true
+      end
+    end
+  end
+  return false
+end
+
 local function is_insert_like_mode(mode)
   mode = mode or vim.api.nvim_get_mode().mode or ""
   return mode:find("i", 1, true) ~= nil or mode:find("R", 1, true) ~= nil
@@ -838,6 +869,7 @@ function M.render_buf(bufnr)
 
   local prev_items = prev_visible_items
   local batch_items = {}
+  local visible_batch_items = {}
   local lingering_items = {}
   local used_prev = {}
 
@@ -880,10 +912,22 @@ function M.render_buf(bufnr)
     state.item_by_image_id[image_id] = item
   end
 
+  for _, item in ipairs(batch_items) do
+    if item_blocked_by_error_diagnostics(bufnr, item) then
+      cleanup_item(bufnr, item)
+    else
+      visible_batch_items[#visible_batch_items + 1] = item
+    end
+  end
+
   -- Release extmarks/images for items that no longer exist
   for idx, prev_item in ipairs(prev_items) do
     if not used_prev[idx] then
-      if item_has_stable_render(prev_item) and (prev_item.linger_misses or 0) < MAX_LINGER_MISSES then
+      if
+        not item_blocked_by_error_diagnostics(bufnr, prev_item)
+        and item_has_stable_render(prev_item)
+        and (prev_item.linger_misses or 0) < MAX_LINGER_MISSES
+      then
         prev_item.linger_misses = (prev_item.linger_misses or 0) + 1
         lingering_items[#lingering_items + 1] = prev_item
       else
@@ -894,7 +938,7 @@ function M.render_buf(bufnr)
 
   state.buffer_render_state[bufnr] = state.buffer_render_state[bufnr] or {}
   state.buffer_render_state[bufnr].full_units = units
-  state.buffer_render_state[bufnr].full_items = batch_items
+  state.buffer_render_state[bufnr].full_items = visible_batch_items
   state.buffer_render_state[bufnr].lingering_items = lingering_items
   state.buffer_render_state[bufnr].runtime_preludes = state.runtime_preludes
 
@@ -902,7 +946,7 @@ function M.render_buf(bufnr)
   local line_to_items = {}
   local extmark_to_item = {}
   local visible_items = {}
-  for _, item in ipairs(batch_items) do
+  for _, item in ipairs(visible_batch_items) do
     visible_items[#visible_items + 1] = item
   end
   for _, item in ipairs(lingering_items) do
@@ -921,7 +965,7 @@ function M.render_buf(bufnr)
   state.buffer_render_state[bufnr].extmark_to_item = extmark_to_item
 
   vim.schedule(function()
-    session.render_items_via_watch(bufnr, batch_items)
+    session.render_items_via_watch(bufnr, visible_batch_items)
   end)
   -- Reset hover guard so hide_extmarks_at_cursor re-evaluates after render
   state.get_buf_state(bufnr).hover.last_cursor_row = nil
