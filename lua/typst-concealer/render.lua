@@ -39,11 +39,13 @@ end
 --- @param bufnr integer
 --- @param tree TSNode
 --- @param query vim.treesitter.Query
+--- @param start_row integer|nil
+--- @param end_row integer|nil
 --- @return table<integer, table>
-local function build_typst_match_index(bufnr, tree, query)
+local function build_typst_match_index(bufnr, tree, query, start_row, end_row)
   local index = {}
 
-  for _, match, _ in query:iter_matches(tree, bufnr, nil, nil, { all = true }) do
+  for _, match, _ in query:iter_matches(tree, bufnr, start_row, end_row, { all = true }) do
     local block = match[3] and match[3][1]
     if block ~= nil then
       local node_id = block:id()
@@ -72,22 +74,34 @@ local function build_typst_match_index(bufnr, tree, query)
   return index
 end
 
+local function range_overlaps_rows(range, start_row, end_row)
+  return range[3] >= start_row and range[1] <= end_row
+end
+
 --- Traverse AST top-down and collect only maximal / top-level matched units.
 --- If a node is already a matched block, its subtree is pruned.
 --- @param root TSNode
 --- @param match_index table<integer, table>
+--- @param start_row integer|nil
+--- @param end_row integer|nil
 --- @return table[]
-local function collect_top_level_typst_units(root, match_index)
+local function collect_top_level_typst_units(root, match_index, start_row, end_row)
   local units = {}
 
   local function visit(node)
     if node == nil then
       return
     end
+    local sr, _, er, _ = node:range()
+    if start_row ~= nil and end_row ~= nil and (er < start_row or sr > end_row) then
+      return
+    end
 
     local entry = match_index[node:id()]
     if entry ~= nil then
-      units[#units + 1] = entry
+      if start_row == nil or range_overlaps_rows(entry.range, start_row, end_row) then
+        units[#units + 1] = entry
+      end
       return
     end
 
@@ -130,6 +144,90 @@ local function build_render_entries_from_units(bufnr, units)
   end
 
   return render_entries
+end
+
+local function units_overlap_rows(unit, start_row, end_row)
+  return range_overlaps_rows(unit.range, start_row, end_row)
+end
+
+local function expand_rows_to_cover_units(units, start_row, end_row)
+  local expanded_start = start_row
+  local expanded_end = end_row
+  local changed = true
+  while changed do
+    changed = false
+    for _, unit in ipairs(units or {}) do
+      if units_overlap_rows(unit, expanded_start, expanded_end) then
+        if unit.range[1] < expanded_start then
+          expanded_start = unit.range[1]
+          changed = true
+        end
+        if unit.range[3] > expanded_end then
+          expanded_end = unit.range[3]
+          changed = true
+        end
+      end
+    end
+  end
+  return expanded_start, expanded_end
+end
+
+local function can_incrementally_merge_units(prev_units, new_units, start_row, end_row)
+  for _, unit in ipairs(prev_units or {}) do
+    if units_overlap_rows(unit, start_row, end_row) and unit.node_type ~= "math" then
+      return false
+    end
+  end
+  for _, unit in ipairs(new_units or {}) do
+    if unit.node_type ~= "math" then
+      return false
+    end
+  end
+  return true
+end
+
+local function merge_units_in_rows(prev_units, new_units, start_row, end_row)
+  local merged = {}
+  local inserted = false
+  for _, unit in ipairs(prev_units or {}) do
+    if unit.range[3] < start_row then
+      merged[#merged + 1] = unit
+    elseif unit.range[1] > end_row then
+      if not inserted then
+        for _, new_unit in ipairs(new_units or {}) do
+          merged[#merged + 1] = new_unit
+        end
+        inserted = true
+      end
+      merged[#merged + 1] = unit
+    end
+  end
+  if not inserted then
+    for _, new_unit in ipairs(new_units or {}) do
+      merged[#merged + 1] = new_unit
+    end
+  end
+  return merged
+end
+
+local function collect_full_units(bufnr, root, query)
+  local match_index = build_typst_match_index(bufnr, root, query)
+  return collect_top_level_typst_units(root, match_index)
+end
+
+local function collect_incremental_units(bufnr, root, query, prev_units, pending_change)
+  if prev_units == nil or pending_change == nil or pending_change.requires_full then
+    return nil
+  end
+
+  local start_row, end_row =
+    expand_rows_to_cover_units(prev_units, pending_change.start_row, pending_change.new_end_row)
+  local match_index = build_typst_match_index(bufnr, root, query, start_row, end_row + 1)
+  local new_units = collect_top_level_typst_units(root, match_index, start_row, end_row)
+  if not can_incrementally_merge_units(prev_units, new_units, start_row, end_row) then
+    return nil
+  end
+  return merge_units_in_rows(prev_units, new_units, start_row, end_row)
 end
 
 --- Allocate a new image_id for bufnr, scanning for a free slot.
@@ -690,14 +788,19 @@ function M.render_buf(bufnr)
 
   local extmark = require("typst-concealer.extmark")
   local session = require("typst-concealer.session")
+  local bs = state.get_buf_state(bufnr)
+  local prev_state = state.buffer_render_state[bufnr] or {}
 
   local parser = vim.treesitter.get_parser(bufnr, "typst")
   local tree = parser:parse()[1]:root()
+  local units = collect_incremental_units(bufnr, tree, main._typst_query, prev_state.full_units, bs.pending_change)
+  if units == nil then
+    units = collect_full_units(bufnr, tree, main._typst_query)
+  end
+  bs.pending_change = nil
+  local sorted_entries = build_render_entries_from_units(bufnr, units)
 
-  local match_index = build_typst_match_index(bufnr, tree, main._typst_query)
-  local sorted_entries = build_render_entries_from_units(bufnr, collect_top_level_typst_units(tree, match_index))
-
-  local prev_items = (state.buffer_render_state[bufnr] and state.buffer_render_state[bufnr].full_items) or {}
+  local prev_items = prev_state.full_items or {}
   local batch_items = {}
   local used_prev = {}
 
@@ -747,6 +850,7 @@ function M.render_buf(bufnr)
   end
 
   state.buffer_render_state[bufnr] = state.buffer_render_state[bufnr] or {}
+  state.buffer_render_state[bufnr].full_units = units
   state.buffer_render_state[bufnr].full_items = batch_items
   state.buffer_render_state[bufnr].runtime_preludes = state.runtime_preludes
 

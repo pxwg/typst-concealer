@@ -53,7 +53,7 @@ M.watch_sessions = {}
 --- @type { [integer]: { full?: table[] } }
 M.watch_diagnostics = {}
 
---- @type { [integer]: { full_items?: table[], line_to_items?: table, extmark_to_item?: table } }
+--- @type { [integer]: { full_items?: table[], full_units?: table[], line_to_items?: table, extmark_to_item?: table, runtime_preludes?: string[] } }
 M.buffer_render_state = {}
 
 --- Per-buffer mutable render state (extmark, live-preview, conceal transients).
@@ -93,6 +93,8 @@ function M.get_buf_state(bufnr)
         invalidated = false,
         throttle_timer = nil,
       },
+      pending_change = nil,
+      change_tracker_attached = false,
     }
   end
   return M.buffers[bufnr]

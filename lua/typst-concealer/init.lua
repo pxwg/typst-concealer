@@ -282,6 +282,41 @@ function M.setup(cfg)
   local function init_buf(bufnr)
     vim.opt_local.conceallevel = 2
     vim.opt_local.concealcursor = "nci"
+    local bs = require("typst-concealer.state").get_buf_state(bufnr)
+    if not bs.change_tracker_attached then
+      vim.api.nvim_buf_attach(bufnr, false, {
+        on_lines = function(_, buf, _, firstline, lastline, new_lastline)
+          local state_mod = require("typst-concealer.state")
+          local tracked = state_mod.get_buf_state(buf)
+          local old_end_row = math.max(firstline, lastline) - 1
+          local new_end_row = math.max(firstline, new_lastline) - 1
+          local line_delta = new_lastline - lastline
+          local pending = tracked.pending_change
+          if pending == nil then
+            tracked.pending_change = {
+              start_row = firstline,
+              old_end_row = old_end_row,
+              new_end_row = new_end_row,
+              line_delta = line_delta,
+              requires_full = line_delta ~= 0,
+            }
+            return
+          end
+          pending.start_row = math.min(pending.start_row, firstline)
+          pending.old_end_row = math.max(pending.old_end_row, old_end_row)
+          pending.new_end_row = math.max(pending.new_end_row, new_end_row)
+          pending.line_delta = pending.line_delta + line_delta
+          pending.requires_full = pending.requires_full or line_delta ~= 0
+        end,
+        on_detach = function(_, buf)
+          local state_mod = require("typst-concealer.state")
+          local tracked = state_mod.get_buf_state(buf)
+          tracked.change_tracker_attached = false
+          tracked.pending_change = nil
+        end,
+      })
+      bs.change_tracker_attached = true
+    end
     if M.config.enabled_by_default and M.is_render_allowed(bufnr) then
       M._enabled_buffers[bufnr] = true
     else
