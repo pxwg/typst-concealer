@@ -235,14 +235,209 @@ end
 
 M.cleanup_preview_item_request = cleanup_preview_item_request
 
+-- Private copies to avoid circular require with render.lua
+local function clamp_range_to_buffer(bufnr, range)
+  if range == nil or not vim.api.nvim_buf_is_valid(bufnr) then
+    return nil
+  end
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+  if line_count <= 0 then
+    return nil
+  end
+
+  local start_row = math.max(0, math.min(range[1], line_count - 1))
+  local end_row = math.max(start_row, math.min(range[3], line_count - 1))
+  local lines = vim.api.nvim_buf_get_lines(bufnr, start_row, end_row + 1, false)
+  if #lines == 0 then
+    return nil
+  end
+
+  local start_col = math.max(0, math.min(range[2], #(lines[1] or "")))
+  local end_col
+  if start_row == end_row then
+    end_col = math.max(start_col, math.min(range[4], #(lines[#lines] or "")))
+  else
+    end_col = math.max(0, math.min(range[4], #(lines[#lines] or "")))
+  end
+
+  return { start_row, start_col, end_row, end_col }
+end
+
+local function get_item_effective_range(item)
+  if item == nil then
+    return nil
+  end
+  return clamp_range_to_buffer(item.bufnr, item.range)
+end
+
+local function normalize_buf_path(path)
+  if path == nil or path == "" then
+    return ""
+  end
+  return vim.fs.normalize(vim.fn.fnamemodify(path, ":p"))
+end
+
+local function item_has_stable_render(item)
+  return item ~= nil and item.page_path ~= nil and item.natural_cols ~= nil and item.natural_rows ~= nil
+end
+
+local function carry_stable_render_metadata(dst, src)
+  if dst == nil or not item_has_stable_render(src) then
+    return
+  end
+
+  dst.page_path = src.page_path
+  dst.page_stamp = src.page_stamp
+  dst.natural_cols = src.natural_cols
+  dst.natural_rows = src.natural_rows
+  dst.source_rows = src.source_rows
+end
+
+local function item_blocked_by_error_diagnostics(bufnr, item)
+  if item == nil then
+    return false
+  end
+  local bucket = state.watch_diagnostics[bufnr]
+  local diagnostics_items = bucket and bucket.full or nil
+  if diagnostics_items == nil or #diagnostics_items == 0 then
+    return false
+  end
+
+  local item_file = normalize_buf_path(vim.api.nvim_buf_get_name(item.bufnr))
+  local effective_range = get_item_effective_range(item)
+  if effective_range == nil then
+    return false
+  end
+  local start_row = effective_range[1] + 1
+  local end_row = effective_range[3] + 1
+  local item_idx = item.item_idx
+  for _, diag in ipairs(diagnostics_items) do
+    if diag.type == "E" and diag.item_idx ~= nil and item_idx ~= nil and diag.item_idx == item_idx then
+      return true
+    end
+    if diag.type == "E" and normalize_buf_path(diag.filename) == item_file then
+      local lnum = tonumber(diag.lnum)
+      if lnum ~= nil and lnum >= start_row and lnum <= end_row then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+local MAX_LINGER_MISSES = 2
+
 --- Allocate image_ids and extmarks for a batch of PlannedItems,
 --- reusing resources from previous render pass where possible.
 --- @param bufnr integer
 --- @param planned_items PlannedItem[]
 --- @return table[]
 function M.commit_plan(bufnr, planned_items)
-  -- stub: Phase 1.6
-  error("commit_plan not yet implemented")
+  local extmark_mod = require("typst-concealer.extmark")
+
+  local prev_state = state.buffer_render_state[bufnr] or {}
+  local prev_items = {}
+  for _, item in ipairs(prev_state.full_items or {}) do
+    prev_items[#prev_items + 1] = item
+  end
+  for _, item in ipairs(prev_state.lingering_items or {}) do
+    prev_items[#prev_items + 1] = item
+  end
+
+  local batch_items = {}
+  local visible_batch_items = {}
+  local lingering_items = {}
+  local used_prev = {}
+
+  for _, planned in ipairs(planned_items) do
+    local prev_item = find_matching_prev_item(prev_items, planned, used_prev)
+    local image_id, ext_id
+
+    if prev_item ~= nil then
+      image_id = prev_item.image_id
+      ext_id = prev_item.extmark_id
+    else
+      image_id = new_image_id(bufnr)
+      ext_id = extmark_mod.place_render_extmark(bufnr, image_id, planned.display_range, nil, nil, planned.semantics)
+    end
+
+    local item = {
+      bufnr = planned.bufnr,
+      image_id = image_id,
+      extmark_id = ext_id,
+      item_idx = planned.item_idx,
+      range = planned.range,
+      display_range = planned.display_range,
+      display_prefix = planned.display_prefix,
+      display_suffix = planned.display_suffix,
+      str = planned.str,
+      prelude_count = planned.prelude_count,
+      node_type = planned.node_type,
+      semantics = planned.semantics,
+      needs_swap = prev_item ~= nil,
+      linger_misses = nil,
+    }
+
+    carry_stable_render_metadata(item, prev_item)
+
+    batch_items[#batch_items + 1] = item
+    state.item_by_image_id[image_id] = item
+  end
+
+  for _, item in ipairs(batch_items) do
+    if item_blocked_by_error_diagnostics(bufnr, item) then
+      cleanup_item(bufnr, item)
+    else
+      visible_batch_items[#visible_batch_items + 1] = item
+    end
+  end
+
+  -- Release extmarks/images for items that no longer exist
+  for idx, prev_item in ipairs(prev_items) do
+    if not used_prev[idx] then
+      if
+        not item_blocked_by_error_diagnostics(bufnr, prev_item)
+        and item_has_stable_render(prev_item)
+        and (prev_item.linger_misses or 0) < MAX_LINGER_MISSES
+      then
+        prev_item.linger_misses = (prev_item.linger_misses or 0) + 1
+        lingering_items[#lingering_items + 1] = prev_item
+      else
+        cleanup_item(bufnr, prev_item)
+      end
+    end
+  end
+
+  state.buffer_render_state[bufnr] = state.buffer_render_state[bufnr] or {}
+  state.buffer_render_state[bufnr].full_items = visible_batch_items
+  state.buffer_render_state[bufnr].lingering_items = lingering_items
+
+  -- Rebuild per-line item index for O(1) hover lookup
+  local line_to_items = {}
+  local extmark_to_item = {}
+  local visible_items = {}
+  for _, item in ipairs(visible_batch_items) do
+    visible_items[#visible_items + 1] = item
+  end
+  for _, item in ipairs(lingering_items) do
+    visible_items[#visible_items + 1] = item
+  end
+  for _, item in ipairs(visible_items) do
+    local effective_range = get_item_effective_range(item)
+    if effective_range ~= nil then
+      extmark_to_item[item.extmark_id] = item
+      for row = effective_range[1], effective_range[3] do
+        if not line_to_items[row] then
+          line_to_items[row] = {}
+        end
+        line_to_items[row][#line_to_items[row] + 1] = item
+      end
+    end
+  end
+  state.buffer_render_state[bufnr].line_to_items = line_to_items
+  state.buffer_render_state[bufnr].extmark_to_item = extmark_to_item
+
+  return visible_batch_items
 end
 
 --- Apply a rendered page update to the display layer.

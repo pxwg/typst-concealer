@@ -11,7 +11,6 @@ local diagnostics = {}
 
 local PREVIEW_FLOAT_TARGET_RANGE = { 0, 0, 0, 0 }
 local PREVIEW_FLOAT_LINE_COUNT = 2
-local MAX_LINGER_MISSES = 2
 
 local candidate_bounds_penalty
 local candidate_obstacle_penalty
@@ -292,45 +291,6 @@ local function clear_diagnostics(bufnr)
   end)
 end
 
-local function normalize_buf_path(path)
-  if path == nil or path == "" then
-    return ""
-  end
-  return vim.fs.normalize(vim.fn.fnamemodify(path, ":p"))
-end
-
-local function item_blocked_by_error_diagnostics(bufnr, item)
-  if item == nil then
-    return false
-  end
-  local bucket = state.watch_diagnostics[bufnr]
-  local diagnostics_items = bucket and bucket.full or nil
-  if diagnostics_items == nil or #diagnostics_items == 0 then
-    return false
-  end
-
-  local item_file = normalize_buf_path(vim.api.nvim_buf_get_name(item.bufnr))
-  local effective_range = get_item_effective_range(item)
-  if effective_range == nil then
-    return false
-  end
-  local start_row = effective_range[1] + 1
-  local end_row = effective_range[3] + 1
-  local item_idx = item.item_idx
-  for _, diag in ipairs(diagnostics_items) do
-    if diag.type == "E" and diag.item_idx ~= nil and item_idx ~= nil and diag.item_idx == item_idx then
-      return true
-    end
-    if diag.type == "E" and normalize_buf_path(diag.filename) == item_file then
-      local lnum = tonumber(diag.lnum)
-      if lnum ~= nil and lnum >= start_row and lnum <= end_row then
-        return true
-      end
-    end
-  end
-  return false
-end
-
 local function is_insert_like_mode(mode)
   mode = mode or vim.api.nvim_get_mode().mode or ""
   return mode:find("i", 1, true) ~= nil or mode:find("R", 1, true) ~= nil
@@ -338,22 +298,6 @@ end
 
 local function item_has_stable_render(item)
   return item ~= nil and item.page_path ~= nil and item.natural_cols ~= nil and item.natural_rows ~= nil
-end
-
-local function carry_stable_render_metadata(dst, src)
-  if dst == nil or not item_has_stable_render(src) then
-    return
-  end
-
-  dst.page_path = src.page_path
-  dst.page_stamp = src.page_stamp
-  dst.natural_cols = src.natural_cols
-  dst.natural_rows = src.natural_rows
-  dst.source_rows = src.source_rows
-end
-
-local function find_matching_prev_item(prev_items, entry, used_prev)
-  return require("typst-concealer.apply").find_matching_prev_item(prev_items, entry, used_prev)
 end
 
 local function cleanup_item(bufnr, item)
@@ -733,17 +677,9 @@ function M.render_buf(bufnr)
   diagnostics = {}
   state.runtime_preludes = {}
 
-  local extmark = require("typst-concealer.extmark")
   local session = require("typst-concealer.session")
   local bs = state.get_buf_state(bufnr)
   local prev_state = state.buffer_render_state[bufnr] or {}
-  local prev_visible_items = {}
-  for _, item in ipairs(prev_state.full_items or {}) do
-    prev_visible_items[#prev_visible_items + 1] = item
-  end
-  for _, item in ipairs(prev_state.lingering_items or {}) do
-    prev_visible_items[#prev_visible_items + 1] = item
-  end
 
   local parser = vim.treesitter.get_parser(bufnr, "typst")
   local tree = parser:parse()[1]:root()
@@ -754,15 +690,12 @@ function M.render_buf(bufnr)
   bs.pending_change = nil
   local sorted_entries = build_render_entries_from_units(bufnr, units)
 
-  local prev_items = prev_visible_items
-  local batch_items = {}
-  local visible_batch_items = {}
-  local lingering_items = {}
-  local used_prev = {}
+  local apply = require("typst-concealer.apply")
 
+  -- Build PlannedItems from sorted_entries
+  local planned_items = {}
   for idx, entry in ipairs(sorted_entries) do
     local range, prelude_count, node_type = entry.range, entry.prelude_count, entry.node_type
-    -- Unified semantic classification: replaces is_block_formula + classify_layout_kind
     local sem = semantics_mod.classify(range, bufnr, node_type)
     local str = range_to_string(range, bufnr)
     local display_range = range
@@ -779,21 +712,8 @@ function M.render_buf(bufnr)
       end
     end
 
-    local prev_item = find_matching_prev_item(prev_items, entry, used_prev)
-    local image_id, ext_id
-
-    if prev_item ~= nil then
-      image_id = prev_item.image_id
-      ext_id = prev_item.extmark_id
-    else
-      image_id = new_image_id(bufnr)
-      ext_id = extmark.place_render_extmark(bufnr, image_id, display_range, nil, nil, sem)
-    end
-
-    local item = {
+    planned_items[#planned_items + 1] = {
       bufnr = bufnr,
-      image_id = image_id,
-      extmark_id = ext_id,
       item_idx = idx,
       range = range,
       display_range = display_range,
@@ -802,74 +722,15 @@ function M.render_buf(bufnr)
       str = str,
       prelude_count = prelude_count,
       node_type = node_type,
-      semantics = sem, -- unified: replaces layout_kind/is_block/display_as_block
-      needs_swap = prev_item ~= nil,
+      semantics = sem,
     }
-    item.linger_misses = nil
-
-    -- Preserve the last stable rendered page metadata while a fresh watch update
-    -- is in flight. This prevents both concealed block renders and inline live
-    -- preview consumers from dropping to an empty state before the next page is ready.
-    carry_stable_render_metadata(item, prev_item)
-
-    batch_items[#batch_items + 1] = item
-    state.item_by_image_id[image_id] = item
-  end
-
-  for _, item in ipairs(batch_items) do
-    if item_blocked_by_error_diagnostics(bufnr, item) then
-      cleanup_item(bufnr, item)
-    else
-      visible_batch_items[#visible_batch_items + 1] = item
-    end
-  end
-
-  -- Release extmarks/images for items that no longer exist
-  for idx, prev_item in ipairs(prev_items) do
-    if not used_prev[idx] then
-      if
-        not item_blocked_by_error_diagnostics(bufnr, prev_item)
-        and item_has_stable_render(prev_item)
-        and (prev_item.linger_misses or 0) < MAX_LINGER_MISSES
-      then
-        prev_item.linger_misses = (prev_item.linger_misses or 0) + 1
-        lingering_items[#lingering_items + 1] = prev_item
-      else
-        cleanup_item(bufnr, prev_item)
-      end
-    end
   end
 
   state.buffer_render_state[bufnr] = state.buffer_render_state[bufnr] or {}
   state.buffer_render_state[bufnr].full_units = units
-  state.buffer_render_state[bufnr].full_items = visible_batch_items
-  state.buffer_render_state[bufnr].lingering_items = lingering_items
   state.buffer_render_state[bufnr].runtime_preludes = state.runtime_preludes
 
-  -- Rebuild per-line item index for O(1) hover lookup
-  local line_to_items = {}
-  local extmark_to_item = {}
-  local visible_items = {}
-  for _, item in ipairs(visible_batch_items) do
-    visible_items[#visible_items + 1] = item
-  end
-  for _, item in ipairs(lingering_items) do
-    visible_items[#visible_items + 1] = item
-  end
-  for _, item in ipairs(visible_items) do
-    local effective_range = get_item_effective_range(item)
-    if effective_range ~= nil then
-      extmark_to_item[item.extmark_id] = item
-      for row = effective_range[1], effective_range[3] do
-        if not line_to_items[row] then
-          line_to_items[row] = {}
-        end
-        line_to_items[row][#line_to_items[row] + 1] = item
-      end
-    end
-  end
-  state.buffer_render_state[bufnr].line_to_items = line_to_items
-  state.buffer_render_state[bufnr].extmark_to_item = extmark_to_item
+  local visible_batch_items = apply.commit_plan(bufnr, planned_items)
 
   vim.schedule(function()
     session.render_items_via_watch(bufnr, visible_batch_items)
