@@ -865,7 +865,6 @@ end
 --- @param page_stamp     string
 local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original_range, page_stamp)
   local pngData = require("typst-concealer.png-lua")
-  local extmark = require("typst-concealer.extmark")
   local kitty_codes = require("typst-concealer.kitty-codes")
 
   local item = state.get_item_by_image_id(image_id)
@@ -873,23 +872,11 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
     return
   end
 
-  local target_bufnr = bufnr
   local target_range = original_range
   if item and item.render_target == "float" then
-    target_bufnr = item.target_bufnr or bufnr
     target_range = item.target_range or original_range
   end
-  if not vim.api.nvim_buf_is_valid(target_bufnr) then
-    return
-  end
-  if state.image_id_to_extmark[image_id] ~= extmark_id then
-    return
-  end
-  local ok_mark, mark =
-    pcall(vim.api.nvim_buf_get_extmark_by_id, target_bufnr, state.ns_id, extmark_id, { details = true })
-  if not ok_mark or mark == nil or #mark == 0 then
-    return
-  end
+
   local expected_str = item.source_str or item.str
   if expected_str ~= nil and range_to_string(item.bufnr, item.range) ~= expected_str then
     return
@@ -928,42 +915,17 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
     natural_cols = #kitty_codes.diacritics - 1
   end
 
-  if item ~= nil then
-    item.natural_cols = natural_cols
-    item.natural_rows = natural_rows
-    item.source_rows = source_rows
-    item.page_path = page_path
-    item.page_stamp = page_stamp
-  end
-
-  -- Swap extmark to new range when the new image is ready.
-  -- item.semantics drives the is_block decision (replaces display_as_block boolean).
-  local bstate = state.buffer_render_state[bufnr]
-  if bstate and bstate.full_items then
-    for _, item in ipairs(bstate.full_items) do
-      if item.image_id == image_id then
-        if item.needs_swap then
-          extmark.swap_extmark_to_range(bufnr, image_id, extmark_id, item.display_range or item.range, item.semantics)
-          item.needs_swap = false
-        end
-        break
-      end
-    end
-  end
-
-  extmark.create_image(page_path, image_id, natural_cols, natural_rows)
-  if item ~= nil and item.render_target == "preview_float" then
-    require("typst-concealer.render").present_rendered_preview_item(target_bufnr, item)
-    return
-  end
-  extmark.conceal_for_image_id(target_bufnr, image_id, natural_cols, natural_rows, source_rows)
-  -- A fresh page render repaints extmarks asynchronously after the last cursor
-  -- hover decision may already have been cached. Force hover recomputation so a
-  -- block currently under the cursor is hidden again instead of briefly
-  -- coexisting with the live preview / source text.
-  require("typst-concealer.state").get_buf_state(bufnr).hover.invalidated = true
-  require("typst-concealer.render").hide_extmarks_at_cursor(bufnr)
-  require("typst-concealer.render").render_live_typst_preview(bufnr)
+  require("typst-concealer.apply").accept_page_update({
+    bufnr = bufnr,
+    image_id = image_id,
+    extmark_id = extmark_id,
+    original_range = original_range,
+    page_path = page_path,
+    page_stamp = page_stamp,
+    natural_cols = natural_cols,
+    natural_rows = natural_rows,
+    source_rows = source_rows,
+  })
 end
 
 --- @param session typst_watch_session
