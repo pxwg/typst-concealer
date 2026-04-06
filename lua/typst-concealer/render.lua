@@ -416,19 +416,8 @@ local function find_matching_prev_item(prev_items, entry, used_prev)
   return best_item
 end
 
---- Release all resources for a single render item.
---- @param bufnr   integer
---- @param item    table|nil
 local function cleanup_item(bufnr, item)
-  if item == nil then
-    return
-  end
-  local extmark = require("typst-concealer.extmark")
-  state.prepare_extmark_reuse(bufnr, item.extmark_id)
-  pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id, item.extmark_id)
-  extmark.clear_image(item.image_id)
-  state.image_id_to_extmark[item.image_id] = nil
-  state.item_by_image_id[item.image_id] = nil
+  return require("typst-concealer.apply").cleanup_item(bufnr, item)
 end
 
 local function cleanup_preview_image(bufnr)

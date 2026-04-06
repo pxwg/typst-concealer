@@ -60,6 +60,23 @@ end
 
 M._new_image_id = new_image_id
 
+--- Release all resources for a single render item.
+--- @param bufnr   integer
+--- @param item    table|nil
+local function cleanup_item(bufnr, item)
+  if item == nil then
+    return
+  end
+  local extmark = require("typst-concealer.extmark")
+  state.prepare_extmark_reuse(bufnr, item.extmark_id)
+  pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id, item.extmark_id)
+  extmark.clear_image(item.image_id)
+  state.image_id_to_extmark[item.image_id] = nil
+  state.item_by_image_id[item.image_id] = nil
+end
+
+M.cleanup_item = cleanup_item
+
 --- Allocate image_ids and extmarks for a batch of PlannedItems,
 --- reusing resources from previous render pass where possible.
 --- @param bufnr integer
