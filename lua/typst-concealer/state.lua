@@ -1,5 +1,7 @@
 --- Shared mutable state for typst-concealer.
---- All modules read/write these tables directly; Lua module caching guarantees a single instance.
+--- Lua module caching guarantees a single instance.
+--- Write access is intentionally concentrated: apply.lua owns resource indices,
+--- plan.lua owns per-buffer render state; session.lua owns watch sessions.
 local M = {}
 
 --- Neovim extmark namespaces
