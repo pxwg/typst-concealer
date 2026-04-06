@@ -501,13 +501,13 @@ function M.accept_page_update(update)
 
   extmark_mod.create_image(page_path, image_id, natural_cols, natural_rows)
   if item ~= nil and item.render_target == "preview_float" then
-    require("typst-concealer.render").present_rendered_preview_item(target_bufnr, item)
+    require("typst-concealer.plan").present_rendered_preview_item(target_bufnr, item)
     return
   end
   extmark_mod.conceal_for_image_id(target_bufnr, image_id, natural_cols, natural_rows, source_rows)
   state.get_buf_state(bufnr).hover.invalidated = true
-  require("typst-concealer.render").hide_extmarks_at_cursor(bufnr)
-  require("typst-concealer.render").render_live_typst_preview(bufnr)
+  require("typst-concealer.plan").hide_extmarks_at_cursor(bufnr)
+  require("typst-concealer.plan").render_live_typst_preview(bufnr)
 end
 
 --- Release all resources for a buffer and reset render state.
