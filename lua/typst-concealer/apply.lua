@@ -451,8 +451,37 @@ end
 --- Release all resources for a buffer and reset render state.
 --- @param bufnr integer
 function M.hard_reset(bufnr)
-  -- stub: Phase 1.7
-  error("hard_reset not yet implemented")
+  local extmark_mod = require("typst-concealer.extmark")
+  local bstate = state.buffer_render_state[bufnr]
+  if bstate and bstate.full_items then
+    for _, item in ipairs(bstate.full_items) do
+      cleanup_item(bufnr, item)
+    end
+  end
+  if bstate and bstate.lingering_items then
+    for _, item in ipairs(bstate.lingering_items) do
+      cleanup_item(bufnr, item)
+    end
+  end
+  state.buffer_render_state[bufnr] = nil
+
+  -- Remove only entries belonging to this buffer from the shared O(1) index
+  local to_remove = {}
+  for image_id, item in pairs(state.item_by_image_id) do
+    if item.bufnr == bufnr then
+      to_remove[#to_remove + 1] = image_id
+    end
+  end
+  for _, image_id in ipairs(to_remove) do
+    state.item_by_image_id[image_id] = nil
+  end
+  state.runtime_preludes = {}
+
+  for id, image_bufnr in pairs(state.image_ids_in_use) do
+    if bufnr == image_bufnr then
+      extmark_mod.clear_image(id)
+    end
+  end
 end
 
 return M

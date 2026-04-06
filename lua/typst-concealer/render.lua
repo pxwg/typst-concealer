@@ -620,44 +620,13 @@ end
 --- Full reset of all concealer state for a buffer (called on disable or wipeout).
 --- @param bufnr integer
 function M.hard_reset_buf(bufnr)
-  local extmark = require("typst-concealer.extmark")
   state.clear_hover_timer(bufnr)
   state.clear_preview_timer(bufnr)
-  local bstate = state.buffer_render_state[bufnr]
-  if bstate and bstate.full_items then
-    for _, item in ipairs(bstate.full_items) do
-      cleanup_item(bufnr, item)
-    end
-  end
-  if bstate and bstate.lingering_items then
-    for _, item in ipairs(bstate.lingering_items) do
-      cleanup_item(bufnr, item)
-    end
-  end
-  state.buffer_render_state[bufnr] = nil
-
+  require("typst-concealer.apply").hard_reset(bufnr)
   vim.api.nvim_buf_clear_namespace(bufnr, state.ns_id, 0, -1)
   vim.api.nvim_buf_clear_namespace(bufnr, state.ns_id2, 0, -1)
-
   state.buffers[bufnr] = nil
   diagnostics = {}
-  -- Remove only entries belonging to this buffer from the shared O(1) index
-  local to_remove = {}
-  for image_id, item in pairs(state.item_by_image_id) do
-    if item.bufnr == bufnr then
-      to_remove[#to_remove + 1] = image_id
-    end
-  end
-  for _, image_id in ipairs(to_remove) do
-    state.item_by_image_id[image_id] = nil
-  end
-  state.runtime_preludes = {}
-
-  for id, image_bufnr in pairs(state.image_ids_in_use) do
-    if bufnr == image_bufnr then
-      extmark.clear_image(id)
-    end
-  end
 end
 
 --- Re-render all Typst nodes in bufnr.
