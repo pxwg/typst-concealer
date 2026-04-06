@@ -361,95 +361,11 @@ local function cleanup_item(bufnr, item)
 end
 
 local function cleanup_preview_image(bufnr)
-  local bs = state.get_buf_state(bufnr)
-  local preview = bs.preview_image
-  local last_rendered = bs.preview_last_rendered_item
-  if preview == nil then
-    if bs.preview_item ~= nil then
-      if bs.preview_item.extmark_id ~= nil then
-        state.prepare_extmark_reuse(bufnr, bs.preview_item.extmark_id)
-        pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id, bs.preview_item.extmark_id)
-      end
-    end
-    if bs.preview_item ~= nil and bs.preview_item.image_id ~= nil then
-      local extmark = require("typst-concealer.extmark")
-      extmark.clear_image(bs.preview_item.image_id)
-      state.image_id_to_extmark[bs.preview_item.image_id] = nil
-      state.item_by_image_id[bs.preview_item.image_id] = nil
-      state.image_ids_in_use[bs.preview_item.image_id] = nil
-    end
-    bs.preview_item = nil
-    if last_rendered ~= nil and last_rendered.image_id ~= nil then
-      local extmark = require("typst-concealer.extmark")
-      extmark.clear_image(last_rendered.image_id)
-      state.image_id_to_extmark[last_rendered.image_id] = nil
-      state.item_by_image_id[last_rendered.image_id] = nil
-      state.image_ids_in_use[last_rendered.image_id] = nil
-    end
-    bs.preview_last_rendered_item = nil
-    bs.preview_last_render_key = nil
-    bs.preview_render_key = nil
-    bs.preview_source_image_id = nil
-    bs.preview_source_page_stamp = nil
-    bs.preview_source_range = nil
-    return
-  end
-
-  local extmark = require("typst-concealer.extmark")
-  local target_bufnr = preview.target_bufnr or bufnr
-  state.prepare_extmark_reuse(target_bufnr, preview.extmark_id)
-  pcall(vim.api.nvim_buf_del_extmark, target_bufnr, state.ns_id, preview.extmark_id)
-  if preview.image_id ~= nil then
-    extmark.clear_image(preview.image_id)
-    state.image_id_to_extmark[preview.image_id] = nil
-    state.item_by_image_id[preview.image_id] = nil
-    state.image_ids_in_use[preview.image_id] = nil
-  end
-  if bs.preview_item ~= nil and bs.preview_item.image_id ~= nil and bs.preview_item.image_id ~= preview.image_id then
-    extmark.clear_image(bs.preview_item.image_id)
-    state.image_id_to_extmark[bs.preview_item.image_id] = nil
-    state.item_by_image_id[bs.preview_item.image_id] = nil
-    state.image_ids_in_use[bs.preview_item.image_id] = nil
-  end
-  if
-    last_rendered ~= nil
-    and last_rendered.image_id ~= nil
-    and last_rendered.image_id ~= preview.image_id
-    and (bs.preview_item == nil or last_rendered.image_id ~= bs.preview_item.image_id)
-  then
-    extmark.clear_image(last_rendered.image_id)
-    state.image_id_to_extmark[last_rendered.image_id] = nil
-    state.item_by_image_id[last_rendered.image_id] = nil
-    state.image_ids_in_use[last_rendered.image_id] = nil
-  end
-  bs.preview_image = nil
-  bs.preview_item = nil
-  bs.preview_last_rendered_item = nil
-  bs.preview_last_render_key = nil
-  bs.preview_render_key = nil
-  bs.preview_source_image_id = nil
-  bs.preview_source_page_stamp = nil
-  bs.preview_source_range = nil
+  return require("typst-concealer.apply").cleanup_preview_image(bufnr)
 end
 
 local function cleanup_preview_item_request(bufnr, item, opts)
-  if item == nil then
-    return
-  end
-
-  opts = opts or {}
-  if item.image_id ~= nil then
-    local extmark = require("typst-concealer.extmark")
-    extmark.clear_image(item.image_id)
-    state.image_id_to_extmark[item.image_id] = nil
-    state.item_by_image_id[item.image_id] = nil
-    state.image_ids_in_use[item.image_id] = nil
-  end
-
-  if opts.keep_extmark ~= true and item.extmark_id ~= nil then
-    state.prepare_extmark_reuse(bufnr, item.extmark_id)
-    pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id, item.extmark_id)
-  end
+  return require("typst-concealer.apply").cleanup_preview_item_request(bufnr, item, opts)
 end
 
 local function get_text_slice(bufnr, start_row, start_col, end_row, end_col)
