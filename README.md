@@ -40,7 +40,7 @@ end)
 ## Features
 - (Maybe) highest resolution typst rendering in neovim community.
 - More configurations aimed for multiple files projects.
-- Live previews when in insert mode with float window (WIP: does not support top level set/let/import)
+- Live previews when in insert mode with float window
 - Supports top level set/let/import
 - Renders code blocks
 - Renders math blocks
@@ -161,6 +161,5 @@ require("typst-concealer").setup({
 Then the crash should be avoided, and you can still have your actual theme/conf when you render the pdf/html.
 
 ## TODO
-- [ ] Support top level set/let/import when in live insert mode previews
 - [ ] Investigate weird rendering bug with transparency
 - [ ] Write some better documentation. Investigate what the best way of doing it is.
