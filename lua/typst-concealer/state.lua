@@ -103,9 +103,18 @@ function M.get_buf_state(bufnr)
 end
 
 --- O(1) flat index: image_id -> item.  Covers both full-render and live-preview items.
---- Maintained by render.lua (insert on create, delete on cleanup/reset).
+--- Maintained by apply.lua (insert on create, delete on cleanup/reset).
 --- @type { [integer]: table }
 M.item_by_image_id = {}
+
+--- UI reaction hooks registered by plan.lua at module load time.
+--- Allows apply.lua to trigger post-page-commit UI reactions without a
+--- direct reverse require("typst-concealer.plan") dependency.
+--- @type { on_page_committed: (fun(bufnr: integer)|nil), present_rendered_preview_item: (fun(bufnr: integer, item: table)|nil) }
+M.hooks = {
+  on_page_committed = nil,
+  present_rendered_preview_item = nil,
+}
 
 --- Prelude strings accumulated during the current render_buf pass
 --- @type string[]

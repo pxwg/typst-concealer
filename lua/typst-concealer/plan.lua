@@ -1448,4 +1448,14 @@ function M.render_live_typst_preview(bufnr)
   M.clear_live_typst_preview(bufnr)
 end
 
+-- Register post-render UI reaction hooks so apply.lua can trigger them
+-- without a direct reverse require("typst-concealer.plan") dependency.
+state.hooks.on_page_committed = function(bufnr)
+  M.hide_extmarks_at_cursor(bufnr)
+  M.render_live_typst_preview(bufnr)
+end
+state.hooks.present_rendered_preview_item = function(bufnr, item)
+  M.present_rendered_preview_item(bufnr, item)
+end
+
 return M
