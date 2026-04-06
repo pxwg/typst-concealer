@@ -440,6 +440,121 @@ function M.commit_plan(bufnr, planned_items)
   return visible_batch_items
 end
 
+--- Display a preview item's image in virtual lines (no stable-render required).
+--- @param bufnr  integer
+--- @param item   table    AppliedItem with natural_cols/rows
+--- @param layout table    { vertical: string, anchor_row: integer, left_pad_cols: integer, effective_range: table }
+function M.show_preview_item(bufnr, item, layout)
+  local extmark_mod = require("typst-concealer.extmark")
+  local bs = state.get_buf_state(bufnr)
+
+  local prev_visible_image_id = bs.preview_image and bs.preview_image.image_id or nil
+  local extmark_id = bs.preview_image and bs.preview_image.extmark_id or nil
+  extmark_id = extmark_mod.show_virtual_image(
+    bufnr,
+    extmark_id,
+    layout.anchor_row,
+    item.image_id,
+    item.natural_cols,
+    item.natural_rows,
+    { above = layout.vertical == "above", left_pad_cols = layout.left_pad_cols }
+  )
+
+  if prev_visible_image_id ~= nil and prev_visible_image_id ~= item.image_id then
+    extmark_mod.clear_image(prev_visible_image_id)
+    state.image_id_to_extmark[prev_visible_image_id] = nil
+    state.item_by_image_id[prev_visible_image_id] = nil
+    state.image_ids_in_use[prev_visible_image_id] = nil
+  end
+
+  bs.preview_image = {
+    extmark_id = extmark_id,
+    target_bufnr = bufnr,
+    natural_cols = item.natural_cols,
+    natural_rows = item.natural_rows,
+  }
+  bs.preview_source_image_id = item.image_id
+  bs.preview_source_page_stamp = item.page_stamp
+  bs.preview_source_range = vim.deepcopy(layout.effective_range)
+end
+
+--- Display a rendered preview item and update all tracking state.
+--- @param bufnr  integer
+--- @param item   table
+--- @param layout table   { vertical: string, anchor_row: integer, left_pad_cols: integer, effective_range: table }
+function M.show_rendered_preview_item(bufnr, item, layout)
+  local extmark_mod = require("typst-concealer.extmark")
+  local bs = state.get_buf_state(bufnr)
+
+  local prev_visible_image_id = bs.preview_image and bs.preview_image.image_id or nil
+  local extmark_id = bs.preview_image and bs.preview_image.extmark_id or item.extmark_id
+  extmark_id = extmark_mod.show_virtual_image(
+    bufnr,
+    extmark_id,
+    layout.anchor_row,
+    item.image_id,
+    item.natural_cols,
+    item.natural_rows,
+    { above = layout.vertical == "above", left_pad_cols = layout.left_pad_cols }
+  )
+
+  item.extmark_id = extmark_id
+  state.image_id_to_extmark[item.image_id] = extmark_id
+  if prev_visible_image_id ~= nil and prev_visible_image_id ~= item.image_id then
+    extmark_mod.clear_image(prev_visible_image_id)
+    state.image_id_to_extmark[prev_visible_image_id] = nil
+    state.item_by_image_id[prev_visible_image_id] = nil
+    state.image_ids_in_use[prev_visible_image_id] = nil
+  end
+  bs.preview_image = {
+    extmark_id = extmark_id,
+    target_bufnr = bufnr,
+    natural_cols = item.natural_cols,
+    natural_rows = item.natural_rows,
+    image_id = item.image_id,
+  }
+  bs.preview_item = item
+  bs.preview_last_rendered_item = item
+  bs.preview_last_render_key = bs.preview_render_key
+  bs.preview_source_image_id = item.source_image_id or item.image_id
+  bs.preview_source_page_stamp = item.page_stamp
+  bs.preview_source_range = vim.deepcopy(layout.effective_range)
+end
+
+--- Allocate a preview item (new image_id + extmark) and register it in state indices.
+--- @param bufnr             integer
+--- @param source_item       table   full AppliedItem under cursor
+--- @param preview_str       string
+--- @param source_str        string
+--- @param render_key        string
+--- @param shared_extmark_id integer|nil  reuse extmark from previous preview if available
+--- @return table  preview_item
+function M.allocate_preview_item(bufnr, source_item, preview_str, source_str, render_key, shared_extmark_id)
+  local extmark_id = shared_extmark_id
+  if extmark_id == nil then
+    extmark_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, source_item.range[3], 0, { invalidate = true })
+  end
+  local preview_item = {
+    bufnr = bufnr,
+    image_id = new_image_id(bufnr),
+    extmark_id = extmark_id,
+    range = vim.deepcopy(source_item.range),
+    str = preview_str,
+    source_str = source_str,
+    prelude_count = source_item.prelude_count,
+    node_type = "math",
+    semantics = source_item.semantics,
+    render_target = "preview_float",
+    source_image_id = source_item.image_id,
+  }
+  state.image_id_to_extmark[preview_item.image_id] = extmark_id
+  state.item_by_image_id[preview_item.image_id] = preview_item
+  local bs = state.get_buf_state(bufnr)
+  bs.preview_item = preview_item
+  bs.preview_render_key = render_key
+  return preview_item
+end
+
 --- Apply a rendered page update to the display layer.
 --- @param update PageUpdate
 function M.accept_page_update(update)
@@ -447,7 +562,6 @@ function M.accept_page_update(update)
   local bufnr = update.bufnr
   local image_id = update.image_id
   local extmark_id = update.extmark_id
-  local original_range = update.original_range
   local page_path = update.page_path
   local page_stamp = update.page_stamp
   local natural_cols = update.natural_cols
@@ -460,10 +574,8 @@ function M.accept_page_update(update)
   end
 
   local target_bufnr = bufnr
-  local target_range = original_range
   if item and item.render_target == "float" then
     target_bufnr = item.target_bufnr or bufnr
-    target_range = item.target_range or original_range
   end
   if not vim.api.nvim_buf_is_valid(target_bufnr) then
     return

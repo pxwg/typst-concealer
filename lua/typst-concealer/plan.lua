@@ -1288,33 +1288,13 @@ local function present_preview_item(bufnr, item, cursor_row, cursor_col)
     return
   end
 
-  local extmark = require("typst-concealer.extmark")
   local vertical = choose_preview_vertical(bufnr, effective_range, item.natural_cols, item.natural_rows)
-  local anchor_row = vertical == "above" and effective_range[1] or effective_range[3]
-  local prev_visible_image_id = bs.preview_image and bs.preview_image.image_id or nil
-  local extmark_id = bs.preview_image and bs.preview_image.extmark_id or nil
-  extmark_id =
-    extmark.show_virtual_image(bufnr, extmark_id, anchor_row, item.image_id, item.natural_cols, item.natural_rows, {
-      above = vertical == "above",
-      left_pad_cols = preview_left_pad_cols(bufnr, effective_range),
-    })
-
-  if prev_visible_image_id ~= nil and prev_visible_image_id ~= item.image_id then
-    extmark.clear_image(prev_visible_image_id)
-    state.image_id_to_extmark[prev_visible_image_id] = nil
-    state.item_by_image_id[prev_visible_image_id] = nil
-    state.image_ids_in_use[prev_visible_image_id] = nil
-  end
-
-  bs.preview_image = {
-    extmark_id = extmark_id,
-    target_bufnr = bufnr,
-    natural_cols = item.natural_cols,
-    natural_rows = item.natural_rows,
-  }
-  bs.preview_source_image_id = item.image_id
-  bs.preview_source_page_stamp = item.page_stamp
-  bs.preview_source_range = vim.deepcopy(effective_range)
+  require("typst-concealer.apply").show_preview_item(bufnr, item, {
+    vertical = vertical,
+    anchor_row = vertical == "above" and effective_range[1] or effective_range[3],
+    left_pad_cols = preview_left_pad_cols(bufnr, effective_range),
+    effective_range = effective_range,
+  })
 end
 
 function M.present_rendered_preview_item(bufnr, item)
@@ -1323,7 +1303,6 @@ function M.present_rendered_preview_item(bufnr, item)
     return
   end
 
-  local bs = state.get_buf_state(bufnr)
   local effective_range = get_item_effective_range(item)
   if effective_range == nil then
     cleanup_preview_image(bufnr)
@@ -1333,38 +1312,13 @@ function M.present_rendered_preview_item(bufnr, item)
     return
   end
 
-  local extmark = require("typst-concealer.extmark")
   local vertical = choose_preview_vertical(bufnr, effective_range, item.natural_cols, item.natural_rows)
-  local anchor_row = vertical == "above" and effective_range[1] or effective_range[3]
-  local prev_visible_image_id = bs.preview_image and bs.preview_image.image_id or nil
-  local extmark_id = bs.preview_image and bs.preview_image.extmark_id or item.extmark_id
-  extmark_id =
-    extmark.show_virtual_image(bufnr, extmark_id, anchor_row, item.image_id, item.natural_cols, item.natural_rows, {
-      above = vertical == "above",
-      left_pad_cols = preview_left_pad_cols(bufnr, effective_range),
-    })
-
-  item.extmark_id = extmark_id
-  state.image_id_to_extmark[item.image_id] = extmark_id
-  if prev_visible_image_id ~= nil and prev_visible_image_id ~= item.image_id then
-    extmark.clear_image(prev_visible_image_id)
-    state.image_id_to_extmark[prev_visible_image_id] = nil
-    state.item_by_image_id[prev_visible_image_id] = nil
-    state.image_ids_in_use[prev_visible_image_id] = nil
-  end
-  bs.preview_image = {
-    extmark_id = extmark_id,
-    target_bufnr = bufnr,
-    natural_cols = item.natural_cols,
-    natural_rows = item.natural_rows,
-    image_id = item.image_id,
-  }
-  bs.preview_item = item
-  bs.preview_last_rendered_item = item
-  bs.preview_last_render_key = bs.preview_render_key
-  bs.preview_source_image_id = item.source_image_id or item.image_id
-  bs.preview_source_page_stamp = item.page_stamp
-  bs.preview_source_range = vim.deepcopy(effective_range)
+  require("typst-concealer.apply").show_rendered_preview_item(bufnr, item, {
+    vertical = vertical,
+    anchor_row = vertical == "above" and effective_range[1] or effective_range[3],
+    left_pad_cols = preview_left_pad_cols(bufnr, effective_range),
+    effective_range = effective_range,
+  })
 end
 
 --- Stop the live preview tail page and remove its extmark/image.
@@ -1476,28 +1430,14 @@ function M.render_live_typst_preview(bufnr)
       cleanup_preview_item_request(bufnr, bs.preview_item, { keep_extmark = shared_extmark_id ~= nil })
     end
 
-    local extmark_id = shared_extmark_id
-    if extmark_id == nil then
-      extmark_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, item.range[3], 0, { invalidate = true })
-    end
-    local preview_item = {
-      bufnr = bufnr,
-      image_id = new_image_id(bufnr),
-      extmark_id = extmark_id,
-      range = vim.deepcopy(item.range),
-      str = preview_str,
-      source_str = source_str,
-      prelude_count = item.prelude_count,
-      node_type = "math",
-      semantics = item.semantics,
-      render_target = "preview_float",
-      source_image_id = item.image_id,
-    }
-    state.image_id_to_extmark[preview_item.image_id] = extmark_id
-    state.item_by_image_id[preview_item.image_id] = preview_item
-    bs.preview_item = preview_item
-    bs.preview_render_key = render_key
-
+    local preview_item = require("typst-concealer.apply").allocate_preview_item(
+      bufnr,
+      item,
+      preview_str,
+      source_str,
+      render_key,
+      shared_extmark_id
+    )
     require("typst-concealer.session").render_preview_tail(bufnr, preview_item)
     return
   end
