@@ -68,6 +68,23 @@ local function get_item_effective_range(item)
   return clamp_range_to_buffer(item.bufnr, item.range)
 end
 
+local function full_line_range(bufnr, row)
+  local line = (vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false) or { "" })[1] or ""
+  return { row, 0, row, #line }
+end
+
+local function line_text(bufnr, row)
+  return (vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false) or { "" })[1] or ""
+end
+
+local function trim_right(s)
+  return (s or ""):gsub("%s+$", "")
+end
+
+local function trim_left(s)
+  return (s or ""):gsub("^%s+", "")
+end
+
 --- Build an index of query-matched block nodes keyed by TSNode:id().
 --- This index is used only for semantic annotation; actual top-level selection
 --- is performed by AST traversal with subtree pruning.
@@ -920,6 +937,19 @@ function M.render_buf(bufnr)
     -- Unified semantic classification: replaces is_block_formula + classify_layout_kind
     local sem = semantics_mod.classify(range, bufnr, node_type)
     local str = range_to_string(range, bufnr)
+    local display_range = range
+    local display_prefix = nil
+    local display_suffix = nil
+
+    if node_type == "math" and sem.display_kind == "block" and range[1] == range[3] then
+      display_range = full_line_range(bufnr, range[1])
+
+      if sem.render_whole_line then
+        local line = line_text(bufnr, range[1])
+        display_prefix = trim_right(line:sub(1, range[2]))
+        display_suffix = trim_left(line:sub(range[4] + 1))
+      end
+    end
 
     local prev_item = find_matching_prev_item(prev_items, entry, used_prev)
     local image_id, ext_id
@@ -929,7 +959,7 @@ function M.render_buf(bufnr)
       ext_id = prev_item.extmark_id
     else
       image_id = new_image_id(bufnr)
-      ext_id = extmark.place_render_extmark(bufnr, image_id, range, nil, nil, sem)
+      ext_id = extmark.place_render_extmark(bufnr, image_id, display_range, nil, nil, sem)
     end
 
     local item = {
@@ -938,6 +968,9 @@ function M.render_buf(bufnr)
       extmark_id = ext_id,
       item_idx = idx,
       range = range,
+      display_range = display_range,
+      display_prefix = display_prefix,
+      display_suffix = display_suffix,
       str = str,
       prelude_count = prelude_count,
       node_type = node_type,
@@ -1107,11 +1140,15 @@ local function should_unconceal_item_for_row(item, row, cursor_row, cursor_col)
   local display_kind = sem.display_kind
   local sr, _, er, _ = effective_range[1], effective_range[2], effective_range[3], effective_range[4]
 
-  if sr == er and display_kind == "inline" then
+  if sr == er and source_kind == "math" then
     if row ~= cursor_row then
       return false
     end
-    return cursor_engages_inline_item(effective_range, cursor_row, cursor_col)
+    local trigger_range = effective_range
+    if sem.render_whole_line and item.display_range ~= nil then
+      trigger_range = clamp_range_to_buffer(item.bufnr, item.display_range) or effective_range
+    end
+    return cursor_engages_inline_item(trigger_range, cursor_row, cursor_col)
   end
 
   if source_kind == "math" or source_kind == "code" then

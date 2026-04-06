@@ -130,6 +130,22 @@ local function normalize_virt_text_line(value)
   return { { "", "" } }
 end
 
+local function normalize_virt_text_lines(value)
+  if type(value) ~= "table" then
+    return { normalize_virt_text_line(value) }
+  end
+
+  if type(value[1]) == "table" and type(value[1][1]) == "table" then
+    local lines = {}
+    for i = 1, #value do
+      lines[i] = normalize_virt_text_line(value[i])
+    end
+    return lines
+  end
+
+  return { normalize_virt_text_line(value) }
+end
+
 --- Low-level extmark placement. Use place_render_extmark for external callers.
 --- @param bufnr      integer
 --- @param image_id  integer
@@ -160,16 +176,17 @@ local function place_image_extmark(bufnr, image_id, range, extmark_id, concealin
         end_row = end_row,
       })
     elseif is_block then
-      -- Block single-line: overlay to avoid line wrapping, will be centred later
+      -- Single-line block formulas also use the block-carrier model so they can
+      -- expand to multiple display rows and fully conceal the source line.
       new_extmark_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, start_row, start_col, {
         id = extmark_id,
         virt_text = { { "" } },
         virt_text_pos = "overlay",
-        conceal = "",
         invalidate = true,
         end_col = end_col,
         end_row = end_row,
       })
+      bs.multiline_marks[new_extmark_id] = { is_block_carrier = true, carrier_id = nil, tail_ids = {} }
     else
       new_extmark_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, start_row, start_col, {
         id = extmark_id,
@@ -272,55 +289,46 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
   local row, col, opts = m[1], m[2], m[3]
   local single_line = normalize_virt_text_line(virt_text_data)
 
-  local height = opts.end_row - row + 1
-  if height ~= 1 then
-    local mm = bs.multiline_marks[extmark_id]
-    if mm and mm.is_block_carrier then
-      -- Top-carrier atomic model: one ns_id2 at start_row owns all image rows.
-      if mm.carrier_id then
-        pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id2, mm.carrier_id)
-        mm.carrier_id = nil
-      end
-      for _, id in ipairs(mm.tail_ids or {}) do
-        pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id2, id)
-      end
-      mm.tail_ids = {}
+  local mm = bs.multiline_marks[extmark_id]
+  if mm and mm.is_block_carrier then
+    -- Top-carrier atomic model: one ns_id2 carrier owns the visible display.
+    if mm.carrier_id then
+      pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id2, mm.carrier_id)
+      mm.carrier_id = nil
+    end
+    for _, id in ipairs(mm.tail_ids or {}) do
+      pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id2, id)
+    end
+    mm.tail_ids = {}
 
-      local lines_buf = vim.api.nvim_buf_get_lines(bufnr, row, opts.end_row + 1, false)
-      local natural_rows = #virt_text_data
+    local lines_buf = vim.api.nvim_buf_get_lines(bufnr, row, opts.end_row + 1, false)
+    local display_lines = normalize_virt_text_lines(virt_text_data)
+    local carrier_vl = {}
+    for i = 2, #display_lines do
+      carrier_vl[#carrier_vl + 1] = display_lines[i]
+    end
 
-      local function norm(r)
-        if type(r) == "string" or (type(r) == "table" and type(r[1]) == "string") then
-          return { r }
-        end
-        return r
-      end
+    mm.carrier_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, row, 0, {
+      virt_text = display_lines[1] or { { "", "" } },
+      virt_text_pos = "overlay",
+      conceal = "",
+      end_col = #(lines_buf[1] or ""),
+      end_row = row,
+      virt_lines = carrier_vl,
+    })
 
-      -- Carrier virt_lines = image rows 2..N (attached to start_row so wrap cannot split them)
-      local carrier_vl = {}
-      for i = 2, natural_rows do
-        carrier_vl[#carrier_vl + 1] = norm(virt_text_data[i])
-      end
-
-      mm.carrier_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, row, 0, {
-        virt_text = norm(virt_text_data[1]),
-        virt_text_pos = "overlay",
-        conceal = "",
-        end_col = #(lines_buf[1] or ""),
-        end_row = row,
-        virt_lines = carrier_vl,
+    -- Tail conceal: fully hide source rows start_row+1 .. end_row (0 screen lines each)
+    local source_rows = opts.end_row - row + 1
+    for i = 2, source_rows do
+      local tid = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, row + i - 1, 0, {
+        conceal_lines = "",
+        end_row = row + i - 1,
       })
-
-      -- Tail conceal: fully hide source rows start_row+1 .. end_row (0 screen lines each)
-      local source_rows = opts.end_row - row + 1
-      for i = 2, source_rows do
-        local tid = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, row + i - 1, 0, {
-          conceal_lines = "",
-          end_row = row + i - 1,
-        })
-        table.insert(mm.tail_ids, tid)
-      end
-    else
+      table.insert(mm.tail_ids, tid)
+    end
+  else
+    local height = opts.end_row - row + 1
+    if height ~= 1 then
       -- Non-block multiline: existing per-source-line overlay model
       if mm then
         for _, id in pairs(mm) do
@@ -350,29 +358,29 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
         })
         table.insert(bs.multiline_marks[extmark_id], new_id)
       end
+    elseif opts.virt_text_pos == "inline" or (opts.virt_text_pos == "overlay" and opts.conceal == "") then
+      vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
+        id = extmark_id,
+        virt_text = single_line,
+        virt_text_pos = opts.virt_text_pos,
+        invalidate = opts.invalidate,
+        end_col = opts.end_col,
+        end_row = opts.end_row,
+        --- @diagnostic disable-next-line nvim type is wrong
+        conceal = "",
+      })
+    else
+      vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
+        id = extmark_id,
+        virt_lines = { single_line },
+        virt_text_pos = opts.virt_text_pos,
+        invalidate = opts.invalidate,
+        end_col = opts.end_col,
+        end_row = opts.end_row,
+        --- @diagnostic disable-next-line nvim type is wrong
+        conceal = opts.conceal,
+      })
     end
-  elseif opts.virt_text_pos == "inline" or (opts.virt_text_pos == "overlay" and opts.conceal == "") then
-    vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
-      id = extmark_id,
-      virt_text = single_line,
-      virt_text_pos = opts.virt_text_pos,
-      invalidate = opts.invalidate,
-      end_col = opts.end_col,
-      end_row = opts.end_row,
-      --- @diagnostic disable-next-line nvim type is wrong
-      conceal = "",
-    })
-  else
-    vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
-      id = extmark_id,
-      virt_lines = { single_line },
-      virt_text_pos = opts.virt_text_pos,
-      invalidate = opts.invalidate,
-      end_col = opts.end_col,
-      end_row = opts.end_row,
-      --- @diagnostic disable-next-line nvim type is wrong
-      conceal = opts.conceal,
-    })
   end
 end
 
@@ -434,19 +442,32 @@ local function conceal_extmark_with_image(
     .. #kitty_codes.diacritics
     .. " lines. If you legitimately see this in a real document, open an issue."
 
+  local function build_block_display_lines()
+    local lines = {}
+    local prefix = item and item.display_prefix or nil
+    local suffix = item and item.display_suffix or nil
+
+    if type(prefix) == "string" and prefix ~= "" then
+      lines[#lines + 1] = { { prefix, "" } }
+    end
+    for i = 1, natural_rows do
+      if i >= #kitty_codes.diacritics then
+        lines[#lines + 1] = { { too_tall_msg, hl_group } }
+      else
+        lines[#lines + 1] = make_row_list(i)
+      end
+    end
+    if type(suffix) == "string" and suffix ~= "" then
+      lines[#lines + 1] = { { suffix, "" } }
+    end
+
+    return lines
+  end
+
   if multiline_extmark_ids == nil then
     M.update_extmark_text(bufnr, extmark_id, make_row_list(1))
   elseif multiline_extmark_ids.is_block_carrier then
-    -- Block carrier: generate natural_rows image rows (not source_rows)
-    local lines = {}
-    for i = 1, natural_rows do
-      if i >= #kitty_codes.diacritics then
-        lines[i] = { { too_tall_msg, hl_group } }
-      else
-        lines[i] = make_row_list(i)
-      end
-    end
-    M.update_extmark_text(bufnr, extmark_id, lines)
+    M.update_extmark_text(bufnr, extmark_id, build_block_display_lines())
   else
     -- Non-block multiline: existing centering logic
     local lines = {}

@@ -11,6 +11,7 @@ local M = {}
 --- @field constraint_kind ConstraintKind  -- "flow": Typst page-width wrapper; "intrinsic": cell-snapping wrapper
 --- @field display_kind    DisplayKind     -- "block": centred/padded extmark; "inline": inline extmark
 --- @field source_kind     SourceKind      -- original treesitter node type
+--- @field render_whole_line? boolean      -- single-line Typst display math embedded in markup; render the whole source line
 
 --- Classify the render semantics of a Typst node.
 ---
@@ -34,14 +35,26 @@ function M.classify(range, bufnr, node_type)
 
   -- Neovim display decision: block = centred or left-padded image extmark.
   local display_kind
+  local render_whole_line = false
   if is_multiline then
     display_kind = "block"
   elseif node_type == "math" then
-    -- Single-line math: block if the formula occupies the entire (trimmed) line.
     local line = vim.api.nvim_buf_get_lines(bufnr, start_row, start_row + 1, false)[1] or ""
     local trimmed = line:match("^%s*(.-)%s*$") or ""
     local formula_text = line:sub(start_col + 1, end_col)
-    display_kind = (trimmed == formula_text) and "block" or "inline"
+
+    if trimmed == formula_text then
+      -- Single-line math occupying the whole trimmed line.
+      display_kind = "block"
+    elseif formula_text:match("^%$%s") and formula_text:match("%s%$$") then
+      -- Typst treats `$ ... $` with inner-edge whitespace as display math even
+      -- when it appears inside surrounding markup. Keep the existing math node
+      -- capture, but upgrade it at render/display time to a whole-line block.
+      display_kind = "block"
+      render_whole_line = true
+    else
+      display_kind = "inline"
+    end
   else
     display_kind = "inline"
   end
@@ -50,6 +63,7 @@ function M.classify(range, bufnr, node_type)
     constraint_kind = constraint_kind,
     display_kind = display_kind,
     source_kind = node_type,
+    render_whole_line = render_whole_line,
   }
 end
 

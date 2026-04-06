@@ -910,7 +910,11 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
     natural_cols = math.ceil((data.width / data.height) * 2) * source_rows
   end
 
-  if source_rows == 1 and natural_rows > 1 then
+  if
+    source_rows == 1
+    and natural_rows > 1
+    and not (item and item.semantics and item.semantics.display_kind == "block")
+  then
     if state._cell_px_w and state._cell_px_h then
       local aspect = data.width / data.height
       natural_cols = math.max(1, math.floor(state._cell_px_h * aspect / state._cell_px_w + 0.5))
@@ -939,7 +943,7 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
     for _, item in ipairs(bstate.full_items) do
       if item.image_id == image_id then
         if item.needs_swap then
-          extmark.swap_extmark_to_range(bufnr, image_id, extmark_id, item.range, item.semantics)
+          extmark.swap_extmark_to_range(bufnr, image_id, extmark_id, item.display_range or item.range, item.semantics)
           item.needs_swap = false
         end
         break
