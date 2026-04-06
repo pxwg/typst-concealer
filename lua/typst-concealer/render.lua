@@ -352,68 +352,8 @@ local function carry_stable_render_metadata(dst, src)
   dst.source_rows = src.source_rows
 end
 
-local function row_overlap_len(a, b)
-  local top = math.max(a[1], b[1])
-  local bottom = math.min(a[3], b[3])
-  if bottom < top then
-    return 0
-  end
-  return bottom - top + 1
-end
-
-local function row_gap_len(a, b)
-  if a[3] < b[1] then
-    return b[1] - a[3]
-  end
-  if b[3] < a[1] then
-    return a[1] - b[3]
-  end
-  return 0
-end
-
-local function col_delta_len(a, b)
-  return math.abs(a[2] - b[2]) + math.abs(a[4] - b[4])
-end
-
---- Match a fresh render entry to the most plausible previous item.
---- Reusing by raw list index is unsafe while the parser is in an error state:
---- a disappearing leading math block can shift later code/math items left and
---- make them inherit the wrong extmark/image, which shows up as duplicated
---- images at the wrong location while editing.
---- @param prev_items table[]
---- @param entry table
---- @param used_prev table<integer, boolean>
---- @return table|nil
 local function find_matching_prev_item(prev_items, entry, used_prev)
-  local best_idx = nil
-  local best_item = nil
-  local best_overlap = -1
-  local best_gap = math.huge
-  local best_col_delta = math.huge
-
-  for idx, prev_item in ipairs(prev_items) do
-    if not used_prev[idx] and prev_item.node_type == entry.node_type then
-      local overlap = row_overlap_len(prev_item.range, entry.range)
-      local gap = row_gap_len(prev_item.range, entry.range)
-      local col_delta = col_delta_len(prev_item.range, entry.range)
-      if
-        overlap > best_overlap
-        or (overlap == best_overlap and gap < best_gap)
-        or (overlap == best_overlap and gap == best_gap and col_delta < best_col_delta)
-      then
-        best_idx = idx
-        best_item = prev_item
-        best_overlap = overlap
-        best_gap = gap
-        best_col_delta = col_delta
-      end
-    end
-  end
-
-  if best_idx ~= nil then
-    used_prev[best_idx] = true
-  end
-  return best_item
+  return require("typst-concealer.apply").find_matching_prev_item(prev_items, entry, used_prev)
 end
 
 local function cleanup_item(bufnr, item)
