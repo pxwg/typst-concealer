@@ -443,9 +443,71 @@ end
 --- Apply a rendered page update to the display layer.
 --- @param update PageUpdate
 function M.accept_page_update(update)
-  -- Phase 2: receives PageUpdate from session, replaces direct extmark calls
-  -- stub: Phase 2.1
-  error("accept_page_update not yet implemented — see Phase 2")
+  local extmark_mod = require("typst-concealer.extmark")
+  local bufnr = update.bufnr
+  local image_id = update.image_id
+  local extmark_id = update.extmark_id
+  local original_range = update.original_range
+  local page_path = update.page_path
+  local page_stamp = update.page_stamp
+  local natural_cols = update.natural_cols
+  local natural_rows = update.natural_rows
+  local source_rows = update.source_rows
+
+  local item = state.get_item_by_image_id(image_id)
+  if item == nil or type(extmark_id) ~= "number" then
+    return
+  end
+
+  local target_bufnr = bufnr
+  local target_range = original_range
+  if item and item.render_target == "float" then
+    target_bufnr = item.target_bufnr or bufnr
+    target_range = item.target_range or original_range
+  end
+  if not vim.api.nvim_buf_is_valid(target_bufnr) then
+    return
+  end
+  if state.image_id_to_extmark[image_id] ~= extmark_id then
+    return
+  end
+  local ok_mark, mark =
+    pcall(vim.api.nvim_buf_get_extmark_by_id, target_bufnr, state.ns_id, extmark_id, { details = true })
+  if not ok_mark or mark == nil or #mark == 0 then
+    return
+  end
+
+  if item ~= nil then
+    item.natural_cols = natural_cols
+    item.natural_rows = natural_rows
+    item.source_rows = source_rows
+    item.page_path = page_path
+    item.page_stamp = page_stamp
+  end
+
+  -- Swap extmark to new range when the new image is ready.
+  local bstate = state.buffer_render_state[bufnr]
+  if bstate and bstate.full_items then
+    for _, fi in ipairs(bstate.full_items) do
+      if fi.image_id == image_id then
+        if fi.needs_swap then
+          extmark_mod.swap_extmark_to_range(bufnr, image_id, extmark_id, fi.display_range or fi.range, fi.semantics)
+          fi.needs_swap = false
+        end
+        break
+      end
+    end
+  end
+
+  extmark_mod.create_image(page_path, image_id, natural_cols, natural_rows)
+  if item ~= nil and item.render_target == "preview_float" then
+    require("typst-concealer.render").present_rendered_preview_item(target_bufnr, item)
+    return
+  end
+  extmark_mod.conceal_for_image_id(target_bufnr, image_id, natural_cols, natural_rows, source_rows)
+  state.get_buf_state(bufnr).hover.invalidated = true
+  require("typst-concealer.render").hide_extmarks_at_cursor(bufnr)
+  require("typst-concealer.render").render_live_typst_preview(bufnr)
 end
 
 --- Release all resources for a buffer and reset render state.
