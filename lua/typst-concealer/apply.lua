@@ -37,6 +37,29 @@ local M = {}
 --- @field page_stamp string
 --- @field kind string
 
+--- Allocate a new image_id for bufnr, scanning for a free slot.
+--- @param bufnr integer
+--- @return integer
+local function new_image_id(bufnr)
+  local pid = state.pid
+  for i = pid, 2 ^ 16 + pid - 1 do
+    if state.image_ids_in_use[i] == nil then
+      state.image_ids_in_use[i] = bufnr
+      return i
+    end
+  end
+  -- Overflow: reset and retry
+  print(
+    "[typst-concealer] >65536 image ids in use, overflowing. "
+      .. "This is probably a bug, you're looking at a very long document or a lot of documents.\n"
+      .. "Open an issue if you see this, the cap can be increased if someone actually needs it.\n"
+  )
+  state.image_ids_in_use = {}
+  return new_image_id(bufnr)
+end
+
+M._new_image_id = new_image_id
+
 --- Allocate image_ids and extmarks for a batch of PlannedItems,
 --- reusing resources from previous render pass where possible.
 --- @param bufnr integer
