@@ -40,16 +40,6 @@ local function rebuild_quickfix(bufnr)
   end
 end
 
---- Clear quickfix diagnostics for one session kind and rebuild the aggregated
---- buffer quickfix list.
---- @param bufnr integer
---- @param kind  'full'
-local function clear_quickfix(bufnr, kind)
-  state.watch_diagnostics[bufnr] = state.watch_diagnostics[bufnr] or {}
-  state.watch_diagnostics[bufnr][kind] = {}
-  rebuild_quickfix(bufnr)
-end
-
 --- @param line_map table[]|nil
 --- @param gen_lnum integer
 --- @param gen_col integer
@@ -730,7 +720,6 @@ local function write_session_document(session, mode)
     session.stderr_chunks = {}
     session.stderr_text = ""
     session.stderr_line_buffer = ""
-    clear_quickfix(session.bufnr, session.kind)
   end
 
   local wrapper = require("typst-concealer.backends.typst.wrapper")
@@ -836,13 +825,6 @@ function M.stop_watch_session(bufnr, kind)
   end
 
   bucket[kind] = nil
-  if state.watch_diagnostics[bufnr] then
-    state.watch_diagnostics[bufnr][kind] = nil
-    if next(state.watch_diagnostics[bufnr]) == nil then
-      state.watch_diagnostics[bufnr] = nil
-    end
-    rebuild_quickfix(bufnr)
-  end
   if next(bucket) == nil then
     state.watch_sessions[bufnr] = nil
   end
