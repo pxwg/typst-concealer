@@ -6,9 +6,29 @@
 local state = require("typst-concealer.state")
 local M = {}
 
-local backend -- set by M.set_backend()
+--- Per-buffer backend registry.  Falls back to default_backend when no
+--- per-buffer entry is found (backwards-compatible with set_backend).
+local default_backend = nil
+local buf_backends = {} --- @type { [integer]: table }
+
+--- Set the default backend (used by all buffers that haven't been explicitly assigned).
+--- @param b table
 function M.set_backend(b)
-  backend = b
+  default_backend = b
+end
+
+--- Assign a specific backend to a buffer.
+--- @param bufnr integer
+--- @param b table
+function M.set_buf_backend(bufnr, b)
+  buf_backends[bufnr] = b
+end
+
+--- Return the backend for the given buffer.
+--- @param bufnr integer
+--- @return table
+local function get_backend(bufnr)
+  return buf_backends[bufnr] or default_backend
 end
 
 local diagnostics = {}
@@ -320,7 +340,8 @@ function M.hard_reset_buf(bufnr)
   vim.api.nvim_buf_clear_namespace(bufnr, state.ns_id2, 0, -1)
   state.buffers[bufnr] = nil
   diagnostics = {}
-  backend.reset_buf_state(bufnr)
+  get_backend(bufnr).reset_buf_state(bufnr)
+  buf_backends[bufnr] = nil
 end
 
 --- Re-render all Typst nodes in bufnr.
@@ -332,7 +353,7 @@ function M.render_buf(bufnr)
 
   if main._enabled_buffers[bufnr] ~= true or not main.is_render_allowed(bufnr) then
     M.hard_reset_buf(bufnr)
-    backend.stop_session(bufnr, "full")
+    get_backend(bufnr).stop_session(bufnr, "full")
     return
   end
 
@@ -340,7 +361,7 @@ function M.render_buf(bufnr)
   state.runtime_preludes = {}
 
   local bs = state.get_buf_state(bufnr)
-  local units = backend.collect_units(bufnr)
+  local units = get_backend(bufnr).collect_units(bufnr)
   bs.pending_change = nil
   local sorted_entries = build_render_entries_from_units(bufnr, units)
 
@@ -350,7 +371,7 @@ function M.render_buf(bufnr)
   local planned_items = {}
   for idx, entry in ipairs(sorted_entries) do
     local range, prelude_count, node_type = entry.range, entry.prelude_count, entry.node_type
-    local sem = backend.classify(range, bufnr, node_type)
+    local sem = get_backend(bufnr).classify(range, bufnr, node_type)
     local str = range_to_string(range, bufnr)
     local display_range = range
     local display_prefix = nil
@@ -387,7 +408,7 @@ function M.render_buf(bufnr)
   local visible_batch_items = apply.commit_plan(bufnr, planned_items)
 
   vim.schedule(function()
-    backend.render_items(bufnr, visible_batch_items)
+    get_backend(bufnr).render_items(bufnr, visible_batch_items)
   end)
   -- Reset hover guard so hide_extmarks_at_cursor re-evaluates after render
   state.get_buf_state(bufnr).hover.last_cursor_row = nil
@@ -1009,7 +1030,7 @@ end
 --- Stop the live preview tail page and remove its extmark/image.
 --- @param bufnr integer
 function M.clear_live_typst_preview(bufnr)
-  backend.clear_preview_tail(bufnr)
+  get_backend(bufnr).clear_preview_tail(bufnr)
   cleanup_preview_image(bufnr)
 end
 
@@ -1087,8 +1108,9 @@ function M.render_live_typst_preview(bufnr)
   -- under the cursor while anchoring the float to the wrong range.
   local item = find_full_item_at_cursor(bufnr, cursor_row, cursor_col, mode)
   if item ~= nil then
-    if backend.make_highlighted_preview then
-      local preview_str, render_key, source_str = backend.make_highlighted_preview(item, cursor_row, cursor_col, mode)
+    local b = get_backend(bufnr)
+    if b.make_highlighted_preview then
+      local preview_str, render_key, source_str = b.make_highlighted_preview(item, cursor_row, cursor_col, mode)
       if type(preview_str) ~= "string" or type(render_key) ~= "string" or type(source_str) ~= "string" then
         M.clear_live_typst_preview(bufnr)
         return
@@ -1124,7 +1146,7 @@ function M.render_live_typst_preview(bufnr)
         render_key,
         shared_extmark_id
       )
-      backend.render_preview_tail(bufnr, preview_item)
+      b.render_preview_tail(bufnr, preview_item)
       return
     end
   end

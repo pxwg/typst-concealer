@@ -16,8 +16,80 @@ local semantics = require("typst-concealer.backends.typst.semantics")
 local units = require("typst-concealer.backends.typst.units")
 local preview = require("typst-concealer.backends.typst.preview")
 
---- No-op setup; reserved for future per-backend configuration.
-function M.setup(_config) end
+-- ── Styling prelude ────────────────────────────────────────────────────────────
+-- The styling prelude is a block of Typst `#set` rules injected at the top of
+-- every batch document.  It is owned by this backend so the main module (init.lua)
+-- stays backend-agnostic.
+
+local _config = {}
+M._styling_prelude = ""
+
+--- Rebuild the styling prelude from the current config and colorscheme.
+--- Called by setup() and by init.lua's ColorScheme autocmd via refresh_styling_prelude().
+function M.refresh_styling_prelude()
+  local color = _config.color
+  if _config.styling_type == "colorscheme" then
+    if color == nil then
+      color = string.format('rgb("#%06X")', vim.api.nvim_get_hl(0, { name = "Normal" })["fg"])
+    end
+    -- FIXME: lists everything. agony. hope https://github.com/typst/typst/issues/3356 is resolved.
+    M._styling_prelude = ""
+      .. "#set page(width: auto, height: auto, margin: (x: 0pt, y: 0pt), fill: none)\n"
+      .. "#set text("
+      .. color
+      .. ', top-edge: "ascender", bottom-edge: "descender")\n'
+      .. "#set line(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set table(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set circle(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set ellipse(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set line(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set curve(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set polygon(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set rect(stroke: "
+      .. color
+      .. ")\n"
+      .. "#set square(stroke: "
+      .. color
+      .. ")\n"
+  elseif _config.styling_type == "simple" then
+    M._styling_prelude = ""
+      .. "#set page(width: auto, height: auto, margin: 0.75pt)\n"
+      .. '#set text(top-edge: "ascender", bottom-edge: "descender")\n'
+  elseif _config.styling_type == "none" then
+    M._styling_prelude = ""
+  end
+end
+
+--- Return the current styling prelude string.
+--- @return string
+function M.get_styling_prelude()
+  return M._styling_prelude
+end
+
+--- Store config, validate prerequisites, and rebuild the styling prelude.
+--- @param config table
+function M.setup(config)
+  _config = config or {}
+  local typst_parser_ok = pcall(vim.treesitter.get_parser, 0, "typst")
+  if not typst_parser_ok then
+    error("Typst treesitter parser not found, typst-concealer will not work")
+  end
+  M.refresh_styling_prelude()
+end
 
 -- AST traversal
 M.collect_units = units.collect_units

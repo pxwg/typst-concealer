@@ -1126,7 +1126,7 @@ function M.ensure_watch_session(bufnr)
   end
 
   -- typst watch expects the input file to exist before startup.
-  local ok, err = write_file_in_place(input_path, main._styling_prelude)
+  local ok, err = write_file_in_place(input_path, require("typst-concealer.backends.typst").get_styling_prelude())
   if not ok then
     vim.schedule(function()
       vim.notify("[typst-concealer] failed to create watch input: " .. tostring(err), vim.log.levels.ERROR)

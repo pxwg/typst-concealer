@@ -69,12 +69,12 @@ local function normalize_item_str(item)
   return ""
 end
 
-local function build_header_text(config, main, maybe_rewrite, preamble_include_line)
+local function build_header_text(config, styling_prelude, maybe_rewrite, preamble_include_line)
   local parts = {}
   if config.header and config.header ~= "" then
     parts[#parts + 1] = maybe_rewrite(config.header) .. "\n"
   end
-  parts[#parts + 1] = main._styling_prelude
+  parts[#parts + 1] = styling_prelude
   if preamble_include_line ~= nil and preamble_include_line ~= "" then
     parts[#parts + 1] = preamble_include_line
   end
@@ -269,6 +269,7 @@ function M.build_batch_document(
 )
   local main = require("typst-concealer")
   local config = main.config
+  local typst_backend = require("typst-concealer.backends.typst")
   local doc = {}
   local line_map = build_line_map == false and nil or {}
   local cur_line = 1
@@ -303,15 +304,16 @@ function M.build_batch_document(
     effective_root or "",
   }, "\0")
 
+  local styling_prelude = typst_backend.get_styling_prelude()
   local header_key = table.concat({
     rewrite_signature,
     config.header or "",
-    main._styling_prelude or "",
+    styling_prelude,
     preamble_include_line or "",
   }, "\0")
   local header_text = cache.header_key == header_key and cache.header_text or nil
   if header_text == nil then
-    header_text = build_header_text(config, main, maybe_rewrite, preamble_include_line)
+    header_text = build_header_text(config, styling_prelude, maybe_rewrite, preamble_include_line)
     cache.header_key = header_key
     cache.header_text = header_text
   end

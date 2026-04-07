@@ -8,6 +8,10 @@ local M = {}
 --- @type { [integer]: boolean }
 M._enabled_buffers = {}
 
+--- Maps filetype string → backend module.  Populated in M.setup().
+--- @type { [string]: table }
+local FILETYPE_TO_BACKEND = {}
+
 -- ── Terminal cell-size detection (FFI) ────────────────────────────────────────
 
 local ffi = require("ffi")
@@ -27,57 +31,6 @@ local function refresh_cell_px_size()
     state._cell_px_h = ws.ws_ypixel / ws.ws_row
     local baseline_pt = (M.config and M.config.math_baseline_pt) or 10
     state._render_ppi = math.max(72, math.floor(state._cell_px_h * 72 / baseline_pt))
-  end
-end
-
--- ── Typst prelude / styling ────────────────────────────────────────────────────
-
---- Rebuild M._styling_prelude from the current colour scheme / styling config.
-local function setup_prelude()
-  if M.config.styling_type == "colorscheme" then
-    local color = M.config.color
-    if color == nil then
-      color = string.format('rgb("#%06X")', vim.api.nvim_get_hl(0, { name = "Normal" })["fg"])
-    end
-    -- FIXME: lists everything. agony. hope https://github.com/typst/typst/issues/3356 is resolved.
-    M._styling_prelude = ""
-      .. "#set page(width: auto, height: auto, margin: (x: 0pt, y: 0pt), fill: none)\n"
-      .. "#set text("
-      .. color
-      .. ', top-edge: "ascender", bottom-edge: "descender")\n'
-      .. "#set line(stroke: "
-      .. color
-      .. ")\n"
-      .. "#set table(stroke: "
-      .. color
-      .. ")\n"
-      .. "#set circle(stroke: "
-      .. color
-      .. ")\n"
-      .. "#set ellipse(stroke: "
-      .. color
-      .. ")\n"
-      .. "#set line(stroke: "
-      .. color
-      .. ")\n"
-      .. "#set curve(stroke: "
-      .. color
-      .. ")\n"
-      .. "#set polygon(stroke: "
-      .. color
-      .. ")\n"
-      .. "#set rect(stroke: "
-      .. color
-      .. ")\n"
-      .. "#set square(stroke: "
-      .. color
-      .. ")\n"
-  elseif M.config.styling_type == "simple" then
-    M._styling_prelude = ""
-      .. "#set page(width: auto, height: auto, margin: 0.75pt)\n"
-      .. '#set text(top-edge: "ascender", bottom-edge: "descender")\n'
-  elseif M.config.styling_type == "none" then
-    M._styling_prelude = ""
   end
 end
 
@@ -161,24 +114,31 @@ local function buf_has_visible_window(bufnr)
   return false
 end
 
+--- Return true when bufnr uses a managed filetype (has a registered backend).
+local function buf_is_managed(bufnr)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+  local ft = vim.bo[bufnr] and vim.bo[bufnr].filetype or ""
+  return FILETYPE_TO_BACKEND[ft] ~= nil
+end
+
 local function maybe_stop_hidden_full_watch(bufnr)
-  if
-    not vim.api.nvim_buf_is_valid(bufnr)
-    or vim.api.nvim_buf_get_name(bufnr):match(".*%.typ$") == nil
-    or M._enabled_buffers[bufnr] ~= true
-  then
+  if not buf_is_managed(bufnr) or M._enabled_buffers[bufnr] ~= true then
     return
   end
   if buf_has_visible_window(bufnr) then
     return
   end
-  require("typst-concealer")._backend.stop_session(bufnr, "full")
+  local b = FILETYPE_TO_BACKEND[(vim.bo[bufnr] and vim.bo[bufnr].filetype) or ""]
+  if b then
+    b.stop_session(bufnr, "full")
+  end
 end
 
 local function maybe_resume_visible_full_watch(bufnr)
   if
-    not vim.api.nvim_buf_is_valid(bufnr)
-    or vim.api.nvim_buf_get_name(bufnr):match(".*%.typ$") == nil
+    not buf_is_managed(bufnr)
     or M._enabled_buffers[bufnr] ~= true
     or not M.is_render_allowed(bufnr)
     or not buf_has_visible_window(bufnr)
@@ -186,7 +146,8 @@ local function maybe_resume_visible_full_watch(bufnr)
     return
   end
 
-  if require("typst-concealer")._backend.has_session(bufnr, "full") then
+  local b = FILETYPE_TO_BACKEND[(vim.bo[bufnr] and vim.bo[bufnr].filetype) or ""]
+  if b and b.has_session(bufnr, "full") then
     return
   end
   require("typst-concealer.plan").render_buf(bufnr)
@@ -225,7 +186,10 @@ M.disable_buf = function(bufnr)
   bufnr = bufnr or vim.fn.bufnr()
   M._enabled_buffers[bufnr] = nil
   require("typst-concealer.state").clear_hover_timer(bufnr)
-  require("typst-concealer")._backend.stop_session(bufnr, "full")
+  local b = FILETYPE_TO_BACKEND[(vim.bo[bufnr] and vim.bo[bufnr].filetype) or ""]
+  if b then
+    b.stop_session(bufnr, "full")
+  end
   local render = require("typst-concealer.plan")
   render.clear_live_typst_preview(bufnr)
   render.hard_reset_buf(bufnr)
@@ -292,18 +256,11 @@ function M.setup(cfg)
     error("typst get_root must be a function when provided")
   end
 
-  setup_prelude()
   refresh_cell_px_size()
 
-  local typst_backend = require("typst-concealer.backends.typst")
-  typst_backend.setup(M.config)
-  require("typst-concealer.plan").set_backend(typst_backend)
-  M._backend = typst_backend
-
-  -- Register the frontend diagnostic handler.
-  -- The backend (session.lua) calls state.hooks.on_diagnostics_changed when its
-  -- error set changes; this handler is the only place that touches setqflist.
-  -- A LaTeX backend would call the same hook — no changes needed here.
+  -- ── Register diagnostics hook (shared by all backends) ──────────────────────
+  -- Each backend calls state.hooks.on_diagnostics_changed with its error list;
+  -- this handler is the single place that owns the quickfix display.
   local _state = require("typst-concealer.state")
   _state.hooks.on_diagnostics_changed = function(bufnr, items)
     vim.schedule(function()
@@ -313,6 +270,7 @@ function M.setup(cfg)
     end)
   end
 
+  -- ── Typst backend ────────────────────────────────────────────────────────────
   if not cfg.allow_missing_typst and vim.fn.executable(M.config.typst_location) ~= 1 then
     if M.config.typst_location == "typst" then
       error("Typst executable not found in path, typst-concealer will not work")
@@ -321,26 +279,21 @@ function M.setup(cfg)
     end
   end
 
-  local typst_parser_installed = pcall(vim.treesitter.get_parser, 0, "typst")
-  if typst_parser_installed == false then
-    error("Typst treesitter parser not found, typst-concealer will not work")
-  end
-
-  M._typst_query = vim.treesitter.query.parse(
-    "typst",
-    [[
-[
- (code
-  [(_) (call item: (ident) @call_ident)] @code
- )
- (math)
-] @block
-]]
-  )
+  local typst_backend = require("typst-concealer.backends.typst")
+  typst_backend.setup(M.config)
+  FILETYPE_TO_BACKEND["typst"] = typst_backend
+  -- Keep M._backend as the typst backend for backwards-compatible access
+  M._backend = typst_backend
 
   -- ── Per-buffer initialisation ──────────────────────────────────────────────
 
   local function init_buf(bufnr)
+    local ft = vim.bo[bufnr] and vim.bo[bufnr].filetype or ""
+    local buf_backend = FILETYPE_TO_BACKEND[ft]
+    if buf_backend == nil then
+      return
+    end
+    require("typst-concealer.plan").set_buf_backend(bufnr, buf_backend)
     vim.opt_local.conceallevel = 2
     vim.opt_local.concealcursor = "nci"
     local bs = require("typst-concealer.state").get_buf_state(bufnr)
@@ -387,15 +340,18 @@ function M.setup(cfg)
 
   if vim.v.vim_did_enter then
     local bufnr = vim.fn.bufnr()
-    if vim.api.nvim_buf_get_name(bufnr):match(".*%.typ$") then
+    local ft = vim.bo[bufnr] and vim.bo[bufnr].filetype or ""
+    if FILETYPE_TO_BACKEND[ft] ~= nil then
       init_buf(bufnr)
     end
   end
 
   -- ── Autocmds ──────────────────────────────────────────────────────────────
 
+  local managed_patterns = { "*.typ", "*.tex" }
+
   vim.api.nvim_create_autocmd("BufReadPost", {
-    pattern = "*.typ",
+    pattern = managed_patterns,
     group = augroup,
     desc = "render file on enter",
     callback = function(ev)
@@ -406,7 +362,7 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd({ "BufNew", "VimEnter" }, {
-    pattern = "*.typ",
+    pattern = managed_patterns,
     group = augroup,
     desc = "enable file on creation if the option is set",
     callback = function(ev)
@@ -415,7 +371,7 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd("BufWritePost", {
-    pattern = "*.typ",
+    pattern = managed_patterns,
     group = augroup,
     desc = "render file on write",
     callback = function(ev)
@@ -426,7 +382,7 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd("TextChanged", {
-    pattern = "*.typ",
+    pattern = managed_patterns,
     group = augroup,
     desc = "re-render on normal-mode text changes so block anchors stay correct",
     callback = function(ev)
@@ -439,7 +395,7 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd("CursorMoved", {
-    pattern = "*.typ",
+    pattern = managed_patterns,
     group = augroup,
     desc = "unconceal on line hover",
     callback = function(ev)
@@ -447,11 +403,9 @@ function M.setup(cfg)
 
       local throttle = require("typst-concealer").config.cursor_hover_throttle_ms
       if throttle <= 0 then
-        -- No throttle: call directly (row-level guard is inside the function)
         require("typst-concealer.plan").hide_extmarks_at_cursor(ev.buf)
         return
       end
-      -- Per-buffer trailing throttle: always process latest cursor position
       local bs = require("typst-concealer.state").get_buf_state(ev.buf)
       if bs.hover.throttle_timer == nil then
         bs.hover.throttle_timer = vim.uv.new_timer()
@@ -472,7 +426,7 @@ function M.setup(cfg)
     pattern = "v:*",
     desc = "unconceal when exiting visual mode (no CursorMoved event fires)",
     callback = function(ev)
-      if vim.api.nvim_buf_get_name(ev.buf):match(".*%.typ$") then
+      if buf_is_managed(ev.buf) then
         require("typst-concealer.plan").hide_extmarks_at_cursor(ev.buf)
       end
     end,
@@ -480,7 +434,7 @@ function M.setup(cfg)
 
   vim.api.nvim_create_autocmd("CursorMovedI", {
     group = augroup,
-    pattern = "*.typ",
+    pattern = managed_patterns,
     desc = "keep float preview synced while moving in insert mode",
     callback = function(ev)
       require("typst-concealer.plan").schedule_live_preview_sync(ev.buf, { immediate = true })
@@ -489,8 +443,8 @@ function M.setup(cfg)
 
   vim.api.nvim_create_autocmd("BufEnter", {
     group = augroup,
-    pattern = "*.typ",
-    desc = "sync float preview when entering a typst buffer",
+    pattern = managed_patterns,
+    desc = "sync float preview when entering a managed buffer",
     callback = function(ev)
       vim.schedule(function()
         maybe_resume_visible_full_watch(ev.buf)
@@ -503,8 +457,8 @@ function M.setup(cfg)
 
   vim.api.nvim_create_autocmd("WinEnter", {
     group = augroup,
-    pattern = "*.typ",
-    desc = "resume full watch when a typst buffer becomes visible",
+    pattern = managed_patterns,
+    desc = "resume full watch when a managed buffer becomes visible",
     callback = function(ev)
       vim.schedule(function()
         maybe_resume_visible_full_watch(ev.buf)
@@ -513,7 +467,7 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd("TextChangedI", {
-    pattern = "*.typ",
+    pattern = managed_patterns,
     group = augroup,
     desc = "render live preview float when insert-mode text changes",
     callback = function(ev)
@@ -526,7 +480,11 @@ function M.setup(cfg)
       group = augroup,
       desc = "update colour scheme",
       callback = function()
-        setup_prelude()
+        for _, b in pairs(FILETYPE_TO_BACKEND) do
+          if b.refresh_styling_prelude then
+            b.refresh_styling_prelude()
+          end
+        end
         local render = require("typst-concealer.plan")
         for bufnr in pairs(M._enabled_buffers) do
           render.render_buf(bufnr)
@@ -536,7 +494,8 @@ function M.setup(cfg)
   end
 
   vim.api.nvim_create_autocmd("FileType", {
-    pattern = "typst",
+    pattern = { "typst", "tex" },
+    group = augroup,
     callback = function(ev)
       init_buf(ev.buf)
     end,
@@ -553,9 +512,9 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd({ "BufLeave", "BufWinLeave", "BufHidden", "BufDelete" }, {
-    pattern = "*.typ",
+    pattern = managed_patterns,
     group = augroup,
-    desc = "clear live preview when leaving a typst buffer",
+    desc = "clear live preview when leaving a managed buffer",
     callback = function(ev)
       require("typst-concealer.plan").clear_live_typst_preview(ev.buf)
       vim.schedule(function()
@@ -566,7 +525,7 @@ function M.setup(cfg)
 
   vim.api.nvim_create_autocmd("WinClosed", {
     group = augroup,
-    desc = "stop full watch when a typst buffer is no longer visible",
+    desc = "stop full watch when a managed buffer is no longer visible",
     callback = function()
       vim.schedule(function()
         for bufnr in pairs(M._enabled_buffers) do
@@ -578,10 +537,14 @@ function M.setup(cfg)
 
   vim.api.nvim_create_autocmd({ "BufWipeout", "BufUnload" }, {
     group = augroup,
-    pattern = "*.typ",
-    desc = "stop typst watch sessions for dead buffers",
+    pattern = managed_patterns,
+    desc = "stop watch sessions for dead buffers",
     callback = function(ev)
-      require("typst-concealer")._backend.stop_sessions_for_buf(ev.buf)
+      local ft = vim.bo[ev.buf] and vim.bo[ev.buf].filetype or ""
+      local b = FILETYPE_TO_BACKEND[ft]
+      if b then
+        b.stop_sessions_for_buf(ev.buf)
+      end
       require("typst-concealer.state").clear_preview_timer(ev.buf)
       require("typst-concealer.plan").hard_reset_buf(ev.buf)
     end,

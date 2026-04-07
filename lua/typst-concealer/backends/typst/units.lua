@@ -4,6 +4,25 @@
 local state = require("typst-concealer.state")
 local M = {}
 
+--- Lazily-initialised treesitter query for Typst math and code nodes.
+local _typst_query = nil
+local function get_typst_query()
+  if _typst_query == nil then
+    _typst_query = vim.treesitter.query.parse(
+      "typst",
+      [[
+[
+ (code
+  [(_) (call item: (ident) @call_ident)] @code
+ )
+ (math)
+] @block
+]]
+    )
+  end
+  return _typst_query
+end
+
 --- Extract the text contained within a buffer range.
 --- @param range Range4
 --- @param bufnr integer
@@ -170,14 +189,13 @@ end
 --- @param bufnr integer
 --- @return table[]
 function M.collect_units(bufnr)
-  local main = require("typst-concealer")
   local bs = state.get_buf_state(bufnr)
   local prev_state = state.buffer_render_state[bufnr] or {}
   local pending = bs.pending_change
 
   local parser = vim.treesitter.get_parser(bufnr, "typst")
   local tree = parser:parse()[1]:root()
-  local query = main._typst_query
+  local query = get_typst_query()
 
   -- Try incremental path
   if prev_state.full_units ~= nil and pending ~= nil and not pending.requires_full then
