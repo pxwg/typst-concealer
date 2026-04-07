@@ -90,7 +90,7 @@ require("typst-concealer").setup({
 })
 ```
 
-For multi-file projects that rely on rooted Typst paths like `#image("/assets/figure.png")`, configure `get_root` so concealer can preserve the same project-root semantics as your real build:
+For multi-file projects that rely on rooted Typst paths like `#image("/assets/figure.png")`, configure `get_root` so concealer uses the same root base as your real build:
 
 ```lua
 require("typst-concealer").setup({
@@ -104,9 +104,9 @@ require("typst-concealer").setup({
 })
 ```
 
-`get_root(bufnr, path, cwd, kind)` should return the source/project root as an absolute filesystem path. When omitted or when it returns `nil`, concealer falls back to the nearest directory containing `typst.toml`, and then to the current buffer directory.
+`get_root(bufnr, path, cwd, kind)` should return the absolute directory that concealer passes to Typst as `--root`. When omitted or when it returns `nil`, concealer falls back to the current working directory, then to the nearest directory containing `typst.toml`, and then to the current buffer directory.
 
-`compiler_args` is still passed through to Typst, but `--root` inside `compiler_args` is ignored because concealer computes the watch root itself.
+`compiler_args` is still passed through to Typst, but `--root` inside `compiler_args` is ignored because concealer computes the watch root from `get_root` or the fallback root base itself.
 
 Two other project hooks are available:
 
@@ -128,7 +128,7 @@ require("typst-concealer").setup({
 - `get_preamble_file` injects a project-level `.typ` file at the top of the generated batch document.
 
 ## Known issues
-- A temporary watch workspace is created under `<project-root>/.typst-concealer/` and used for `typst watch`. Keeping it inside the project root preserves rooted Typst path semantics for imported project files. The plugin removes active session files when disabled, but the directory may remain after crashes and is safe to delete.
+- A temporary watch workspace is created under `<root-base>/.typst-concealer/` and used for `typst watch`, where `<root-base>` is the directory returned by `get_root` or the fallback root. The plugin removes active session files when disabled, but the directory may remain after crashes and is safe to delete.
 - Breaks sometimes, pls report if any errors happen
 - Sometimes the message sent to the kitty image protocol gets displayed on the screen as colourful garbage text. It's difficult to reproduce, and I have no idea what to do about this.
 

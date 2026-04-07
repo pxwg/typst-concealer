@@ -102,8 +102,9 @@ end
 --- @field render_paths?          { include?: (string|fun(path: string, bufnr: integer): boolean)[], exclude?: (string|fun(path: string, bufnr: integer): boolean)[] }
 ---                                     Optional path rules. `include` acts as a whitelist when non-empty; `exclude` always wins.
 --- @field get_root?              fun(bufnr: integer, path: string, cwd: string, kind: "full"): string|nil
----                                     Return the source/project root used to interpret rooted Typst paths like `/fig/a.png`.
----                                     Must be an absolute filesystem path. `nil` falls back to detected project root.
+---                                     Return the Typst root base passed to `--root` and used to interpret rooted paths
+---                                     like `/fig/a.png`. Must be an absolute filesystem path. `nil` falls back to the
+---                                     current working directory, then to the detected project root.
 --- @field get_inputs?            fun(bufnr: integer, path: string, cwd: string, kind: "full"): string[]|nil
 ---                                     Return extra `--input` values, e.g. `{"focus=123", "preview=true"}`. `nil`/`{}` appends nothing.
 --- @field get_preamble_file?     fun(bufnr: integer, path: string, cwd: string, kind: "full"): string|nil

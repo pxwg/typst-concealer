@@ -565,6 +565,17 @@ local function get_watch_session(bufnr, kind)
   return bucket and bucket[kind] or nil
 end
 
+local function resolve_root_base(configured_root, cwd, project_root, buf_dir)
+  local function normalize(path)
+    if type(path) ~= "string" or path == "" then
+      return nil
+    end
+    return vim.fs.normalize(vim.fn.fnamemodify(path, ":p")):gsub("/$", "")
+  end
+
+  return normalize(configured_root) or normalize(cwd) or normalize(project_root) or normalize(buf_dir)
+end
+
 --- Report whether a watch session exists and is still alive.
 --- @param bufnr integer
 --- @param kind "full"
@@ -1114,15 +1125,9 @@ function M.ensure_watch_session(bufnr)
     end
   end
 
-  local source_root = normalize_root(configured_root or project_root)
+  local source_root = resolve_root_base(configured_root, cwd, project_root, buf_dir)
   local input_path = session_input_path(bufnr, source_root)
-  local cache_base = vim.fn.fnamemodify(input_path, ":h")
-  -- effective_root = common ancestor of the intended project root and the
-  -- actual generated input directory. When the cache lives under source_root,
-  -- this stays equal to source_root and preserves rooted-path semantics for
-  -- real project files imported by context helpers.
-  local base_root = source_root or project_root
-  local effective_root = path_rewrite.common_ancestor(base_root, cache_base)
+  local effective_root = source_root
   local template, prefix = session_output_template(bufnr)
   local preview_sidecar_path = session_preview_sidecar_path(bufnr, source_root)
 

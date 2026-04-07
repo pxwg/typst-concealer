@@ -296,8 +296,14 @@ function M.build_batch_document(
 
   cache = cache or {}
   cache.item_fragments = cache.item_fragments or {}
+  local rewrite_signature = table.concat({
+    buf_dir or "",
+    source_root or "",
+    effective_root or "",
+  }, "\0")
 
   local header_key = table.concat({
+    rewrite_signature,
     config.header or "",
     main._styling_prelude or "",
     preamble_include_line or "",
@@ -319,6 +325,7 @@ function M.build_batch_document(
     local wrap_prefix, wrap_suffix = M.build_wrapper(item, source_rows)
     local suffix_text = wrap_suffix ~= "" and wrap_suffix or "\n"
     local item_key = table.concat({
+      rewrite_signature,
       tostring(prelude_chunks),
       tostring(item.prelude_count or 0),
       wrap_prefix,

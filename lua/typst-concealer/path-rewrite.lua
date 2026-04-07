@@ -13,6 +13,10 @@ local function normalize_path(path)
   return vim.fs.normalize(vim.fn.fnamemodify(path, ":p")):gsub("/$", "")
 end
 
+local function path_exists(path)
+  return path ~= nil and vim.uv.fs_stat(path) ~= nil
+end
+
 local function starts_with_path(path, base)
   if path == nil or base == nil then
     return false
@@ -110,11 +114,18 @@ function M.resolve_to_absolute(raw_path, buf_dir, source_root)
     return normalize_path((buf_dir or "") .. "/" .. raw_path), "fs"
   end
 
+  local fs_candidate = normalize_path(raw_path)
   local source_candidate = source_root and normalize_path(source_root .. raw_path) or nil
+  if path_exists(source_candidate) then
+    return source_candidate, "fs"
+  end
+  if path_exists(fs_candidate) then
+    return fs_candidate, "fs"
+  end
   if source_candidate ~= nil then
     return source_candidate, "fs"
   end
-  return normalize_path(raw_path), "fs"
+  return fs_candidate, "fs"
 end
 
 --- Encode a filesystem path for the effective Typst root.
