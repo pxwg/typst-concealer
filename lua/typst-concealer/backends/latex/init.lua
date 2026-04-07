@@ -9,10 +9,10 @@
 local state = require("typst-concealer.state")
 local M = {}
 
-local session = require("typst-concealer.backends.latex.session")
-local semantics = require("typst-concealer.backends.latex.semantics")
-local units = require("typst-concealer.backends.latex.units")
 local preview = require("typst-concealer.backends.latex.preview")
+local semantics = require("typst-concealer.backends.latex.semantics")
+local session = require("typst-concealer.backends.latex.session")
+local units = require("typst-concealer.backends.latex.units")
 
 -- ── Styling prelude ────────────────────────────────────────────────────────────
 -- For LaTeX, the styling prelude consists of colour/font commands injected into
@@ -33,7 +33,13 @@ function M.refresh_styling_prelude()
       end
     end
     if color then
-      M._styling_prelude = "\\definecolor{tcfg}{HTML}{" .. color:gsub("^#", "") .. "}\\color{tcfg}"
+      local fg_hex = color:gsub("^#", "")
+      local parts = {}
+      parts[#parts + 1] = "\\definecolor{tcfg}{HTML}{" .. fg_hex .. "}"
+      parts[#parts + 1] = "\\color{tcfg}"
+      parts[#parts + 1] = "\\everymath{\\color{tcfg}}"
+      parts[#parts + 1] = "\\everydisplay{\\color{tcfg}}"
+      M._styling_prelude = table.concat(parts, "\n")
     else
       M._styling_prelude = ""
     end
