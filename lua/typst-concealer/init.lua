@@ -341,6 +341,8 @@ function M.setup(cfg)
     local latex_backend = require("typst-concealer.backends.latex")
     latex_backend.setup(M.config.backends.latex)
     FILETYPE_TO_BACKEND["tex"] = latex_backend
+    FILETYPE_TO_BACKEND["plaintex"] = latex_backend
+    FILETYPE_TO_BACKEND["latex"] = latex_backend
   end
 
   -- ── Per-buffer initialisation ──────────────────────────────────────────────
@@ -552,7 +554,7 @@ function M.setup(cfg)
   end
 
   vim.api.nvim_create_autocmd("FileType", {
-    pattern = { "typst", "tex" },
+    pattern = { "typst", "tex", "plaintex", "latex" },
     group = augroup,
     callback = function(ev)
       init_buf(ev.buf)
