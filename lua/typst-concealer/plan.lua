@@ -340,7 +340,10 @@ function M.hard_reset_buf(bufnr)
   vim.api.nvim_buf_clear_namespace(bufnr, state.ns_id2, 0, -1)
   state.buffers[bufnr] = nil
   diagnostics = {}
-  get_backend(bufnr).reset_buf_state(bufnr)
+  local b = get_backend(bufnr)
+  if b then
+    b.reset_buf_state(bufnr)
+  end
   buf_backends[bufnr] = nil
 end
 
