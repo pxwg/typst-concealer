@@ -38,7 +38,8 @@ local function build_preamble(config, styling_prelude)
   local parts = {
     "\\documentclass{article}\n",
     "\\usepackage[active,tightpage]{preview}\n",
-    "\\setlength\\PreviewBorder{1pt}\n",
+    "\\setlength\\PreviewBorder{0pt}",
+    "\\setlength{\\topskip}{0pt}",
     "\\usepackage{amsmath,amssymb,amsfonts,mathtools}\n",
     "\\usepackage{xcolor}\n",
     "\\pagestyle{empty}\n",
