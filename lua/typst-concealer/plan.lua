@@ -3,9 +3,13 @@
 --- (render_live_typst_preview).  Both paths share semantics.classify() and the
 --- same extmark/session infrastructure.
 
-local semantics_mod = require("typst-concealer.semantics")
 local state = require("typst-concealer.state")
 local M = {}
+
+local backend -- set by M.set_backend()
+function M.set_backend(b)
+  backend = b
+end
 
 local diagnostics = {}
 
@@ -84,89 +88,6 @@ local function trim_left(s)
   return (s or ""):gsub("^%s+", "")
 end
 
---- Build an index of query-matched block nodes keyed by TSNode:id().
---- This index is used only for semantic annotation; actual top-level selection
---- is performed by AST traversal with subtree pruning.
---- @param bufnr integer
---- @param tree TSNode
---- @param query vim.treesitter.Query
---- @param start_row integer|nil
---- @param end_row integer|nil
---- @return table<integer, table>
-local function build_typst_match_index(bufnr, tree, query, start_row, end_row)
-  local index = {}
-
-  for _, match, _ in query:iter_matches(tree, bufnr, start_row, end_row, { all = true }) do
-    local block = match[3] and match[3][1]
-    if block ~= nil then
-      local node_id = block:id()
-      local entry = {
-        node = block,
-        node_type = block:type(),
-        range = { block:range() },
-      }
-
-      if entry.node_type == "code" then
-        local code_node = match[2] and match[2][1]
-        entry.code_type = code_node and code_node:type() or nil
-
-        if match[1] ~= nil then
-          local a, b, c, d = match[1][1]:range()
-          entry.call_ident = range_to_string({ a, b, c, d }, bufnr)
-        else
-          entry.call_ident = ""
-        end
-      end
-
-      index[node_id] = entry
-    end
-  end
-
-  return index
-end
-
-local function range_overlaps_rows(range, start_row, end_row)
-  return range[3] >= start_row and range[1] <= end_row
-end
-
---- Traverse AST top-down and collect only maximal / top-level matched units.
---- If a node is already a matched block, its subtree is pruned.
---- @param root TSNode
---- @param match_index table<integer, table>
---- @param start_row integer|nil
---- @param end_row integer|nil
---- @return table[]
-local function collect_top_level_typst_units(root, match_index, start_row, end_row)
-  local units = {}
-
-  local function visit(node)
-    if node == nil then
-      return
-    end
-    local sr, _, er, _ = node:range()
-    if start_row ~= nil and end_row ~= nil and (er < start_row or sr > end_row) then
-      return
-    end
-
-    local entry = match_index[node:id()]
-    if entry ~= nil then
-      if start_row == nil or range_overlaps_rows(entry.range, start_row, end_row) then
-        units[#units + 1] = entry
-      end
-      return
-    end
-
-    for child in node:iter_children() do
-      if child:named() then
-        visit(child)
-      end
-    end
-  end
-
-  visit(root)
-  return units
-end
-
 --- Convert top-level units into ordered render entries while accumulating preludes.
 --- @param bufnr integer
 --- @param units table[]
@@ -195,90 +116,6 @@ local function build_render_entries_from_units(bufnr, units)
   end
 
   return render_entries
-end
-
-local function units_overlap_rows(unit, start_row, end_row)
-  return range_overlaps_rows(unit.range, start_row, end_row)
-end
-
-local function expand_rows_to_cover_units(units, start_row, end_row)
-  local expanded_start = start_row
-  local expanded_end = end_row
-  local changed = true
-  while changed do
-    changed = false
-    for _, unit in ipairs(units or {}) do
-      if units_overlap_rows(unit, expanded_start, expanded_end) then
-        if unit.range[1] < expanded_start then
-          expanded_start = unit.range[1]
-          changed = true
-        end
-        if unit.range[3] > expanded_end then
-          expanded_end = unit.range[3]
-          changed = true
-        end
-      end
-    end
-  end
-  return expanded_start, expanded_end
-end
-
-local function can_incrementally_merge_units(prev_units, new_units, start_row, end_row)
-  for _, unit in ipairs(prev_units or {}) do
-    if units_overlap_rows(unit, start_row, end_row) and unit.node_type ~= "math" then
-      return false
-    end
-  end
-  for _, unit in ipairs(new_units or {}) do
-    if unit.node_type ~= "math" then
-      return false
-    end
-  end
-  return true
-end
-
-local function merge_units_in_rows(prev_units, new_units, start_row, end_row)
-  local merged = {}
-  local inserted = false
-  for _, unit in ipairs(prev_units or {}) do
-    if unit.range[3] < start_row then
-      merged[#merged + 1] = unit
-    elseif unit.range[1] > end_row then
-      if not inserted then
-        for _, new_unit in ipairs(new_units or {}) do
-          merged[#merged + 1] = new_unit
-        end
-        inserted = true
-      end
-      merged[#merged + 1] = unit
-    end
-  end
-  if not inserted then
-    for _, new_unit in ipairs(new_units or {}) do
-      merged[#merged + 1] = new_unit
-    end
-  end
-  return merged
-end
-
-local function collect_full_units(bufnr, root, query)
-  local match_index = build_typst_match_index(bufnr, root, query)
-  return collect_top_level_typst_units(root, match_index)
-end
-
-local function collect_incremental_units(bufnr, root, query, prev_units, pending_change)
-  if prev_units == nil or pending_change == nil or pending_change.requires_full then
-    return nil
-  end
-
-  local start_row, end_row =
-    expand_rows_to_cover_units(prev_units, pending_change.start_row, pending_change.new_end_row)
-  local match_index = build_typst_match_index(bufnr, root, query, start_row, end_row + 1)
-  local new_units = collect_top_level_typst_units(root, match_index, start_row, end_row)
-  if not can_incrementally_merge_units(prev_units, new_units, start_row, end_row) then
-    return nil
-  end
-  return merge_units_in_rows(prev_units, new_units, start_row, end_row)
 end
 
 local function new_image_id(bufnr)
@@ -317,150 +154,6 @@ local function get_text_slice(bufnr, start_row, start_col, end_row, end_col)
     return ""
   end
   return table.concat(vim.api.nvim_buf_get_text(bufnr, start_row, start_col, end_row, end_col, {}), "\n")
-end
-
-local function get_math_symbol_span_at_pos(item, row, col)
-  local line = vim.fn.getbufline(item.bufnr, row + 1)[1] or ""
-  if line == "" then
-    return nil
-  end
-
-  local parser = vim.treesitter.get_parser(item.bufnr, "typst")
-  local root = parser:parse()[1]:root()
-  local end_col = math.min(#line, col + 1)
-  local node = root:named_descendant_for_range(row, col, row, end_col)
-  if node == nil then
-    return nil
-  end
-
-  local formula_node = nil
-  local target = node
-  while target ~= nil do
-    local t = target:type()
-    if t == "formula" then
-      formula_node = target
-      break
-    end
-    target = target:parent()
-  end
-  if formula_node == nil then
-    return nil
-  end
-
-  target = node
-  while target ~= nil do
-    local parent = target:parent()
-    if parent == nil then
-      return nil
-    end
-    if parent:id() == formula_node:id() then
-      break
-    end
-    target = parent
-  end
-
-  local sr, sc, er, ec = target:range()
-  if not cursor_in_range(item.range, sr, sc, { include_right_edge = false }) then
-    return nil
-  end
-  if er < sr or (er == sr and ec < sc) then
-    return nil
-  end
-  local text = get_text_slice(item.bufnr, sr, sc, er, ec)
-  if text == nil or text == "" or text:match("^%s+$") then
-    return nil
-  end
-
-  return {
-    start_row = sr,
-    start_col = sc,
-    end_row = er,
-    end_col = ec,
-    text = text,
-  }
-end
-
-local function get_math_symbol_span_at_cursor(item, row, col, mode)
-  if item == nil or item.node_type ~= "math" or type(item.str) ~= "string" then
-    return nil
-  end
-
-  local line = vim.fn.getbufline(item.bufnr, row + 1)[1] or ""
-  if line == "" then
-    return nil
-  end
-
-  local candidates = {}
-  if col >= 0 and col < #line then
-    candidates[#candidates + 1] = col
-  end
-
-  if is_insert_like_mode(mode) and col > 0 then
-    local left_col = col - 1
-    if left_col >= 0 and left_col < #line then
-      candidates[#candidates + 1] = left_col
-    end
-  end
-
-  for _, candidate_col in ipairs(candidates) do
-    local span = get_math_symbol_span_at_pos(item, row, candidate_col)
-    if span ~= nil then
-      return span
-    end
-  end
-
-  return nil
-end
-
-local function make_highlighted_preview_math(item, cursor_row, cursor_col, mode)
-  if item == nil or item.node_type ~= "math" then
-    return nil, nil, nil
-  end
-
-  local source_text = range_to_string(item.range, item.bufnr)
-  if source_text == nil or source_text == "" then
-    return nil, nil, nil
-  end
-
-  local span = get_math_symbol_span_at_cursor(item, cursor_row, cursor_col, mode)
-  if span == nil then
-    local key = table.concat(item.range, ":")
-      .. ":plain:"
-      .. tostring(cursor_row)
-      .. ":"
-      .. tostring(cursor_col)
-      .. ":"
-      .. source_text
-    return source_text, key, source_text
-  end
-
-  if not cursor_in_range(item.range, span.start_row, span.start_col, { include_right_edge = false }) then
-    local key = table.concat(item.range, ":")
-      .. ":plain:"
-      .. tostring(cursor_row)
-      .. ":"
-      .. tostring(cursor_col)
-      .. ":"
-      .. source_text
-    return source_text, key, source_text
-  end
-
-  local prefix = get_text_slice(item.bufnr, item.range[1], item.range[2], span.start_row, span.start_col)
-  local suffix = get_text_slice(item.bufnr, span.end_row, span.end_col, item.range[3], item.range[4])
-  local replacement = "#text(red)[$" .. span.text .. "$]"
-  local rendered = prefix .. replacement .. suffix
-  local key = table.concat(item.range, ":")
-    .. ":"
-    .. tostring(span.start_row)
-    .. ":"
-    .. tostring(span.start_col)
-    .. ":"
-    .. tostring(span.end_row)
-    .. ":"
-    .. tostring(span.end_col)
-    .. ":"
-    .. source_text
-  return rendered, key, source_text
 end
 
 cursor_in_range = function(range, row, col, opts)
@@ -627,6 +320,7 @@ function M.hard_reset_buf(bufnr)
   vim.api.nvim_buf_clear_namespace(bufnr, state.ns_id2, 0, -1)
   state.buffers[bufnr] = nil
   diagnostics = {}
+  backend.reset_buf_state(bufnr)
 end
 
 --- Re-render all Typst nodes in bufnr.
@@ -638,24 +332,15 @@ function M.render_buf(bufnr)
 
   if main._enabled_buffers[bufnr] ~= true or not main.is_render_allowed(bufnr) then
     M.hard_reset_buf(bufnr)
-    local session = require("typst-concealer.session")
-    session.stop_watch_session(bufnr, "full")
+    backend.stop_session(bufnr, "full")
     return
   end
 
   diagnostics = {}
   state.runtime_preludes = {}
 
-  local session = require("typst-concealer.session")
   local bs = state.get_buf_state(bufnr)
-  local prev_state = state.buffer_render_state[bufnr] or {}
-
-  local parser = vim.treesitter.get_parser(bufnr, "typst")
-  local tree = parser:parse()[1]:root()
-  local units = collect_incremental_units(bufnr, tree, main._typst_query, prev_state.full_units, bs.pending_change)
-  if units == nil then
-    units = collect_full_units(bufnr, tree, main._typst_query)
-  end
+  local units = backend.collect_units(bufnr)
   bs.pending_change = nil
   local sorted_entries = build_render_entries_from_units(bufnr, units)
 
@@ -665,7 +350,7 @@ function M.render_buf(bufnr)
   local planned_items = {}
   for idx, entry in ipairs(sorted_entries) do
     local range, prelude_count, node_type = entry.range, entry.prelude_count, entry.node_type
-    local sem = semantics_mod.classify(range, bufnr, node_type)
+    local sem = backend.classify(range, bufnr, node_type)
     local str = range_to_string(range, bufnr)
     local display_range = range
     local display_prefix = nil
@@ -702,7 +387,7 @@ function M.render_buf(bufnr)
   local visible_batch_items = apply.commit_plan(bufnr, planned_items)
 
   vim.schedule(function()
-    session.render_items_via_watch(bufnr, visible_batch_items)
+    backend.render_items(bufnr, visible_batch_items)
   end)
   -- Reset hover guard so hide_extmarks_at_cursor re-evaluates after render
   state.get_buf_state(bufnr).hover.last_cursor_row = nil
@@ -1324,7 +1009,7 @@ end
 --- Stop the live preview tail page and remove its extmark/image.
 --- @param bufnr integer
 function M.clear_live_typst_preview(bufnr)
-  require("typst-concealer.session").clear_preview_tail(bufnr)
+  backend.clear_preview_tail(bufnr)
   cleanup_preview_image(bufnr)
 end
 
@@ -1402,44 +1087,46 @@ function M.render_live_typst_preview(bufnr)
   -- under the cursor while anchoring the float to the wrong range.
   local item = find_full_item_at_cursor(bufnr, cursor_row, cursor_col, mode)
   if item ~= nil then
-    local preview_str, render_key, source_str = make_highlighted_preview_math(item, cursor_row, cursor_col, mode)
-    if type(preview_str) ~= "string" or type(render_key) ~= "string" or type(source_str) ~= "string" then
-      M.clear_live_typst_preview(bufnr)
-      return
-    end
-    local bs = state.get_buf_state(bufnr)
-    if bs.preview_item ~= nil and bs.preview_render_key == render_key and item_has_stable_render(bs.preview_item) then
-      M.present_rendered_preview_item(bufnr, bs.preview_item)
-      return
-    end
-    if bs.preview_render_key == render_key then
+    if backend.make_highlighted_preview then
+      local preview_str, render_key, source_str = backend.make_highlighted_preview(item, cursor_row, cursor_col, mode)
+      if type(preview_str) ~= "string" or type(render_key) ~= "string" or type(source_str) ~= "string" then
+        M.clear_live_typst_preview(bufnr)
+        return
+      end
+      local bs = state.get_buf_state(bufnr)
+      if bs.preview_item ~= nil and bs.preview_render_key == render_key and item_has_stable_render(bs.preview_item) then
+        M.present_rendered_preview_item(bufnr, bs.preview_item)
+        return
+      end
+      if bs.preview_render_key == render_key then
+        present_preview_item(bufnr, item, cursor_row, cursor_col)
+        return
+      end
+
+      if item_has_stable_render(bs.preview_item) then
+        bs.preview_last_rendered_item = bs.preview_item
+        bs.preview_last_render_key = bs.preview_render_key
+      end
       present_preview_item(bufnr, item, cursor_row, cursor_col)
+
+      local shared_extmark_id = bs.preview_image and bs.preview_image.extmark_id or nil
+      if
+        bs.preview_item ~= nil and (bs.preview_image == nil or bs.preview_item.image_id ~= bs.preview_image.image_id)
+      then
+        cleanup_preview_item_request(bufnr, bs.preview_item, { keep_extmark = shared_extmark_id ~= nil })
+      end
+
+      local preview_item = require("typst-concealer.apply").allocate_preview_item(
+        bufnr,
+        item,
+        preview_str,
+        source_str,
+        render_key,
+        shared_extmark_id
+      )
+      backend.render_preview_tail(bufnr, preview_item)
       return
     end
-
-    if item_has_stable_render(bs.preview_item) then
-      bs.preview_last_rendered_item = bs.preview_item
-      bs.preview_last_render_key = bs.preview_render_key
-    end
-    present_preview_item(bufnr, item, cursor_row, cursor_col)
-
-    local shared_extmark_id = bs.preview_image and bs.preview_image.extmark_id or nil
-    if
-      bs.preview_item ~= nil and (bs.preview_image == nil or bs.preview_item.image_id ~= bs.preview_image.image_id)
-    then
-      cleanup_preview_item_request(bufnr, bs.preview_item, { keep_extmark = shared_extmark_id ~= nil })
-    end
-
-    local preview_item = require("typst-concealer.apply").allocate_preview_item(
-      bufnr,
-      item,
-      preview_str,
-      source_str,
-      render_key,
-      shared_extmark_id
-    )
-    require("typst-concealer.session").render_preview_tail(bufnr, preview_item)
-    return
   end
 
   if should_preserve_preview(bufnr, cursor_row, cursor_col) then

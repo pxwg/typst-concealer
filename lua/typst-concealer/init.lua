@@ -172,7 +172,7 @@ local function maybe_stop_hidden_full_watch(bufnr)
   if buf_has_visible_window(bufnr) then
     return
   end
-  require("typst-concealer.session").stop_watch_session(bufnr, "full")
+  require("typst-concealer")._backend.stop_session(bufnr, "full")
 end
 
 local function maybe_resume_visible_full_watch(bufnr)
@@ -186,8 +186,7 @@ local function maybe_resume_visible_full_watch(bufnr)
     return
   end
 
-  local session = require("typst-concealer.session")
-  if session.has_watch_session(bufnr, "full") then
+  if require("typst-concealer")._backend.has_session(bufnr, "full") then
     return
   end
   require("typst-concealer.plan").render_buf(bufnr)
@@ -226,8 +225,7 @@ M.disable_buf = function(bufnr)
   bufnr = bufnr or vim.fn.bufnr()
   M._enabled_buffers[bufnr] = nil
   require("typst-concealer.state").clear_hover_timer(bufnr)
-  local session = require("typst-concealer.session")
-  session.stop_watch_session(bufnr, "full")
+  require("typst-concealer")._backend.stop_session(bufnr, "full")
   local render = require("typst-concealer.plan")
   render.clear_live_typst_preview(bufnr)
   render.hard_reset_buf(bufnr)
@@ -296,6 +294,11 @@ function M.setup(cfg)
 
   setup_prelude()
   refresh_cell_px_size()
+
+  local typst_backend = require("typst-concealer.backends.typst")
+  typst_backend.setup(M.config)
+  require("typst-concealer.plan").set_backend(typst_backend)
+  M._backend = typst_backend
 
   if not cfg.allow_missing_typst and vim.fn.executable(M.config.typst_location) ~= 1 then
     if M.config.typst_location == "typst" then
@@ -565,8 +568,7 @@ function M.setup(cfg)
     pattern = "*.typ",
     desc = "stop typst watch sessions for dead buffers",
     callback = function(ev)
-      local session = require("typst-concealer.session")
-      session.stop_watch_sessions_for_buf(ev.buf)
+      require("typst-concealer")._backend.stop_sessions_for_buf(ev.buf)
       require("typst-concealer.state").clear_preview_timer(ev.buf)
       require("typst-concealer.plan").hard_reset_buf(ev.buf)
     end,
