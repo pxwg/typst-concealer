@@ -172,7 +172,8 @@ end
 --- @param bufnr integer
 --- @return string prefix, string suffix
 function M.make_flow_block_wrap(bufnr)
-  local config = require("typst-concealer").config
+  local main_config = require("typst-concealer").config
+  local config = main_config.backends and main_config.backends.typst or main_config
   local page_w_pt = current_window_width_pt(bufnr)
   local margin_pt = config.block_preview_margin_pt or 0
   return string.format(
@@ -268,7 +269,7 @@ function M.build_batch_document(
   cache
 )
   local main = require("typst-concealer")
-  local config = main.config
+  local config = main.config.backends.typst
   local typst_backend = require("typst-concealer.backends.typst")
   local doc = {}
   local line_map = build_line_map == false and nil or {}

@@ -37,23 +37,28 @@ end
 -- ── Public API ─────────────────────────────────────────────────────────────────
 
 --- @class typstconfig
---- @field typst_location?        string    Path to typst binary. Defaults to "typst" (PATH).
+--- Shared settings (apply to all backends):
 --- @field do_diagnostics?        boolean   Provide diagnostics on compile error.
---- @field color?                 string    Render colour (only when styling_type = "colorscheme").
 --- @field enabled_by_default?    boolean   Conceal newly opened buffers by default.
---- @field styling_type?          "none"|"simple"|"colorscheme"  Styling strategy.
 --- @field ppi?                   integer   Fallback PPI when terminal pixel size is unavailable.
 --- @field math_baseline_pt?      number    Expected math line height in pt for 1 terminal row. Default 11.
 --- @field conceal_in_normal      boolean   Keep concealing when the cursor is on a line in normal mode.
---- @field compiler_args?         string[]  Extra typst CLI arguments.
---- @field header?                string    Custom Typst code prepended to every rendered document.
 --- @field block_padding_cols?    integer   Terminal columns reserved as outer padding for code blocks.
---- @field block_preview_margin_pt? number  Extra Typst-side inner margin for code block previews.
 --- @field live_preview_enabled?  boolean   Enable inline live preview around the active math node. Default true.
 --- @field live_preview_debounce? number    Debounce delay for live preview in ms. Default 100.
 --- @field cursor_hover_throttle_ms? number  Throttle delay for CursorMoved hover in ms. Default 0 (disabled).
 --- @field render_paths?          { include?: (string|fun(path: string, bufnr: integer): boolean)[], exclude?: (string|fun(path: string, bufnr: integer): boolean)[] }
 ---                                     Optional path rules. `include` acts as a whitelist when non-empty; `exclude` always wins.
+--- Per-backend config (nested under backends.typst / backends.latex):
+--- @field backends?              { typst?: typstbackendconfig, latex?: latexbackendconfig }
+---
+--- @class typstbackendconfig  Typst-specific backend options (backends.typst).
+--- @field location?              string    Path to typst binary. Defaults to "typst" (PATH).
+--- @field styling_type?          "none"|"simple"|"colorscheme"  Styling strategy. Default "colorscheme".
+--- @field color?                 string    Render colour (only when styling_type = "colorscheme").
+--- @field compiler_args?         string[]  Extra typst CLI arguments.
+--- @field header?                string    Custom Typst code prepended to every rendered document.
+--- @field block_preview_margin_pt? number  Extra Typst-side inner margin for code block previews.
 --- @field get_root?              fun(bufnr: integer, path: string, cwd: string, kind: "full"): string|nil
 ---                                     Return the Typst root base passed to `--root` and used to interpret rooted paths
 ---                                     like `/fig/a.png`. Must be an absolute filesystem path. `nil` falls back to the
@@ -222,28 +227,46 @@ function M.setup(cfg)
   end
   M._setup_ran = true
 
+  -- Support both new nested form (backends.typst.X) and legacy top-level form (X).
+  local typst_cfg = (cfg.backends and cfg.backends.typst) or {}
   local latex_cfg = (cfg.backends and cfg.backends.latex) or {}
+
+  -- Backwards-compat: top-level keys fall back when not present in typst_cfg.
+  local function typst_default(key, fallback)
+    if typst_cfg[key] ~= nil then
+      return typst_cfg[key]
+    end
+    if cfg[key] ~= nil then
+      return cfg[key]
+    end
+    return fallback
+  end
+
   M.config = {
-    typst_location = default(cfg.typst_location, "typst"),
+    -- ── Shared settings ──────────────────────────────────────────────────────
     do_diagnostics = default(cfg.do_diagnostics, true),
     enabled_by_default = default(cfg.enabled_by_default, true),
-    styling_type = default(cfg.styling_type, "colorscheme"),
     ppi = default(cfg.ppi, 300),
     math_baseline_pt = default(cfg.math_baseline_pt, 11),
-    color = cfg.color,
     conceal_in_normal = default(cfg.conceal_in_normal, false),
-    compiler_args = default(cfg.compiler_args, {}),
-    header = default(cfg.header, ""),
     block_padding_cols = default(cfg.block_padding_cols, 15),
-    block_preview_margin_pt = default(cfg.block_preview_margin_pt, 6),
     live_preview_enabled = default(cfg.live_preview_enabled, true),
     live_preview_debounce = default(cfg.live_preview_debounce, 100),
     cursor_hover_throttle_ms = default(cfg.cursor_hover_throttle_ms, 0),
     render_paths = default(cfg.render_paths, {}),
-    get_root = cfg.get_root,
-    get_inputs = cfg.get_inputs,
-    get_preamble_file = cfg.get_preamble_file,
+    -- ── Per-backend settings ─────────────────────────────────────────────────
     backends = {
+      typst = {
+        location = typst_default("location", typst_default("typst_location", "typst")),
+        styling_type = typst_default("styling_type", "colorscheme"),
+        color = typst_cfg.color or cfg.color,
+        compiler_args = typst_default("compiler_args", {}),
+        header = typst_default("header", ""),
+        block_preview_margin_pt = typst_default("block_preview_margin_pt", 6),
+        get_root = typst_cfg.get_root or cfg.get_root,
+        get_inputs = typst_cfg.get_inputs or cfg.get_inputs,
+        get_preamble_file = typst_cfg.get_preamble_file or cfg.get_preamble_file,
+      },
       latex = {
         enabled = default(latex_cfg.enabled, false),
         compiler = default(latex_cfg.compiler, "pdflatex"),
@@ -257,16 +280,17 @@ function M.setup(cfg)
     },
   }
 
-  if not vim.list_contains({ "none", "simple", "colorscheme" }, M.config.styling_type) then
+  local typst_bc = M.config.backends.typst
+  if not vim.list_contains({ "none", "simple", "colorscheme" }, typst_bc.styling_type) then
     error(
-      "typst styling_type "
-        .. M.config.styling_type
+      "backends.typst.styling_type "
+        .. typst_bc.styling_type
         .. " is not a valid option. Please use 'none', 'simple' or 'colorscheme'"
     )
   end
 
-  if M.config.get_root ~= nil and type(M.config.get_root) ~= "function" then
-    error("typst get_root must be a function when provided")
+  if typst_bc.get_root ~= nil and type(typst_bc.get_root) ~= "function" then
+    error("backends.typst.get_root must be a function when provided")
   end
 
   refresh_cell_px_size()
@@ -284,16 +308,16 @@ function M.setup(cfg)
   end
 
   -- ── Typst backend ────────────────────────────────────────────────────────────
-  if not cfg.allow_missing_typst and vim.fn.executable(M.config.typst_location) ~= 1 then
-    if M.config.typst_location == "typst" then
+  if not cfg.allow_missing_typst and vim.fn.executable(typst_bc.location) ~= 1 then
+    if typst_bc.location == "typst" then
       error("Typst executable not found in path, typst-concealer will not work")
     else
-      error("Typst executable not found at '" .. M.config.typst_location .. "', typst-concealer will not work")
+      error("Typst executable not found at '" .. typst_bc.location .. "', typst-concealer will not work")
     end
   end
 
   local typst_backend = require("typst-concealer.backends.typst")
-  typst_backend.setup(M.config)
+  typst_backend.setup(typst_bc)
   FILETYPE_TO_BACKEND["typst"] = typst_backend
   -- Keep M._backend as the typst backend for backwards-compatible access
   M._backend = typst_backend

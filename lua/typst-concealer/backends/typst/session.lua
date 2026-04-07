@@ -184,7 +184,13 @@ local function get_typst_package_roots()
   end
 
   local ok_main, main = pcall(require, "typst-concealer")
-  local typst_location = (ok_main and main.config and main.config.typst_location) or "typst"
+  local typst_location = (
+    ok_main
+    and main.config
+    and main.config.backends
+    and main.config.backends.typst
+    and main.config.backends.typst.location
+  ) or "typst"
   local ok_run, result = pcall(vim.system, { typst_location, "info", "--format=json" }, { text = true })
   if ok_run and result then
     local completed = result:wait(1500)
@@ -342,7 +348,7 @@ end
 --- @return string
 local function resolve_preamble_include_line(bufnr, effective_root, kind)
   local main = require("typst-concealer")
-  local config = main.config
+  local config = main.config.backends.typst
   if type(config.get_preamble_file) ~= "function" then
     return ""
   end
@@ -1059,7 +1065,7 @@ function M.ensure_watch_session(bufnr)
   end
 
   local main = require("typst-concealer")
-  local config = main.config
+  local config = main.config.backends.typst
   local stdout = vim.uv.new_pipe()
   local stderr = vim.uv.new_pipe()
 
@@ -1115,7 +1121,7 @@ function M.ensure_watch_session(bufnr)
     end
   end
 
-  local args = { "watch", input_path, template, "--ppi=" .. (state._render_ppi or config.ppi) }
+  local args = { "watch", input_path, template, "--ppi=" .. (state._render_ppi or main.config.ppi) }
   for _, arg in ipairs(filtered_compiler_args) do
     args[#args + 1] = arg
   end
@@ -1193,7 +1199,7 @@ function M.ensure_watch_session(bufnr)
   session.preview_tail_item = make_preview_tail_item(session, nil)
 
   local handle
-  handle = vim.uv.spawn(config.typst_location, {
+  handle = vim.uv.spawn(config.location, {
     stdio = { nil, stdout, stderr },
     args = args,
   }, function()
@@ -1202,7 +1208,7 @@ function M.ensure_watch_session(bufnr)
       session.stderr_text = (session.stderr_text or "") .. session.stderr_line_buffer
       session.stderr_line_buffer = ""
     end
-    if config.do_diagnostics then
+    if main.config.do_diagnostics then
       update_quickfix_from_stderr(session)
     end
     if session.stderr_debounce and not session.stderr_debounce:is_closing() then
@@ -1240,7 +1246,7 @@ function M.ensure_watch_session(bufnr)
     if err2 ~= nil then
       return
     end
-    if not config.do_diagnostics then
+    if not main.config.do_diagnostics then
       return
     end
     if data ~= nil and data ~= "" then
