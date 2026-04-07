@@ -116,13 +116,15 @@ local function build_render_entries_from_units(bufnr, units)
   local render_entries = {}
 
   for _, unit in ipairs(units) do
-    if unit.node_type == "math" then
+    local source_kind = unit.source_kind or unit.node_type
+    if source_kind == "math" then
       render_entries[#render_entries + 1] = {
         range = unit.range,
         prelude_count = #state.runtime_preludes,
         node_type = "math",
+        backend_node_type = unit.node_type,
       }
-    elseif unit.node_type == "code" then
+    elseif source_kind == "code" then
       if vim.list_contains({ "let", "set", "import", "show" }, unit.code_type) then
         state.runtime_preludes[#state.runtime_preludes + 1] = range_to_string(unit.range, bufnr) .. "\n"
       elseif not vim.list_contains({ "pagebreak" }, unit.call_ident or "") then
@@ -130,6 +132,7 @@ local function build_render_entries_from_units(bufnr, units)
           range = unit.range,
           prelude_count = #state.runtime_preludes,
           node_type = "code",
+          backend_node_type = unit.node_type,
         }
       end
     end
@@ -374,7 +377,8 @@ function M.render_buf(bufnr)
   local planned_items = {}
   for idx, entry in ipairs(sorted_entries) do
     local range, prelude_count, node_type = entry.range, entry.prelude_count, entry.node_type
-    local sem = get_backend(bufnr).classify(range, bufnr, node_type)
+    local backend_node_type = entry.backend_node_type or node_type
+    local sem = get_backend(bufnr).classify(range, bufnr, backend_node_type)
     local str = range_to_string(range, bufnr)
     local display_range = range
     local display_prefix = nil
@@ -400,6 +404,7 @@ function M.render_buf(bufnr)
       str = str,
       prelude_count = prelude_count,
       node_type = node_type,
+      backend_node_type = backend_node_type,
       semantics = sem,
     }
   end
