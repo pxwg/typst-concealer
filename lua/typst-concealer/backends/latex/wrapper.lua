@@ -75,7 +75,7 @@ function M.build_batch_document(items, config, styling_prelude)
     parts[#parts + 1] = "\\begin{preview}\n"
     cur_line = cur_line + 1
 
-    local content = M.unwrap_math(item.str or "", item.node_type or "inline_formula")
+    local content = M.unwrap_math(item.str or "", item.backend_node_type or item.node_type or "inline_formula")
     local src_start = item.range[1] + 1 -- 1-based
     local src_end = item.range[3] + 1
     local content_lines = select(2, content:gsub("\n", "\n")) + 1

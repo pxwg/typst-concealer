@@ -34,6 +34,7 @@ local function build_latex_match_index(bufnr, tree, query, start_row, end_row)
       index[node_id] = {
         node = node,
         node_type = node:type(),
+        source_kind = "math",
         range = { node:range() },
       }
     end
