@@ -99,13 +99,13 @@ end
 --- @param bufnr integer
 --- @return string  path to the .tex batch input file
 local function session_input_path(bufnr)
-  return get_cache_dir(bufnr) .. "/.latex-concealer-" .. state.full_pid .. "-" .. bufnr .. ".tex"
+  return get_cache_dir(bufnr) .. "/latex-concealer-" .. state.full_pid .. "-" .. bufnr .. ".tex"
 end
 
 --- @param bufnr integer
 --- @return string  path to the compiled .pdf
 local function session_pdf_path(bufnr)
-  return get_cache_dir(bufnr) .. "/.latex-concealer-" .. state.full_pid .. "-" .. bufnr .. ".pdf"
+  return get_cache_dir(bufnr) .. "/latex-concealer-" .. state.full_pid .. "-" .. bufnr .. ".pdf"
 end
 
 --- @param bufnr integer
@@ -117,13 +117,13 @@ end
 --- @param bufnr integer
 --- @return string  path to the preview .tex input file
 local function preview_input_path(bufnr)
-  return get_cache_dir(bufnr) .. "/.latex-concealer-preview-" .. state.full_pid .. "-" .. bufnr .. ".tex"
+  return get_cache_dir(bufnr) .. "/latex-concealer-preview-" .. state.full_pid .. "-" .. bufnr .. ".tex"
 end
 
 --- @param bufnr integer
 --- @return string  path to the preview compiled .pdf
 local function preview_pdf_path(bufnr)
-  return get_cache_dir(bufnr) .. "/.latex-concealer-preview-" .. state.full_pid .. "-" .. bufnr .. ".pdf"
+  return get_cache_dir(bufnr) .. "/latex-concealer-preview-" .. state.full_pid .. "-" .. bufnr .. ".pdf"
 end
 
 --- @param bufnr integer
