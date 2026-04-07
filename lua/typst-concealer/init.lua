@@ -222,6 +222,7 @@ function M.setup(cfg)
   end
   M._setup_ran = true
 
+  local latex_cfg = (cfg.backends and cfg.backends.latex) or {}
   M.config = {
     typst_location = default(cfg.typst_location, "typst"),
     do_diagnostics = default(cfg.do_diagnostics, true),
@@ -242,6 +243,18 @@ function M.setup(cfg)
     get_root = cfg.get_root,
     get_inputs = cfg.get_inputs,
     get_preamble_file = cfg.get_preamble_file,
+    backends = {
+      latex = {
+        enabled = default(latex_cfg.enabled, false),
+        compiler = default(latex_cfg.compiler, "pdflatex"),
+        compiler_args = default(latex_cfg.compiler_args, {}),
+        converter = default(latex_cfg.converter, "pdftoppm"),
+        header = default(latex_cfg.header, ""),
+        do_diagnostics = default(latex_cfg.do_diagnostics, true),
+        color = latex_cfg.color,
+        styling_type = default(latex_cfg.styling_type, "colorscheme"),
+      },
+    },
   }
 
   if not vim.list_contains({ "none", "simple", "colorscheme" }, M.config.styling_type) then
@@ -284,6 +297,27 @@ function M.setup(cfg)
   FILETYPE_TO_BACKEND["typst"] = typst_backend
   -- Keep M._backend as the typst backend for backwards-compatible access
   M._backend = typst_backend
+
+  -- ── LaTeX backend (opt-in) ────────────────────────────────────────────────
+  if M.config.backends.latex.enabled then
+    local latex_bin = M.config.backends.latex.compiler
+    if vim.fn.executable(latex_bin) ~= 1 then
+      vim.notify(
+        ("[typst-concealer] LaTeX backend enabled but compiler '%s' not found in PATH"):format(latex_bin),
+        vim.log.levels.WARN
+      )
+    end
+    local latex_parser_ok = pcall(vim.treesitter.language.inspect, "latex")
+    if not latex_parser_ok then
+      vim.notify(
+        "[typst-concealer] LaTeX backend enabled but 'latex' treesitter parser not found — run :TSInstall latex",
+        vim.log.levels.WARN
+      )
+    end
+    local latex_backend = require("typst-concealer.backends.latex")
+    latex_backend.setup(M.config.backends.latex)
+    FILETYPE_TO_BACKEND["tex"] = latex_backend
+  end
 
   -- ── Per-buffer initialisation ──────────────────────────────────────────────
 
