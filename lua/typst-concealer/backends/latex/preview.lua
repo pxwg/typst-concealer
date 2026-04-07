@@ -13,11 +13,14 @@ local M = {}
 local function range_to_string(range, bufnr)
   local start_row, start_col, end_row, end_col = range[1], range[2], range[3], range[4]
   local content = vim.api.nvim_buf_get_lines(bufnr, start_row, end_row + 1, false)
+  if #content == 0 then
+    return ""
+  end
   if start_row == end_row then
-    content[1] = string.sub(content[1], start_col + 1, end_col)
+    content[1] = string.sub(content[1] or "", start_col + 1, end_col)
   else
-    content[1] = string.sub(content[1], start_col + 1)
-    content[#content] = string.sub(content[#content], 0, end_col)
+    content[1] = string.sub(content[1] or "", start_col + 1)
+    content[#content] = string.sub(content[#content] or "", 0, end_col)
   end
   return table.concat(content, "\n")
 end
