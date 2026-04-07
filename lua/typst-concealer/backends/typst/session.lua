@@ -24,7 +24,8 @@ local function qf_title(bufnr)
   return ("typst-concealer: %s"):format(name)
 end
 
---- Rebuild the global quickfix list for a buffer from active watch diagnostics.
+--- Aggregate diagnostics for bufnr and notify the frontend via the hook.
+--- The frontend (init.lua) owns the actual quickfix/diagnostic display.
 --- @param bufnr integer
 local function rebuild_quickfix(bufnr)
   local bucket = state.watch_diagnostics[bufnr] or {}
@@ -34,12 +35,9 @@ local function rebuild_quickfix(bufnr)
       items[#items + 1] = item
     end
   end
-  vim.schedule(function()
-    vim.fn.setqflist({}, "r", {
-      title = qf_title(bufnr),
-      items = items,
-    })
-  end)
+  if state.hooks.on_diagnostics_changed then
+    state.hooks.on_diagnostics_changed(bufnr, items)
+  end
 end
 
 --- Clear quickfix diagnostics for one session kind and rebuild the aggregated

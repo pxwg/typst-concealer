@@ -109,13 +109,20 @@ end
 --- @type { [integer]: table }
 M.item_by_image_id = {}
 
---- UI reaction hooks registered by plan.lua at module load time.
---- Allows apply.lua to trigger post-page-commit UI reactions without a
---- direct reverse require("typst-concealer.plan") dependency.
---- @type { on_page_committed: (fun(bufnr: integer)|nil), present_rendered_preview_item: (fun(bufnr: integer, item: table)|nil) }
+--- UI reaction hooks registered at module load / setup time.
+--- Allows backend modules to trigger frontend reactions (quickfix, page commits)
+--- without creating circular require dependencies.
+---
+--- on_page_committed: registered by plan.lua — called when a rendered page lands
+--- present_rendered_preview_item: registered by plan.lua — called to show preview
+--- on_diagnostics_changed: registered by init.lua — called by any backend when its
+---   diagnostic set for a buffer changes; receives (bufnr, items) where items is a
+---   flat list of quickfix-compatible tables.  The frontend owns display (setqflist).
+--- @type { on_page_committed: (fun(bufnr: integer)|nil), present_rendered_preview_item: (fun(bufnr: integer, item: table)|nil), on_diagnostics_changed: (fun(bufnr: integer, items: table[])|nil) }
 M.hooks = {
   on_page_committed = nil,
   present_rendered_preview_item = nil,
+  on_diagnostics_changed = nil,
 }
 
 --- Prelude strings accumulated during the current render_buf pass

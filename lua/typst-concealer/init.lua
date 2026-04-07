@@ -300,6 +300,19 @@ function M.setup(cfg)
   require("typst-concealer.plan").set_backend(typst_backend)
   M._backend = typst_backend
 
+  -- Register the frontend diagnostic handler.
+  -- The backend (session.lua) calls state.hooks.on_diagnostics_changed when its
+  -- error set changes; this handler is the only place that touches setqflist.
+  -- A LaTeX backend would call the same hook — no changes needed here.
+  local _state = require("typst-concealer.state")
+  _state.hooks.on_diagnostics_changed = function(bufnr, items)
+    vim.schedule(function()
+      local name = vim.api.nvim_buf_get_name(bufnr)
+      local title = ("typst-concealer: %s"):format(name ~= "" and name or ("buf:%d"):format(bufnr))
+      vim.fn.setqflist({}, "r", { title = title, items = items })
+    end)
+  end
+
   if not cfg.allow_missing_typst and vim.fn.executable(M.config.typst_location) ~= 1 then
     if M.config.typst_location == "typst" then
       error("Typst executable not found in path, typst-concealer will not work")
