@@ -1,6 +1,6 @@
 --- LaTeX compile session for typst-concealer.
---- Each buffer gets one compile session that runs pdflatex → pdftoppm on demand.
---- Pages are dispatched to apply.accept_page_update immediately after pdftoppm exits.
+--- Each buffer gets one compile session that runs pdflatex → pdftocairo on demand.
+--- Pages are dispatched to apply.accept_page_update immediately after pdftocairo exits.
 ---
 --- LaTeXBackend interface:
 ---   M.render_items_via_compile(bufnr, items)    trigger a full compile cycle
@@ -109,7 +109,7 @@ local function session_pdf_path(bufnr)
 end
 
 --- @param bufnr integer
---- @return string  prefix passed to pdftoppm for full render PNGs
+--- @return string  prefix passed to pdftocairo for full render PNGs
 local function session_output_prefix(bufnr)
   return "/tmp/tty-graphics-protocol-latex-concealer-" .. state.full_pid .. "-" .. bufnr
 end
@@ -127,7 +127,7 @@ local function preview_pdf_path(bufnr)
 end
 
 --- @param bufnr integer
---- @return string  pdftoppm prefix for preview PNGs
+--- @return string  pdftocairo prefix for preview PNGs
 local function preview_output_prefix(bufnr)
   return "/tmp/tty-graphics-protocol-latex-concealer-preview-" .. state.full_pid .. "-" .. bufnr
 end
@@ -314,13 +314,13 @@ end
 --- Forward declaration for mutual recursion.
 local start_full_compile
 
---- Run pdftoppm on the session's PDF and dispatch on_page_rendered for each page.
+--- Run pdftocairo on the session's PDF and dispatch on_page_rendered for each page.
 --- @param session table
 --- @param n_items integer  total number of items (= number of PDF pages)
 local function start_full_convert(session, n_items)
   local main = require("typst-concealer")
   local config = main.config.backends and main.config.backends.latex or {}
-  local converter = config.converter or "pdftoppm"
+  local converter = config.converter or "pdftocairo"
   local ppi = state._render_ppi or main.config.ppi or 150
   local pdf_path = session.pdf_path
   local prefix = session.output_prefix
@@ -329,7 +329,7 @@ local function start_full_convert(session, n_items)
   local handle
   handle = vim.uv.spawn(converter, {
     stdio = { nil, nil, stderr },
-    args = { "-r", tostring(ppi), "-png", pdf_path, prefix },
+    args = { "-r", tostring(ppi), "-png", "-transp", pdf_path, prefix },
   }, function(code)
     session.convert_handle = nil
     kill_handle(stderr)
@@ -354,7 +354,7 @@ local function start_full_convert(session, n_items)
       end
 
       if code ~= 0 then
-        vim.notify("[typst-concealer/latex] pdftoppm exited with code " .. tostring(code), vim.log.levels.WARN)
+        vim.notify("[typst-concealer/latex] pdftocairo exited with code " .. tostring(code), vim.log.levels.WARN)
       end
 
       if session.compile_pending then
@@ -370,7 +370,7 @@ local function start_full_convert(session, n_items)
 
   if handle == nil then
     vim.schedule(function()
-      vim.notify("[typst-concealer/latex] failed to spawn pdftoppm", vim.log.levels.ERROR)
+      vim.notify("[typst-concealer/latex] failed to spawn pdftocairo", vim.log.levels.ERROR)
     end)
     return
   end
@@ -411,7 +411,7 @@ start_full_compile = function(session)
       update_diagnostics_from_log(session)
 
       if code ~= 0 then
-        -- Compile error: still try pdftoppm in case partial output exists,
+        -- Compile error: still try pdftocairo in case partial output exists,
         -- but mark compile_pending false so we don't loop.
         session.compile_pending = false
         return
@@ -481,13 +481,13 @@ end
 --- Forward declaration for mutual recursion.
 local start_preview_compile
 
---- Run pdftoppm for the preview PDF and dispatch on_page_rendered for page 1.
+--- Run pdftocairo for the preview PDF and dispatch on_page_rendered for page 1.
 --- @param session table
 --- @param preview_item table
 local function start_preview_convert(session, preview_item)
   local main = require("typst-concealer")
   local config = main.config.backends and main.config.backends.latex or {}
-  local converter = config.converter or "pdftoppm"
+  local converter = config.converter or "pdftocairo"
   local ppi = state._render_ppi or main.config.ppi or 150
   local prefix = session.preview_output_prefix
 
@@ -495,7 +495,7 @@ local function start_preview_convert(session, preview_item)
   local handle
   handle = vim.uv.spawn(converter, {
     stdio = { nil, nil, stderr },
-    args = { "-r", tostring(ppi), "-png", session.preview_pdf_path, prefix },
+    args = { "-r", tostring(ppi), "-png", "-transp", session.preview_pdf_path, prefix },
   }, function(code)
     session.preview_convert_handle = nil
     kill_handle(stderr)
@@ -539,7 +539,7 @@ local function start_preview_convert(session, preview_item)
 
   if handle == nil then
     vim.schedule(function()
-      vim.notify("[typst-concealer/latex] failed to spawn pdftoppm (preview)", vim.log.levels.ERROR)
+      vim.notify("[typst-concealer/latex] failed to spawn pdftocairo (preview)", vim.log.levels.ERROR)
     end)
   end
 
