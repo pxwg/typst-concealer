@@ -100,6 +100,27 @@ local function col_delta_len(a, b)
   return math.abs(a[2] - b[2]) + math.abs(a[4] - b[4])
 end
 
+local function prev_item_matches_entry(prev_item, entry)
+  if prev_item == nil or entry == nil then
+    return false
+  end
+
+  -- Resource reuse must preserve source identity, not just visual proximity.
+  -- If we reuse an image/extmark for a different math node, stale rendered
+  -- pages stay bound to the wrong source until typst rewrites that page.
+  if prev_item.node_type ~= entry.node_type then
+    return false
+  end
+  if prev_item.str ~= entry.str then
+    return false
+  end
+  if prev_item.prelude_count ~= entry.prelude_count then
+    return false
+  end
+
+  return true
+end
+
 --- Match a fresh render entry to the most plausible previous item.
 --- @param prev_items table[]
 --- @param entry table
@@ -113,7 +134,7 @@ local function find_matching_prev_item(prev_items, entry, used_prev)
   local best_col_delta = math.huge
 
   for idx, prev_item in ipairs(prev_items) do
-    if not used_prev[idx] and prev_item.node_type == entry.node_type then
+    if not used_prev[idx] and prev_item_matches_entry(prev_item, entry) then
       local overlap = row_overlap_len(prev_item.range, entry.range)
       local gap = row_gap_len(prev_item.range, entry.range)
       local col_delta = col_delta_len(prev_item.range, entry.range)
@@ -325,8 +346,6 @@ local function item_blocked_by_error_diagnostics(bufnr, item)
   return false
 end
 
-local MAX_LINGER_MISSES = 2
-
 --- Allocate image_ids and extmarks for a batch of PlannedItems,
 --- reusing resources from previous render pass where possible.
 --- @param bufnr integer
@@ -340,13 +359,9 @@ function M.commit_plan(bufnr, planned_items)
   for _, item in ipairs(prev_state.full_items or {}) do
     prev_items[#prev_items + 1] = item
   end
-  for _, item in ipairs(prev_state.lingering_items or {}) do
-    prev_items[#prev_items + 1] = item
-  end
 
   local batch_items = {}
   local visible_batch_items = {}
-  local lingering_items = {}
   local used_prev = {}
 
   for _, planned in ipairs(planned_items) do
@@ -375,7 +390,6 @@ function M.commit_plan(bufnr, planned_items)
       node_type = planned.node_type,
       semantics = planned.semantics,
       needs_swap = prev_item ~= nil,
-      linger_misses = nil,
     }
 
     carry_stable_render_metadata(item, prev_item)
@@ -392,34 +406,24 @@ function M.commit_plan(bufnr, planned_items)
     end
   end
 
-  -- Release extmarks/images for items that no longer exist
+  -- Release extmarks/images for items that no longer exist. Do not keep
+  -- unmatched items alive across passes: when a math node is deleted or moved
+  -- far enough to stop matching, the old overlay must disappear immediately.
   for idx, prev_item in ipairs(prev_items) do
     if not used_prev[idx] then
-      if
-        not item_blocked_by_error_diagnostics(bufnr, prev_item)
-        and item_has_stable_render(prev_item)
-        and (prev_item.linger_misses or 0) < MAX_LINGER_MISSES
-      then
-        prev_item.linger_misses = (prev_item.linger_misses or 0) + 1
-        lingering_items[#lingering_items + 1] = prev_item
-      else
-        cleanup_item(bufnr, prev_item)
-      end
+      cleanup_item(bufnr, prev_item)
     end
   end
 
   state.buffer_render_state[bufnr] = state.buffer_render_state[bufnr] or {}
   state.buffer_render_state[bufnr].full_items = visible_batch_items
-  state.buffer_render_state[bufnr].lingering_items = lingering_items
+  state.buffer_render_state[bufnr].lingering_items = {}
 
   -- Rebuild per-line item index for O(1) hover lookup
   local line_to_items = {}
   local extmark_to_item = {}
   local visible_items = {}
   for _, item in ipairs(visible_batch_items) do
-    visible_items[#visible_items + 1] = item
-  end
-  for _, item in ipairs(lingering_items) do
     visible_items[#visible_items + 1] = item
   end
   for _, item in ipairs(visible_items) do
@@ -572,7 +576,6 @@ function M.accept_page_update(update)
   if item == nil or type(extmark_id) ~= "number" then
     return
   end
-
   local target_bufnr = bufnr
   if item and item.render_target == "float" then
     target_bufnr = item.target_bufnr or bufnr
