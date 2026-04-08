@@ -211,7 +211,7 @@ end
 
 local function cursor_engages_inline_item(range, row, col, mode)
   return cursor_in_range(range, row, col, {
-    include_right_edge = is_insert_like_mode(mode),
+    include_right_edge = is_insert_like_mode(mode) or range[1] ~= range[3],
   })
 end
 
