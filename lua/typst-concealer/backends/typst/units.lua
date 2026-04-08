@@ -184,30 +184,17 @@ local function merge_units_in_rows_impl(prev_units, new_units, start_row, end_ro
 end
 
 --- Collect all top-level Typst render units for bufnr.
---- Attempts an incremental merge if a pending_change is available and safe;
---- falls back to a full tree traversal.
+--- Use a full tree traversal for correctness.
+--- The incremental merge path can retain deleted math units after unsaved edits,
+--- which then keeps stale image/extmark state alive until the next full render
+--- (for example on save).
 --- @param bufnr integer
 --- @return table[]
 function M.collect_units(bufnr)
-  local bs = state.get_buf_state(bufnr)
-  local prev_state = state.buffer_render_state[bufnr] or {}
-  local pending = bs.pending_change
-
   local parser = vim.treesitter.get_parser(bufnr, "typst")
   local tree = parser:parse()[1]:root()
   local query = get_typst_query()
 
-  -- Try incremental path
-  if prev_state.full_units ~= nil and pending ~= nil and not pending.requires_full then
-    local start_row, end_row = expand_rows_to_cover_units(prev_state.full_units, pending.start_row, pending.new_end_row)
-    local match_index = build_typst_match_index(bufnr, tree, query, start_row, end_row + 1)
-    local new_units = collect_top_level_typst_units(tree, match_index, start_row, end_row)
-    if can_incrementally_merge_check(prev_state.full_units, new_units, start_row, end_row) then
-      return merge_units_in_rows_impl(prev_state.full_units, new_units, start_row, end_row)
-    end
-  end
-
-  -- Full collect
   local match_index = build_typst_match_index(bufnr, tree, query)
   return collect_top_level_typst_units(tree, match_index)
 end
