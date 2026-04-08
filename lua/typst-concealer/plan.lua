@@ -1038,7 +1038,10 @@ end
 --- Stop the live preview tail page and remove its extmark/image.
 --- @param bufnr integer
 function M.clear_live_typst_preview(bufnr)
-  get_backend(bufnr).clear_preview_tail(bufnr)
+  local backend = get_backend(bufnr)
+  if backend and backend.clear_preview_tail then
+    backend.clear_preview_tail(bufnr)
+  end
   cleanup_preview_image(bufnr)
 end
 
