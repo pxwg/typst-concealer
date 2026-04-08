@@ -192,7 +192,7 @@ end
 --- @return table[]
 function M.collect_units(bufnr)
   local parser = vim.treesitter.get_parser(bufnr, "typst")
-  local tree = parser:parse()[1]:root()
+  local tree = parser:parse(true)[1]:root()
   local query = get_typst_query()
 
   local match_index = build_typst_match_index(bufnr, tree, query)

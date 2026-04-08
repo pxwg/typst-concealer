@@ -65,7 +65,7 @@ local function get_math_symbol_span_at_pos(item, row, col)
   end
 
   local parser = vim.treesitter.get_parser(item.bufnr, "typst")
-  local root = parser:parse()[1]:root()
+  local root = parser:parse(true)[1]:root()
   local end_col = math.min(#line, col + 1)
   local node = root:named_descendant_for_range(row, col, row, end_col)
   if node == nil then
