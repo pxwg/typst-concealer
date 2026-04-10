@@ -42,6 +42,8 @@ end
 local function reset_modules()
   package.loaded["typst-concealer"] = nil
   package.loaded["typst-concealer.state"] = nil
+  package.loaded["typst-concealer.apply"] = nil
+  package.loaded["typst-concealer.extmark"] = nil
   package.loaded["typst-concealer.session"] = nil
   package.loaded["typst-concealer.wrapper"] = nil
   package.loaded["typst-concealer.path-rewrite"] = nil
@@ -121,6 +123,58 @@ local function fresh_state()
   state.path_rewrite_cache = {}
   state.runtime_preludes = {}
   return state
+end
+
+local function with_stubbed_extmark(fn)
+  local original = package.loaded["typst-concealer.extmark"]
+  local calls = {
+    placed = {},
+    cleared = {},
+  }
+
+  package.loaded["typst-concealer.extmark"] = {
+    place_render_extmark = function(bufnr, image_id, range, extmark_id)
+      local id = extmark_id or (image_id + 10000)
+      local state = require("typst-concealer.state")
+      state.image_id_to_extmark[image_id] = id
+      calls.placed[#calls.placed + 1] = {
+        bufnr = bufnr,
+        image_id = image_id,
+        range = range,
+        extmark_id = id,
+      }
+      return id
+    end,
+    clear_image = function(image_id)
+      local state = require("typst-concealer.state")
+      calls.cleared[#calls.cleared + 1] = image_id
+      state.image_ids_in_use[image_id] = nil
+    end,
+  }
+
+  local ok_run, result = pcall(fn, calls)
+  package.loaded["typst-concealer.extmark"] = original
+  if not ok_run then
+    error(result)
+  end
+  return result
+end
+
+local function make_render_item(fields)
+  local item = {
+    bufnr = 1,
+    item_idx = 1,
+    range = { 0, 0, 0, 3 },
+    str = "$x$",
+    prelude_count = 0,
+    node_type = "math",
+    semantics = { display_kind = "inline", constraint_kind = "inline" },
+  }
+  for key, value in pairs(fields or {}) do
+    item[key] = value
+  end
+  item.display_range = item.display_range or item.range
+  return item
 end
 
 local function make_temp_tree(name)
@@ -375,6 +429,101 @@ local function test_named_path_args_preserve_remote_urls()
   )
 end
 
+local function test_commit_plan_reuses_stable_render_for_same_source()
+  local state = fresh_state()
+  local bufnr = 1
+  local prev = make_render_item({
+    image_id = 101,
+    extmark_id = 201,
+    page_path = "/tmp/old.png",
+    page_stamp = "old-stamp",
+    natural_cols = 2,
+    natural_rows = 1,
+    source_rows = 1,
+  })
+  state.buffer_render_state[bufnr] = { full_items = { prev }, lingering_items = {} }
+  state.image_ids_in_use[prev.image_id] = bufnr
+  state.image_id_to_extmark[prev.image_id] = prev.extmark_id
+  state.item_by_image_id[prev.image_id] = prev
+
+  with_stubbed_extmark(function(calls)
+    local apply = require("typst-concealer.apply")
+    local planned = make_render_item({
+      range = { 0, 1, 0, 4 },
+    })
+    local items = apply.commit_plan(bufnr, { planned })
+
+    assert_eq(#items, 1, "same source should stay visible as one committed item")
+    assert_eq(items[1].image_id, prev.image_id, "same source should reuse image id")
+    assert_eq(items[1].extmark_id, prev.extmark_id, "same source should reuse extmark")
+    assert_eq(items[1].page_stamp, prev.page_stamp, "same source should carry stable render metadata")
+    assert_eq(#calls.cleared, 0, "same source should not clear the existing image")
+  end)
+end
+
+local function test_commit_plan_does_not_reuse_render_for_changed_source()
+  local state = fresh_state()
+  local bufnr = 1
+  state.pid = 1000
+  local prev = make_render_item({
+    image_id = 101,
+    extmark_id = 201,
+    page_path = "/tmp/old.png",
+    page_stamp = "old-stamp",
+    natural_cols = 2,
+    natural_rows = 1,
+    source_rows = 1,
+  })
+  state.buffer_render_state[bufnr] = { full_items = { prev }, lingering_items = {} }
+  state.image_ids_in_use[prev.image_id] = bufnr
+  state.image_id_to_extmark[prev.image_id] = prev.extmark_id
+  state.item_by_image_id[prev.image_id] = prev
+
+  with_stubbed_extmark(function(calls)
+    local apply = require("typst-concealer.apply")
+    local planned = make_render_item({
+      str = "$y$",
+    })
+    local items = apply.commit_plan(bufnr, { planned })
+
+    assert_eq(#items, 1, "changed source should still commit the new item")
+    assert_truthy(items[1].image_id ~= prev.image_id, "changed source should allocate a new image id")
+    assert_eq(items[1].page_stamp, nil, "changed source should not carry stale page metadata")
+    assert_eq(calls.cleared[1], prev.image_id, "changed source should clear the stale image immediately")
+    assert_eq(state.item_by_image_id[prev.image_id], nil, "changed source should unindex stale item")
+    assert_eq(state.image_id_to_extmark[prev.image_id], nil, "changed source should unindex stale extmark")
+  end)
+end
+
+local function test_commit_plan_cleans_removed_items_immediately()
+  local state = fresh_state()
+  local bufnr = 1
+  local prev = make_render_item({
+    image_id = 101,
+    extmark_id = 201,
+    page_path = "/tmp/old.png",
+    page_stamp = "old-stamp",
+    natural_cols = 2,
+    natural_rows = 1,
+    source_rows = 1,
+  })
+  state.buffer_render_state[bufnr] = { full_items = { prev }, lingering_items = {} }
+  state.image_ids_in_use[prev.image_id] = bufnr
+  state.image_id_to_extmark[prev.image_id] = prev.extmark_id
+  state.item_by_image_id[prev.image_id] = prev
+
+  with_stubbed_extmark(function(calls)
+    local apply = require("typst-concealer.apply")
+    local items = apply.commit_plan(bufnr, {})
+
+    assert_eq(#items, 0, "removed items should not remain visible")
+    assert_eq(#state.buffer_render_state[bufnr].lingering_items, 0, "removed items should not linger")
+    assert_eq(calls.cleared[1], prev.image_id, "removed items should clear their image immediately")
+    assert_eq(state.item_by_image_id[prev.image_id], nil, "removed items should be removed from image index")
+    assert_eq(state.image_ids_in_use[prev.image_id], nil, "removed items should release image ids")
+  end)
+end
+
 local function main()
   test_root_prefers_cwd_fallback()
   ok("ok root fallback uses cwd")
@@ -388,6 +537,12 @@ local function main()
   ok("ok named path args rewrite local paths")
   test_named_path_args_preserve_remote_urls()
   ok("ok named path args preserve remote urls")
+  test_commit_plan_reuses_stable_render_for_same_source()
+  ok("ok commit_plan reuses same-source stable renders")
+  test_commit_plan_does_not_reuse_render_for_changed_source()
+  ok("ok commit_plan rejects changed-source stale renders")
+  test_commit_plan_cleans_removed_items_immediately()
+  ok("ok commit_plan cleans removed items immediately")
   vim.cmd("qa!")
 end
 
