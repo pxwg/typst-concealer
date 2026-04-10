@@ -299,6 +299,82 @@ local function test_wrapper_cache_tracks_root_signature()
   )
 end
 
+local function test_remote_urls_do_not_rewrite_against_root()
+  reset_modules()
+  local path_rewrite = require("typst-concealer.path-rewrite")
+  local base = make_temp_tree("remote-url")
+  local project = vim.fs.joinpath(base, "project")
+  local effective_root = vim.fs.joinpath(base, "root")
+  assert(vim.fn.mkdir(project, "p") == 1)
+  assert(vim.fn.mkdir(effective_root, "p") == 1)
+  project = real_path(project)
+  effective_root = real_path(effective_root)
+
+  local rewritten = path_rewrite.rewrite_paths('#import "https://example.com/theme.typ": theme', {
+    bufnr = 1,
+    buf_dir = project,
+    source_root = project,
+    effective_root = effective_root,
+  })
+
+  assert_eq(
+    rewritten,
+    '#import "https://example.com/theme.typ": theme',
+    "remote URLs should bypass root-relative path rewriting"
+  )
+end
+
+local function test_named_path_args_rewrite_local_paths()
+  reset_modules()
+  local path_rewrite = require("typst-concealer.path-rewrite")
+  local base = make_temp_tree("named-path")
+  local project = vim.fs.joinpath(base, "project")
+  local assets = vim.fs.joinpath(project, "assets")
+  local effective_root = base
+  assert(vim.fn.mkdir(assets, "p") == 1)
+  write_file(vim.fs.joinpath(assets, "figure.png"), "png")
+  project = real_path(project)
+  effective_root = real_path(effective_root)
+
+  local rewritten = path_rewrite.rewrite_paths('#image_viewer(path: "assets/figure.png")', {
+    bufnr = 1,
+    buf_dir = project,
+    source_root = project,
+    effective_root = effective_root,
+  })
+
+  assert_eq(
+    rewritten,
+    '#image_viewer(path: "/project/assets/figure.png")',
+    "named path args should rewrite local asset paths against the effective root"
+  )
+end
+
+local function test_named_path_args_preserve_remote_urls()
+  reset_modules()
+  local path_rewrite = require("typst-concealer.path-rewrite")
+  local base = make_temp_tree("named-path-url")
+  local project = vim.fs.joinpath(base, "project")
+  local effective_root = vim.fs.joinpath(base, "root")
+  assert(vim.fn.mkdir(project, "p") == 1)
+  assert(vim.fn.mkdir(effective_root, "p") == 1)
+  project = real_path(project)
+  effective_root = real_path(effective_root)
+
+  local rewritten = path_rewrite.rewrite_paths('#image_viewer(path: "https://example.com/figure.png")', {
+    bufnr = 1,
+    buf_dir = project,
+    source_root = project,
+    effective_root = effective_root,
+  })
+
+  assert_eq(
+    rewritten,
+    '#image_viewer(path: "https://example.com/figure.png")',
+    "named path args should preserve remote URLs"
+  )
+end
+
 local function main()
   test_root_prefers_cwd_fallback()
   ok("ok root fallback uses cwd")
@@ -306,6 +382,12 @@ local function main()
   ok("ok get_root overrides root base")
   test_wrapper_cache_tracks_root_signature()
   ok("ok wrapper cache keys include root signature")
+  test_remote_urls_do_not_rewrite_against_root()
+  ok("ok remote urls bypass root rewrite")
+  test_named_path_args_rewrite_local_paths()
+  ok("ok named path args rewrite local paths")
+  test_named_path_args_preserve_remote_urls()
+  ok("ok named path args preserve remote urls")
   vim.cmd("qa!")
 end
 

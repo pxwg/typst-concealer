@@ -17,6 +17,14 @@ local function path_exists(path)
   return path ~= nil and vim.uv.fs_stat(path) ~= nil
 end
 
+local function is_remote_url(path)
+  if type(path) ~= "string" or path == "" then
+    return false
+  end
+  local scheme = path:match("^([%a][%w+%.%-]*)://")
+  return scheme ~= nil and scheme:lower() ~= "file"
+end
+
 local function starts_with_path(path, base)
   if path == nil or base == nil then
     return false
@@ -109,6 +117,9 @@ function M.resolve_to_absolute(raw_path, buf_dir, source_root)
   if raw_path:sub(1, 1) == "@" then
     return raw_path, "package"
   end
+  if is_remote_url(raw_path) then
+    return raw_path, "url"
+  end
 
   if raw_path:sub(1, 1) ~= "/" then
     return normalize_path((buf_dir or "") .. "/" .. raw_path), "fs"
@@ -162,6 +173,8 @@ function M.rewrite_path(raw_path, opts)
   local rewritten = raw_path
   if kind == "package" then
     rewritten = raw_path
+  elseif kind == "url" then
+    rewritten = raw_path
   elseif kind == "fs" and abs_path ~= nil then
     rewritten = M.encode_root_relative(abs_path, opts.effective_root)
   end
@@ -174,7 +187,7 @@ end
 
 --- Rewrite all relevant path strings in a Typst text fragment.
 --- Handles: #import, #include, image(), json(), toml(), yaml(), read(), csv(),
----          bibliography() first arg and style: named arg.
+---          bibliography() first arg and style:/path: named args.
 --- @param text string
 --- @param opts { bufnr?: integer, buf_dir: string, source_root: string, effective_root: string }
 --- @return string
@@ -213,6 +226,8 @@ function M.rewrite_paths(text, opts)
 
   text = text:gsub('(style%s*:%s*")([^"]*)(")', sub)
   text = text:gsub("(style%s*:%s*')" .. "([^']*)" .. "(')", sub)
+  text = text:gsub('(path%s*:%s*")([^"]*)(")', sub)
+  text = text:gsub("(path%s*:%s*')" .. "([^']*)" .. "(')", sub)
 
   if text_cache ~= nil then
     text_cache[original_text] = text
