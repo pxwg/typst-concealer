@@ -1,5 +1,10 @@
 # Typst concealer
 
+> [!WARNING]
+> The `main` branch is under heavy refactoring to extend preview support to more languages and has known issues.  
+> For a stable experience with Typst only, please pin to the [`stable`](https://github.com/pxwg/typst-concealer/tree/stable) branch in your Neovim plugin manager.  
+> The `stable` branch supports **only Typst** and is not affected by the ongoing refactoring.
+
 A neovim plugin that uses the new(ish) kitty unicode rendering protocol to render typst expressions inline.
 Has live previews as you type in insert mode.
 
