@@ -291,6 +291,25 @@ local function clear_diagnostics(bufnr)
   end)
 end
 
+local function hash_string(value)
+  return vim.fn.sha256(value or "")
+end
+
+local function project_scope_id(bufnr)
+  return table.concat({
+    vim.api.nvim_buf_get_name(bufnr) or "",
+    vim.fn.getcwd() or "",
+  }, "\0")
+end
+
+local function context_hash(prelude_count)
+  local parts = { tostring(prelude_count or 0) }
+  for i = 1, prelude_count or 0 do
+    parts[#parts + 1] = state.runtime_preludes[i] or ""
+  end
+  return hash_string(table.concat(parts, "\0"))
+end
+
 local function is_insert_like_mode(mode)
   mode = mode or vim.api.nvim_get_mode().mode or ""
   return mode:find("i", 1, true) ~= nil or mode:find("R", 1, true) ~= nil
@@ -646,7 +665,6 @@ function M.render_buf(bufnr)
   diagnostics = {}
   state.runtime_preludes = {}
 
-  local session = require("typst-concealer.session")
   local bs = state.get_buf_state(bufnr)
   local prev_state = state.buffer_render_state[bufnr] or {}
 
@@ -659,10 +677,8 @@ function M.render_buf(bufnr)
   bs.pending_change = nil
   local sorted_entries = build_render_entries_from_units(bufnr, units)
 
-  local apply = require("typst-concealer.apply")
-
-  -- Build PlannedItems from sorted_entries
-  local planned_items = {}
+  -- Build machine ScannedNodes from sorted_entries.
+  local scanned_nodes = {}
   for idx, entry in ipairs(sorted_entries) do
     local range, prelude_count, node_type = entry.range, entry.prelude_count, entry.node_type
     local sem = semantics_mod.classify(range, bufnr, node_type)
@@ -681,14 +697,16 @@ function M.render_buf(bufnr)
       end
     end
 
-    planned_items[#planned_items + 1] = {
-      bufnr = bufnr,
+    scanned_nodes[#scanned_nodes + 1] = {
       item_idx = idx,
-      range = range,
+      stable_key = nil,
+      source_range = range,
       display_range = display_range,
       display_prefix = display_prefix,
       display_suffix = display_suffix,
-      str = str,
+      source_text = str,
+      source_text_hash = hash_string(str),
+      context_hash = context_hash(prelude_count),
       prelude_count = prelude_count,
       node_type = node_type,
       semantics = sem,
@@ -699,11 +717,20 @@ function M.render_buf(bufnr)
   state.buffer_render_state[bufnr].full_units = units
   state.buffer_render_state[bufnr].runtime_preludes = state.runtime_preludes
 
-  local visible_batch_items = apply.commit_plan(bufnr, planned_items)
+  local runtime = require("typst-concealer.machine.runtime")
+  runtime.dispatch({
+    type = "nodes_scanned",
+    bufnr = bufnr,
+    project_scope_id = project_scope_id(bufnr),
+    buffer_version = vim.api.nvim_buf_get_changedtick(bufnr),
+    layout_version = vim.o.columns,
+    scanned_nodes = scanned_nodes,
+  })
+  runtime.dispatch({
+    type = "full_render_requested",
+    bufnr = bufnr,
+  })
 
-  vim.schedule(function()
-    session.render_items_via_watch(bufnr, visible_batch_items)
-  end)
   -- Reset hover guard so hide_extmarks_at_cursor re-evaluates after render
   state.get_buf_state(bufnr).hover.last_cursor_row = nil
   state.get_buf_state(bufnr).hover.last_mode = nil
