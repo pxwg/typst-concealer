@@ -642,6 +642,7 @@ function M.hard_reset_buf(bufnr)
   state.clear_hover_timer(bufnr)
   state.clear_preview_timer(bufnr)
   require("typst-concealer.apply").hard_reset(bufnr)
+  require("typst-concealer.machine.runtime").reset_buffer(bufnr)
   vim.api.nvim_buf_clear_namespace(bufnr, state.ns_id, 0, -1)
   vim.api.nvim_buf_clear_namespace(bufnr, state.ns_id2, 0, -1)
   state.buffers[bufnr] = nil

@@ -1,6 +1,7 @@
 --- Watch session management for typst-concealer.
 --- Manages long-running `typst watch` processes and polling for rendered pages.
---- When a page is stable, delegates to apply.accept_page_update for display.
+--- When a legacy preview page is stable, delegates to apply.accept_page_update.
+--- Machine-owned full pages are emitted as overlay_page_ready events.
 ---
 --- TypstBackend interface (current: Typst only)
 ---   M.render_items_via_watch(bufnr, items)          dispatch full items to the watch session

@@ -138,6 +138,21 @@ function M.reset()
   return state.machine_state
 end
 
+function M.reset_buffer(bufnr)
+  local machine_state = ensure_machine_state()
+  machine_state.buffers[bufnr] = nil
+
+  local to_remove = {}
+  for overlay_id, overlay in pairs(machine_state.overlays or {}) do
+    if overlay.owner_bufnr == bufnr then
+      to_remove[#to_remove + 1] = overlay_id
+    end
+  end
+  for _, overlay_id in ipairs(to_remove) do
+    machine_state.overlays[overlay_id] = nil
+  end
+end
+
 function M.get_state()
   return ensure_machine_state()
 end

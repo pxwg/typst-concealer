@@ -804,6 +804,23 @@ local function test_machine_runtime_builds_watch_render_job()
   assert_eq(job.str, "$x$", "job should remain wrapper-compatible")
 end
 
+local function test_machine_runtime_resets_buffer_snapshot()
+  local state = fresh_state()
+  local runtime = require("typst-concealer.machine.runtime")
+
+  state.machine_state.buffers[1] = { bufnr = 1, nodes = {}, node_order = {} }
+  state.machine_state.buffers[2] = { bufnr = 2, nodes = {}, node_order = {} }
+  state.machine_state.overlays["overlay:1"] = { overlay_id = "overlay:1", owner_bufnr = 1 }
+  state.machine_state.overlays["overlay:2"] = { overlay_id = "overlay:2", owner_bufnr = 2 }
+
+  runtime.reset_buffer(1)
+
+  assert_eq(state.machine_state.buffers[1], nil, "reset should remove the target buffer snapshot")
+  assert_truthy(state.machine_state.buffers[2] ~= nil, "reset should keep other buffer snapshots")
+  assert_eq(state.machine_state.overlays["overlay:1"], nil, "reset should remove target buffer overlays")
+  assert_truthy(state.machine_state.overlays["overlay:2"] ~= nil, "reset should keep other buffer overlays")
+end
+
 local function test_commit_plan_reuses_stable_render_for_same_source()
   local state = fresh_state()
   local bufnr = 1
@@ -922,6 +939,8 @@ local function main()
   ok("ok machine runtime rebuilds compat read model")
   test_machine_runtime_builds_watch_render_job()
   ok("ok machine runtime builds watch render job")
+  test_machine_runtime_resets_buffer_snapshot()
+  ok("ok machine runtime resets buffer snapshot")
   test_commit_plan_reuses_stable_render_for_same_source()
   ok("ok commit_plan reuses same-source stable renders")
   test_commit_plan_does_not_reuse_render_for_changed_source()
