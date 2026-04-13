@@ -596,6 +596,61 @@ local function compose_session_items(session)
   return items
 end
 
+--- @param request WatchRenderRequest
+--- @return CurrentWatchRequest
+local function build_current_request(request)
+  local page_to_overlay = {}
+  local overlay_to_page = {}
+  local jobs = request.jobs or {}
+
+  for i, job in ipairs(jobs) do
+    local page_index = job.request_page_index or i
+    job.request_id = request.request_id
+    job.request_page_index = page_index
+    page_to_overlay[page_index] = job.overlay_id
+    overlay_to_page[job.overlay_id] = page_index
+  end
+
+  return {
+    request_id = request.request_id,
+    render_epoch = request.render_epoch,
+    buffer_version = request.buffer_version,
+    layout_version = request.layout_version,
+    project_scope_id = request.project_scope_id,
+    jobs = jobs,
+    page_to_overlay = page_to_overlay,
+    overlay_to_page = overlay_to_page,
+    page_count = #jobs,
+    status = "active",
+  }
+end
+
+local function is_active_request_page(session, i)
+  local request = session.current_request
+  return request ~= nil and request.status == "active" and i >= 1 and i <= request.page_count
+end
+
+local function replace_current_request(session, request)
+  if session.current_request ~= nil then
+    session.current_request.status = "abandoned"
+  end
+  session.current_request = build_current_request(request)
+  return session.current_request
+end
+
+local function clear_request_output_pages(session, page_count)
+  local last_count = session.last_page_count or 0
+  local clear_count = math.max(last_count, page_count or 0)
+  for i = 1, clear_count do
+    clear_session_output_page(session.output_prefix, i)
+  end
+  session.page_state = {}
+  session.last_page_count = 0
+  -- If the generated input text is identical to the previous request, Typst
+  -- still needs a fresh write after pages were cleared.
+  session.last_input_text = nil
+end
+
 local function session_render_start_index(session)
   local total = #(session.items or {})
   if total == 0 then
@@ -615,7 +670,7 @@ local try_render_session_page
 --- @param session typst_watch_session
 --- @return boolean
 local function full_pages_have_stable_renders(session)
-  local total = #(session.base_items or {})
+  local total = session.current_request and session.current_request.page_count or #(session.base_items or {})
   if total == 0 then
     return false
   end
@@ -866,20 +921,18 @@ function M.stop_watch_sessions_for_buf(bufnr)
   M.stop_watch_session(bufnr, "full")
 end
 
---- Called when a rendered page file is stable and ready to display.
---- Looks up item.semantics for the swap / padding decisions.
+--- Called when a rendered page file is stable enough to inspect.
 --- @param bufnr          integer
 --- @param page_path      string
---- @param image_id       integer
---- @param extmark_id     integer
+--- @param item           table
 --- @param original_range table
 --- @param page_stamp     string
-local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original_range, page_stamp)
+--- @return table|nil
+local function build_page_update(bufnr, page_path, item, original_range, page_stamp)
   local pngData = require("typst-concealer.png-lua")
   local kitty_codes = require("typst-concealer.kitty-codes")
 
-  local item = state.get_item_by_image_id(image_id)
-  if item == nil or type(extmark_id) ~= "number" then
+  if item == nil then
     return
   end
 
@@ -888,7 +941,7 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
     target_range = item.target_range or original_range
   end
 
-  local expected_str = item.source_str or item.str
+  local expected_str = item.source_str or item.source_text or item.str
   if expected_str ~= nil and range_to_string(item.bufnr, item.range) ~= expected_str then
     return
   end
@@ -926,17 +979,78 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
     natural_cols = #kitty_codes.diacritics - 1
   end
 
-  require("typst-concealer.apply").accept_page_update({
+  return {
     bufnr = bufnr,
-    image_id = image_id,
-    extmark_id = extmark_id,
+    image_id = item.image_id,
+    extmark_id = item.extmark_id,
     original_range = original_range,
     page_path = page_path,
     page_stamp = page_stamp,
     natural_cols = natural_cols,
     natural_rows = natural_rows,
     source_rows = source_rows,
+  }
+end
+
+--- Called when a legacy rendered page is ready to display.
+--- @param bufnr          integer
+--- @param page_path      string
+--- @param image_id       integer
+--- @param extmark_id     integer
+--- @param original_range table
+--- @param page_stamp     string
+local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original_range, page_stamp)
+  local item = state.get_item_by_image_id(image_id)
+  if item == nil or type(extmark_id) ~= "number" then
+    return false
+  end
+
+  local update = build_page_update(bufnr, page_path, item, original_range, page_stamp)
+  if update == nil then
+    return false
+  end
+  require("typst-concealer.apply").accept_page_update(update)
+  return true
+end
+
+--- @param session typst_watch_session
+--- @param request CurrentWatchRequest
+--- @param request_page_index integer
+--- @param job RenderJob
+--- @param page_path string
+--- @param page_stamp string
+--- @return boolean
+local function on_request_page_rendered(session, request, request_page_index, job, page_path, page_stamp)
+  if job == nil or request == nil or request.status ~= "active" then
+    return false
+  end
+  if request.page_to_overlay[request_page_index] ~= job.overlay_id then
+    return false
+  end
+
+  local update = build_page_update(session.bufnr, page_path, job, job.range, page_stamp)
+  if update == nil then
+    return false
+  end
+
+  require("typst-concealer.machine.runtime").dispatch({
+    type = "overlay_page_ready",
+    request_id = request.request_id,
+    request_page_index = request_page_index,
+    overlay_id = job.overlay_id,
+    owner_node_id = job.node_id,
+    owner_bufnr = job.bufnr,
+    owner_project_scope_id = job.project_scope_id,
+    render_epoch = job.render_epoch,
+    buffer_version = job.buffer_version,
+    layout_version = job.layout_version,
+    page_path = page_path,
+    page_stamp = page_stamp,
+    natural_cols = update.natural_cols,
+    natural_rows = update.natural_rows,
+    source_rows = update.source_rows,
   })
+  return true
 end
 
 --- @param session typst_watch_session
@@ -971,7 +1085,10 @@ end
 --- @param item table|nil
 --- @return boolean
 local function session_page_needs_render(session, i, item)
-  if item == nil or item.image_id == nil or item.extmark_id == nil or item.render_target == "preview_tail_inactive" then
+  if item == nil or item.image_id == nil or item.render_target == "preview_tail_inactive" then
+    return false
+  end
+  if item.extmark_id == nil and not is_active_request_page(session, i) then
     return false
   end
 
@@ -1012,11 +1129,28 @@ end
 local function schedule_session_page_render(session, i, item, page_path, stamp)
   local page_state = session.page_state[i] or {}
   session.page_state[i] = page_state
+  local request = is_active_request_page(session, i) and session.current_request or nil
   vim.schedule(function()
     local current = get_watch_session(session.bufnr, session.kind)
     if current ~= session then
       return
     end
+    if request ~= nil then
+      if session.current_request ~= request or request.status ~= "active" then
+        return
+      end
+      local job = request.jobs[i]
+      if job == nil then
+        return
+      end
+      if on_request_page_rendered(session, request, i, job, page_path, stamp) then
+        page_state.rendered = stamp
+        session.page_state[i] = page_state
+        refresh_session_poll_interval(session)
+      end
+      return
+    end
+
     local before_item = state.get_item_by_image_id(item.image_id)
     local before_stamp = before_item and before_item.page_stamp or nil
     on_page_rendered(session.bufnr, page_path, item.image_id, item.extmark_id, item.range, stamp)
@@ -1036,7 +1170,10 @@ end
 --- @param i       integer
 --- @param item    table
 try_render_session_page = function(session, i, item)
-  if item == nil or item.image_id == nil or item.extmark_id == nil or item.render_target == "preview_tail_inactive" then
+  if item == nil or item.image_id == nil or item.render_target == "preview_tail_inactive" then
+    return
+  end
+  if item.extmark_id == nil and not is_active_request_page(session, i) then
     return
   end
   local page_path = session.output_prefix .. "-" .. i .. ".png"
@@ -1205,6 +1342,7 @@ function M.ensure_watch_session(bufnr)
     wrapper_cache = {
       item_fragments = {},
     },
+    current_request = nil,
     line_map = nil,
     stderr_chunks = {},
     stderr_text = "",
@@ -1312,6 +1450,10 @@ function M.render_items_via_watch(bufnr, items)
   if session == nil then
     return
   end
+  if session.current_request ~= nil then
+    session.current_request.status = "abandoned"
+    session.current_request = nil
+  end
   session.base_items = items or {}
   session.prelude_chunks = snapshot_full_context_preludes(bufnr)
   if session.preview_active and session.preview_sidecar_item ~= nil then
@@ -1328,6 +1470,49 @@ function M.render_items_via_watch(bufnr, items)
   session.render_start_index = 1
   write_session_document(session, "full")
   refresh_session_poll_interval(session)
+end
+
+--- Send a machine-owned full render request to the watch session.
+--- @param bufnr integer
+--- @param request WatchRenderRequest
+function M.render_request_via_watch(bufnr, request)
+  local session = M.ensure_watch_session(bufnr)
+  if session == nil then
+    return
+  end
+
+  local current_request = replace_current_request(session, request)
+  clear_request_output_pages(session, current_request.page_count)
+  session.base_items = current_request.jobs
+  session.prelude_chunks = snapshot_full_context_preludes(bufnr)
+  if session.preview_active and session.preview_sidecar_item ~= nil then
+    session.preview_tail_item = make_preview_tail_item(session, session.preview_sidecar_item)
+  else
+    session.preview_tail_item = make_preview_tail_item(session, nil)
+  end
+  local ok_preview, preview_err = write_preview_sidecar(session, session.preview_sidecar_item)
+  if not ok_preview then
+    vim.schedule(function()
+      vim.notify("[typst-concealer] failed to refresh preview sidecar: " .. tostring(preview_err), vim.log.levels.ERROR)
+    end)
+  end
+  session.render_start_index = 1
+  write_session_document(session, "full")
+  refresh_session_poll_interval(session)
+end
+
+--- Mark an in-flight machine request as abandoned if it is still current.
+--- @param bufnr integer
+--- @param old_request_id string
+--- @param _new_request_id string
+function M.abandon_request(bufnr, old_request_id, _new_request_id)
+  local session = get_watch_session(bufnr, "full")
+  if session == nil or session.current_request == nil then
+    return
+  end
+  if session.current_request.request_id == old_request_id then
+    session.current_request.status = "abandoned"
+  end
 end
 
 --- Update the transient preview tail page on the full watch session.

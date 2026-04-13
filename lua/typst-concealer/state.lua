@@ -43,6 +43,7 @@ M.image_ids_in_use = {}
 --- @field last_input_text string|nil
 --- @field last_preview_sidecar_text string|nil
 --- @field wrapper_cache table|nil
+--- @field current_request CurrentWatchRequest|nil
 --- @field stderr_chunks string[]
 --- @field dead boolean|nil
 --- @field buf_dir string

@@ -364,6 +364,88 @@ local function test_get_root_overrides_fallback()
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
+local function test_session_render_request_tracks_current_request()
+  local root = make_temp_tree("watch-request")
+  local main_path = vim.fs.joinpath(root, "main.typ")
+  write_file(main_path, "$x$")
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(bufnr, main_path)
+  local state = fresh_state()
+  state.buffer_render_state[bufnr] = { runtime_preludes = {} }
+
+  with_stubbed_uv(function()
+    package.loaded["typst-concealer"] = {
+      config = {
+        typst_location = "typst",
+        ppi = 300,
+        compiler_args = {},
+        get_root = function()
+          return root
+        end,
+        get_inputs = nil,
+        get_preamble_file = nil,
+        do_diagnostics = false,
+        header = "",
+      },
+      _styling_prelude = "",
+    }
+
+    local session_mod = require("typst-concealer.session")
+    local request = {
+      request_id = "request:1",
+      bufnr = bufnr,
+      project_scope_id = "project:1",
+      render_epoch = 1,
+      buffer_version = 1,
+      layout_version = 1,
+      jobs = {
+        {
+          request_id = "request:1",
+          request_page_index = 1,
+          overlay_id = "overlay:1",
+          node_id = "node:1",
+          bufnr = bufnr,
+          project_scope_id = "project:1",
+          render_epoch = 1,
+          buffer_version = 1,
+          layout_version = 1,
+          item_idx = 1,
+          range = { 0, 0, 0, 3 },
+          display_range = { 0, 0, 0, 3 },
+          source_text = "$x$",
+          str = "$x$",
+          prelude_count = 0,
+          semantics = { display_kind = "inline", constraint_kind = "intrinsic" },
+          image_id = 101,
+        },
+      },
+    }
+
+    session_mod.render_request_via_watch(bufnr, request)
+    local session = state.watch_sessions[bufnr].full
+    assert_eq(session.current_request.request_id, "request:1", "session should track current request id")
+    assert_eq(session.current_request.status, "active", "new request should be active")
+    assert_eq(session.current_request.page_to_overlay[1], "overlay:1", "page should map to overlay")
+    assert_eq(session.current_request.overlay_to_page["overlay:1"], 1, "overlay should map back to page")
+    assert_eq(session.base_items[1].overlay_id, "overlay:1", "request jobs should become watch base items")
+    assert_eq(next(session.page_state), nil, "new request should reset page state")
+    assert_truthy(session.last_input_text ~= nil, "new request should write watch input")
+
+    local old_request = session.current_request
+    local request2 = vim.deepcopy(request)
+    request2.request_id = "request:2"
+    request2.jobs[1].request_id = "request:2"
+    session_mod.render_request_via_watch(bufnr, request2)
+    assert_eq(old_request.status, "abandoned", "replaced request should be abandoned")
+    assert_eq(session.current_request.request_id, "request:2", "session should install replacement request")
+
+    session_mod.stop_watch_session(bufnr, "full")
+  end)
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
 local function test_wrapper_cache_tracks_root_signature()
   reset_modules()
   local wrapper = require("typst-concealer.wrapper")
@@ -822,6 +904,8 @@ local function main()
   ok("ok root fallback uses cwd")
   test_get_root_overrides_fallback()
   ok("ok get_root overrides root base")
+  test_session_render_request_tracks_current_request()
+  ok("ok session tracks machine watch requests")
   test_wrapper_cache_tracks_root_signature()
   ok("ok wrapper cache keys include root signature")
   test_remote_urls_do_not_rewrite_against_root()
