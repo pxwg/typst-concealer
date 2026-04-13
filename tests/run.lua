@@ -48,6 +48,7 @@ local function reset_modules()
   package.loaded["typst-concealer.machine.types"] = nil
   package.loaded["typst-concealer.machine.reducer"] = nil
   package.loaded["typst-concealer.machine.effects"] = nil
+  package.loaded["typst-concealer.machine.runtime"] = nil
   package.loaded["typst-concealer.wrapper"] = nil
   package.loaded["typst-concealer.path-rewrite"] = nil
 end
@@ -125,6 +126,7 @@ local function fresh_state()
   state.buffer_render_state = {}
   state.path_rewrite_cache = {}
   state.runtime_preludes = {}
+  state.machine_state = require("typst-concealer.machine.types").initial_state()
   return state
 end
 
@@ -612,6 +614,114 @@ local function test_machine_reducer_does_not_render_deleted_nodes()
   )
 end
 
+local function test_machine_runtime_rebuilds_compat_read_model()
+  local state = fresh_state()
+  local types = require("typst-concealer.machine.types")
+  local runtime = require("typst-concealer.machine.runtime")
+  local machine = types.initial_state()
+
+  local old_item = make_render_item({
+    image_id = 11,
+    extmark_id = 21,
+  })
+  state.buffer_render_state[1] = {
+    full_items = { old_item },
+    lingering_items = {},
+    full_units = { "keep-units" },
+    runtime_preludes = { "keep-prelude" },
+  }
+  state.item_by_image_id[old_item.image_id] = old_item
+  state.image_id_to_extmark[old_item.image_id] = old_item.extmark_id
+
+  machine.buffers[1] = {
+    bufnr = 1,
+    project_scope_id = "project:1",
+    buffer_version = 1,
+    layout_version = 1,
+    render_epoch = 1,
+    nodes = {
+      ["node:1"] = {
+        node_id = "node:1",
+        bufnr = 1,
+        project_scope_id = "project:1",
+        item_idx = 1,
+        node_type = "math",
+        source_range = { 2, 0, 2, 3 },
+        display_range = { 2, 0, 2, 3 },
+        source_text = "$z$",
+        source_text_hash = "hash:z",
+        context_hash = "ctx:0",
+        prelude_count = 0,
+        semantics = { display_kind = "inline", constraint_kind = "intrinsic" },
+        status = "stable",
+        visible_overlay_id = "overlay:1",
+      },
+    },
+    node_order = { "node:1" },
+  }
+  machine.overlays["overlay:1"] = {
+    overlay_id = "overlay:1",
+    owner_node_id = "node:1",
+    owner_bufnr = 1,
+    owner_project_scope_id = "project:1",
+    request_id = "request:1",
+    page_index = 1,
+    render_epoch = 1,
+    buffer_version = 1,
+    layout_version = 1,
+    image_id = 31,
+    extmark_id = 41,
+    page_path = "/tmp/page.png",
+    page_stamp = "stamp",
+    natural_cols = 4,
+    natural_rows = 1,
+    source_rows = 1,
+    status = "visible",
+  }
+
+  runtime.rebuild_buffer_read_model(machine, 1)
+
+  local bstate = state.buffer_render_state[1]
+  assert_eq(state.item_by_image_id[old_item.image_id], nil, "old full item index should be removed")
+  assert_eq(state.image_id_to_extmark[old_item.image_id], nil, "old full extmark index should be removed")
+  assert_eq(#bstate.full_items, 1, "visible machine overlay should become one compat full item")
+  assert_eq(bstate.full_items[1].image_id, 31, "compat item should use overlay image id")
+  assert_eq(bstate.full_items[1].str, "$z$", "compat item should preserve source text as str")
+  assert_eq(state.item_by_image_id[31], bstate.full_items[1], "compat item should be indexed by image id")
+  assert_eq(state.image_id_to_extmark[31], 41, "compat extmark index should be rebuilt")
+  assert_eq(bstate.line_to_items[2][1], bstate.full_items[1], "line index should include visible item")
+  assert_eq(bstate.extmark_to_item[41], bstate.full_items[1], "extmark index should include visible item")
+  assert_eq(bstate.full_units[1], "keep-units", "runtime rebuild should preserve full_units")
+  assert_eq(bstate.runtime_preludes[1], "keep-prelude", "runtime rebuild should preserve runtime preludes")
+end
+
+local function test_machine_runtime_builds_watch_render_job()
+  local state = fresh_state()
+  local reducer = require("typst-concealer.machine.reducer")
+  local runtime = require("typst-concealer.machine.runtime")
+
+  local machine, effects = reducer.reduce(state.machine_state, scan_event({ make_scanned_node() }))
+  machine, effects = reducer.reduce(machine, { type = "full_render_requested", bufnr = 1 })
+  local request = first_effect(effects, "request_full_render")
+  local overlay_id = request.overlay_ids[1]
+  state.machine_state = machine
+
+  runtime.dispatch({
+    type = "overlay_resources_allocated",
+    overlay_id = overlay_id,
+    image_id = 51,
+    extmark_id = 61,
+  }, { run_effects = false })
+
+  local job = runtime.build_render_job(state.machine_state, overlay_id)
+  assert_eq(job.request_id, state.machine_state.overlays[overlay_id].request_id, "job should carry request id")
+  assert_eq(job.request_page_index, 1, "job should carry page index")
+  assert_eq(job.overlay_id, overlay_id, "job should carry overlay id")
+  assert_eq(job.image_id, 51, "job should carry allocated image id")
+  assert_eq(job.extmark_id, 61, "job should carry allocated extmark id")
+  assert_eq(job.str, "$x$", "job should remain wrapper-compatible")
+end
+
 local function test_commit_plan_reuses_stable_render_for_same_source()
   local state = fresh_state()
   local bufnr = 1
@@ -724,6 +834,10 @@ local function main()
   ok("ok machine reducer enforces request identity and delayed retire")
   test_machine_reducer_does_not_render_deleted_nodes()
   ok("ok machine reducer does not render deleted nodes")
+  test_machine_runtime_rebuilds_compat_read_model()
+  ok("ok machine runtime rebuilds compat read model")
+  test_machine_runtime_builds_watch_render_job()
+  ok("ok machine runtime builds watch render job")
   test_commit_plan_reuses_stable_render_for_same_source()
   ok("ok commit_plan reuses same-source stable renders")
   test_commit_plan_does_not_reuse_render_for_changed_source()

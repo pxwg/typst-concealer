@@ -436,6 +436,18 @@ local function reduce_overlay_page_ready(state, ev)
   return new_state, effects
 end
 
+local function reduce_overlay_resources_allocated(state, ev)
+  local new_state = clone_state(state)
+  local overlay = new_state.overlays[ev.overlay_id]
+  if overlay == nil then
+    return new_state, {}
+  end
+
+  overlay.image_id = ev.image_id
+  overlay.extmark_id = ev.extmark_id
+  return new_state, {}
+end
+
 local function reduce_overlay_commit_succeeded(state, ev)
   local new_state = clone_state(state)
   local effects = {}
@@ -541,6 +553,8 @@ function M.reduce(state, event)
     return reduce_full_render_requested(state, event)
   elseif event.type == "overlay_page_ready" then
     return reduce_overlay_page_ready(state, event)
+  elseif event.type == "overlay_resources_allocated" then
+    return reduce_overlay_resources_allocated(state, event)
   elseif event.type == "overlay_commit_succeeded" then
     return reduce_overlay_commit_succeeded(state, event)
   elseif event.type == "buffer_layout_changed" then

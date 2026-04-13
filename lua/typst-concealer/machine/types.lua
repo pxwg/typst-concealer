@@ -87,6 +87,12 @@ local M = {}
 --- @field source_rows integer|nil
 --- @field status OverlayStatus
 
+--- @class EventOverlayResourcesAllocated
+--- @field type "overlay_resources_allocated"
+--- @field overlay_id string
+--- @field image_id integer
+--- @field extmark_id integer|nil
+
 --- @class BufferState
 --- @field bufnr integer
 --- @field project_scope_id string
@@ -136,6 +142,7 @@ local M = {}
 --- @field range Range4
 --- @field display_range Range4
 --- @field source_text string
+--- @field str string
 --- @field prelude_count integer
 --- @field semantics NodeSemantics
 --- @field display_prefix string|nil

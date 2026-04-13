@@ -3,6 +3,7 @@
 --- Write access is intentionally concentrated: apply.lua owns resource indices,
 --- plan.lua owns per-buffer render state; session.lua owns watch sessions.
 local M = {}
+local machine_types = require("typst-concealer.machine.types")
 
 --- Neovim extmark namespaces
 M.ns_id = vim.api.nvim_create_namespace("typst-concealer")
@@ -57,6 +58,11 @@ M.watch_diagnostics = {}
 
 --- @type { [integer]: { full_items?: table[], lingering_items?: table[], full_units?: table[], line_to_items?: table, extmark_to_item?: table, runtime_preludes?: string[] } }
 M.buffer_render_state = {}
+
+--- Single machine snapshot for the full-overlay reducer.
+--- Runtime owns effect execution; reducer owns logical transitions.
+--- @type MachineState
+M.machine_state = machine_types.initial_state()
 
 --- Per-buffer mutable render state (extmark, live-preview, conceal transients).
 --- @type table<integer, table>
