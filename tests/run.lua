@@ -45,6 +45,9 @@ local function reset_modules()
   package.loaded["typst-concealer.apply"] = nil
   package.loaded["typst-concealer.extmark"] = nil
   package.loaded["typst-concealer.session"] = nil
+  package.loaded["typst-concealer.machine.types"] = nil
+  package.loaded["typst-concealer.machine.reducer"] = nil
+  package.loaded["typst-concealer.machine.effects"] = nil
   package.loaded["typst-concealer.wrapper"] = nil
   package.loaded["typst-concealer.path-rewrite"] = nil
 end
@@ -175,6 +178,76 @@ local function make_render_item(fields)
   end
   item.display_range = item.display_range or item.range
   return item
+end
+
+local function make_scanned_node(fields)
+  local node = {
+    stable_key = "stable:1",
+    item_idx = 1,
+    node_type = "math",
+    source_range = { 0, 0, 0, 3 },
+    display_range = { 0, 0, 0, 3 },
+    source_text = "$x$",
+    source_text_hash = "hash:x",
+    context_hash = "ctx:0",
+    prelude_count = 0,
+    semantics = { display_kind = "inline", constraint_kind = "intrinsic" },
+  }
+  for key, value in pairs(fields or {}) do
+    node[key] = value
+  end
+  return node
+end
+
+local function scan_event(scanned_nodes, opts)
+  opts = opts or {}
+  return {
+    type = "nodes_scanned",
+    bufnr = opts.bufnr or 1,
+    project_scope_id = opts.project_scope_id or "project:1",
+    buffer_version = opts.buffer_version or 1,
+    layout_version = opts.layout_version or 1,
+    scanned_nodes = scanned_nodes,
+  }
+end
+
+local function page_ready_event(overlay, opts)
+  opts = opts or {}
+  return {
+    type = "overlay_page_ready",
+    request_id = opts.request_id or overlay.request_id,
+    request_page_index = opts.request_page_index or overlay.page_index,
+    overlay_id = overlay.overlay_id,
+    owner_node_id = opts.owner_node_id or overlay.owner_node_id,
+    owner_bufnr = opts.owner_bufnr or overlay.owner_bufnr,
+    owner_project_scope_id = opts.owner_project_scope_id or overlay.owner_project_scope_id,
+    render_epoch = opts.render_epoch or overlay.render_epoch,
+    buffer_version = opts.buffer_version or overlay.buffer_version,
+    layout_version = opts.layout_version or overlay.layout_version,
+    page_path = opts.page_path or "/tmp/page.png",
+    page_stamp = opts.page_stamp or "stamp",
+    natural_cols = opts.natural_cols or 4,
+    natural_rows = opts.natural_rows or 1,
+    source_rows = opts.source_rows or 1,
+  }
+end
+
+local function count_effects(effects, kind)
+  local count = 0
+  for _, effect in ipairs(effects or {}) do
+    if effect.kind == kind then
+      count = count + 1
+    end
+  end
+  return count
+end
+
+local function first_effect(effects, kind)
+  for _, effect in ipairs(effects or {}) do
+    if effect.kind == kind then
+      return effect
+    end
+  end
 end
 
 local function make_temp_tree(name)
@@ -429,6 +502,116 @@ local function test_named_path_args_preserve_remote_urls()
   )
 end
 
+local function test_machine_reducer_enforces_request_identity_and_delayed_retire()
+  reset_modules()
+  local types = require("typst-concealer.machine.types")
+  local reducer = require("typst-concealer.machine.reducer")
+
+  local state = types.initial_state()
+  local effects
+  state, effects = reducer.reduce(state, scan_event({ make_scanned_node() }))
+  assert_eq(#effects, 0, "scan should not produce side effects")
+
+  local buf = state.buffers[1]
+  local node = buf.nodes[buf.node_order[1]]
+  assert_eq(node.status, "pending", "new scanned node should await render")
+
+  state, effects = reducer.reduce(state, { type = "full_render_requested", bufnr = 1 })
+  assert_eq(count_effects(effects, "ensure_overlay_placeholder"), 1, "new node should get a placeholder")
+  local request = first_effect(effects, "request_full_render")
+  assert_truthy(request, "full render should request watch rendering")
+  local overlay = state.overlays[request.overlay_ids[1]]
+  assert_eq(overlay.request_id, request.request_id, "overlay request id should be immutable candidate identity")
+  assert_eq(overlay.page_index, 1, "overlay should record request page index")
+
+  local wrong_ready = page_ready_event(overlay, { request_id = "request:wrong" })
+  local rejected_state
+  rejected_state, effects = reducer.reduce(state, wrong_ready)
+  assert_eq(#effects, 0, "wrong request id should be rejected")
+  assert_eq(
+    rejected_state.overlays[overlay.overlay_id].status,
+    "placeholder",
+    "rejected page should not update overlay"
+  )
+
+  state, effects = reducer.reduce(state, page_ready_event(overlay))
+  assert_eq(effects[1].kind, "commit_overlay", "accepted page should request commit")
+  state, effects = reducer.reduce(state, {
+    type = "overlay_commit_succeeded",
+    overlay_id = overlay.overlay_id,
+    node_id = overlay.owner_node_id,
+  })
+  assert_eq(#effects, 0, "first commit has no old overlay to retire")
+
+  node = state.buffers[1].nodes[overlay.owner_node_id]
+  assert_eq(node.status, "stable", "committed node should become stable")
+  assert_eq(node.visible_overlay_id, overlay.overlay_id, "candidate should become visible")
+
+  state, effects = reducer.reduce(
+    state,
+    scan_event({
+      make_scanned_node({
+        source_text = "$y$",
+        source_text_hash = "hash:y",
+      }),
+    }, { buffer_version = 2 })
+  )
+  node = state.buffers[1].nodes[overlay.owner_node_id]
+  assert_eq(node.status, "stale", "changed visible node should become stale")
+  assert_eq(node.visible_overlay_id, overlay.overlay_id, "old overlay should stay visible while stale")
+
+  state, effects = reducer.reduce(state, { type = "full_render_requested", bufnr = 1 })
+  assert_eq(count_effects(effects, "ensure_overlay_placeholder"), 0, "stale visible node must not be blanked")
+  assert_eq(count_effects(effects, "abandon_request"), 1, "new request should abandon previous active request")
+  request = first_effect(effects, "request_full_render")
+  assert_truthy(request, "changed node should request a new render")
+  local next_overlay = state.overlays[request.overlay_ids[1]]
+  assert_eq(next_overlay.status, "rendering", "visible stale node should render candidate off-screen")
+  assert_truthy(next_overlay.request_id ~= overlay.request_id, "new candidate must not reuse old request identity")
+
+  state, effects = reducer.reduce(state, page_ready_event(next_overlay))
+  assert_eq(effects[1].kind, "commit_overlay", "new candidate should commit after page ready")
+  state, effects = reducer.reduce(state, {
+    type = "overlay_commit_succeeded",
+    overlay_id = next_overlay.overlay_id,
+    node_id = next_overlay.owner_node_id,
+  })
+  assert_eq(effects[1].kind, "retire_overlay", "old visible overlay should retire only after new commit")
+  assert_eq(effects[1].overlay_id, overlay.overlay_id, "retire effect should target the previous visible overlay")
+end
+
+local function test_machine_reducer_does_not_render_deleted_nodes()
+  reset_modules()
+  local types = require("typst-concealer.machine.types")
+  local reducer = require("typst-concealer.machine.reducer")
+
+  local state = types.initial_state()
+  local effects
+  state = reducer.reduce(state, scan_event({ make_scanned_node() }))
+  state, effects = reducer.reduce(state, { type = "full_render_requested", bufnr = 1 })
+  local request = first_effect(effects, "request_full_render")
+  local overlay = state.overlays[request.overlay_ids[1]]
+  state = reducer.reduce(state, page_ready_event(overlay))
+  state = reducer.reduce(state, {
+    type = "overlay_commit_succeeded",
+    overlay_id = overlay.overlay_id,
+    node_id = overlay.owner_node_id,
+  })
+
+  state, effects = reducer.reduce(state, scan_event({}))
+  local node = state.buffers[1].nodes[overlay.owner_node_id]
+  assert_eq(node.status, "deleted", "missing scanned node should be marked deleted")
+  assert_eq(node.visible_overlay_id, overlay.overlay_id, "deleted node keeps visible overlay until explicit retire")
+
+  state, effects = reducer.reduce(state, { type = "full_render_requested", bufnr = 1 })
+  assert_eq(#effects, 0, "deleted-only buffer should not request a new render")
+  assert_eq(
+    state.overlays[overlay.overlay_id].status,
+    "visible",
+    "deleted node should not retire during scan/render request"
+  )
+end
+
 local function test_commit_plan_reuses_stable_render_for_same_source()
   local state = fresh_state()
   local bufnr = 1
@@ -537,6 +720,10 @@ local function main()
   ok("ok named path args rewrite local paths")
   test_named_path_args_preserve_remote_urls()
   ok("ok named path args preserve remote urls")
+  test_machine_reducer_enforces_request_identity_and_delayed_retire()
+  ok("ok machine reducer enforces request identity and delayed retire")
+  test_machine_reducer_does_not_render_deleted_nodes()
+  ok("ok machine reducer does not render deleted nodes")
   test_commit_plan_reuses_stable_render_for_same_source()
   ok("ok commit_plan reuses same-source stable renders")
   test_commit_plan_does_not_reuse_render_for_changed_source()
