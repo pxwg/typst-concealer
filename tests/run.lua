@@ -664,7 +664,7 @@ local function test_machine_reducer_enforces_request_identity_and_delayed_retire
   assert_eq(effects[1].overlay_id, overlay.overlay_id, "retire effect should target the previous visible overlay")
 end
 
-local function test_machine_reducer_does_not_render_deleted_nodes()
+local function test_machine_reducer_orphans_deleted_visible_nodes_until_confirmed()
   reset_modules()
   local types = require("typst-concealer.machine.types")
   local reducer = require("typst-concealer.machine.reducer")
@@ -684,16 +684,27 @@ local function test_machine_reducer_does_not_render_deleted_nodes()
 
   state, effects = reducer.reduce(state, scan_event({}))
   local node = state.buffers[1].nodes[overlay.owner_node_id]
-  assert_eq(node.status, "deleted", "missing scanned node should be marked deleted")
-  assert_eq(node.visible_overlay_id, overlay.overlay_id, "deleted node keeps visible overlay until explicit retire")
+  assert_eq(node.status, "orphaned", "missing visible node should become an orphan")
+  assert_eq(node.visible_overlay_id, overlay.overlay_id, "orphaned node keeps visible overlay until confirmation")
 
   state, effects = reducer.reduce(state, { type = "full_render_requested", bufnr = 1 })
-  assert_eq(#effects, 0, "deleted-only buffer should not request a new render")
+  assert_eq(#effects, 0, "orphan-only buffer should not request a new render")
   assert_eq(
     state.overlays[overlay.overlay_id].status,
     "visible",
-    "deleted node should not retire during scan/render request"
+    "orphaned node should not retire during scan/render request"
   )
+
+  state, effects = reducer.reduce(state, {
+    type = "node_deleted_confirmed",
+    bufnr = 1,
+    node_id = overlay.owner_node_id,
+  })
+  node = state.buffers[1].nodes[overlay.owner_node_id]
+  assert_eq(node.status, "deleted_confirmed", "confirmation should finalize deleted node")
+  assert_eq(node.visible_overlay_id, nil, "confirmed delete should detach visible overlay")
+  assert_eq(effects[1].kind, "retire_overlay", "confirmed delete should retire old overlay")
+  assert_eq(effects[1].overlay_id, overlay.overlay_id, "confirmed delete should retire the orphan overlay")
 end
 
 local function test_machine_runtime_rebuilds_compat_read_model()
@@ -933,8 +944,8 @@ local function main()
   ok("ok named path args preserve remote urls")
   test_machine_reducer_enforces_request_identity_and_delayed_retire()
   ok("ok machine reducer enforces request identity and delayed retire")
-  test_machine_reducer_does_not_render_deleted_nodes()
-  ok("ok machine reducer does not render deleted nodes")
+  test_machine_reducer_orphans_deleted_visible_nodes_until_confirmed()
+  ok("ok machine reducer orphans deleted visible nodes until confirmed")
   test_machine_runtime_rebuilds_compat_read_model()
   ok("ok machine runtime rebuilds compat read model")
   test_machine_runtime_builds_watch_render_job()

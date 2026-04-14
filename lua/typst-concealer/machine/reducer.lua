@@ -267,7 +267,7 @@ local function reduce_nodes_scanned(state, ev)
       used_old[prev.node_id] = true
       local unchanged = node_render_inputs_equal(prev, scanned)
       node = patch_node(prev, scanned, ev.buffer_version, ev.layout_version)
-      if unchanged and prev.status ~= "deleted" then
+      if unchanged and prev.status ~= "deleted_confirmed" then
         if node.candidate_overlay_id ~= nil then
           node.status = prev.status
         elseif node.visible_overlay_id ~= nil then
@@ -290,7 +290,7 @@ local function reduce_nodes_scanned(state, ev)
   for node_id, old in pairs(old_nodes) do
     if not used_old[node_id] then
       local node = deepcopy(old)
-      node.status = "deleted"
+      node.status = node.visible_overlay_id ~= nil and "orphaned" or "deleted_confirmed"
       node.candidate_overlay_id = nil
       next_nodes[node_id] = node
       next_order[#next_order + 1] = node_id
@@ -502,7 +502,7 @@ local function reduce_buffer_layout_changed(state, ev)
   buf.layout_version = ev.new_layout_version
   for _, node_id in ipairs(buf.node_order or {}) do
     local node = buf.nodes[node_id]
-    if node ~= nil and node.status ~= "deleted" then
+    if node ~= nil and node.status ~= "orphaned" and node.status ~= "deleted_confirmed" then
       node.candidate_overlay_id = nil
       node.status = node.visible_overlay_id ~= nil and "stale" or "pending"
     end
@@ -536,10 +536,43 @@ local function reduce_request_abandoned(state, ev)
       local candidate = node.candidate_overlay_id and new_state.overlays[node.candidate_overlay_id] or nil
       if candidate ~= nil and candidate.request_id == ev.request_id then
         node.candidate_overlay_id = nil
-        if node.status ~= "deleted" then
+        if node.status ~= "orphaned" and node.status ~= "deleted_confirmed" then
           node.status = node.visible_overlay_id ~= nil and "stale" or "pending"
         end
       end
+    end
+  end
+
+  return new_state, effects
+end
+
+local function reduce_node_deleted_confirmed(state, ev)
+  local new_state = clone_state(state)
+  local effects = {}
+
+  local buf = new_state.buffers[ev.bufnr]
+  if buf == nil then
+    return new_state, effects
+  end
+
+  local node = buf.nodes[ev.node_id]
+  if node == nil then
+    return new_state, effects
+  end
+
+  local old_visible_id = node.visible_overlay_id
+  node.status = "deleted_confirmed"
+  node.candidate_overlay_id = nil
+  node.visible_overlay_id = nil
+
+  if old_visible_id ~= nil then
+    local overlay = new_state.overlays[old_visible_id]
+    if overlay ~= nil and overlay.status ~= "retired" then
+      overlay.status = "retiring"
+      effects[#effects + 1] = {
+        kind = "retire_overlay",
+        overlay_id = old_visible_id,
+      }
     end
   end
 
@@ -561,6 +594,8 @@ function M.reduce(state, event)
     return reduce_buffer_layout_changed(state, event)
   elseif event.type == "request_abandoned" then
     return reduce_request_abandoned(state, event)
+  elseif event.type == "node_deleted_confirmed" then
+    return reduce_node_deleted_confirmed(state, event)
   end
 
   return state or types.initial_state(), {}

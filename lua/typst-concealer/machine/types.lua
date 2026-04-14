@@ -7,7 +7,8 @@ local M = {}
 --- | "stale"
 --- | "pending"
 --- | "ready"
---- | "deleted"
+--- | "orphaned"
+--- | "deleted_confirmed"
 
 --- @alias OverlayStatus
 --- | "placeholder"
@@ -79,6 +80,11 @@ local M = {}
 --- @field buffer_version integer
 --- @field layout_version integer
 --- @field extmark_id integer|nil
+
+--- @class EventNodeDeletedConfirmed
+--- @field type "node_deleted_confirmed"
+--- @field bufnr integer
+--- @field node_id string
 --- @field image_id integer|nil
 --- @field page_path string|nil
 --- @field page_stamp string|nil
