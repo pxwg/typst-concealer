@@ -36,7 +36,7 @@ local M = {}
 --- @field kind "abandon_request"
 --- @field bufnr integer
 --- @field old_request_id string
---- @field new_request_id string
+--- @field new_request_id string|nil
 
 --- @alias MachineEffect
 --- | EffectEnsureOverlayPlaceholder

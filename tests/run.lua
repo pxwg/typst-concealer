@@ -651,6 +651,7 @@ local function test_machine_reducer_enforces_request_identity_and_delayed_retire
   node = state.buffers[1].nodes[overlay.owner_node_id]
   assert_eq(node.status, "stable", "committed node should become stable")
   assert_eq(node.visible_overlay_id, overlay.overlay_id, "candidate should become visible")
+  assert_eq(state.buffers[1].active_request_id, nil, "completed request should no longer be active")
 
   state, effects = reducer.reduce(
     state,
@@ -667,7 +668,7 @@ local function test_machine_reducer_enforces_request_identity_and_delayed_retire
 
   state, effects = reducer.reduce(state, { type = "full_render_requested", bufnr = 1 })
   assert_eq(count_effects(effects, "ensure_overlay_placeholder"), 0, "stale visible node must not be blanked")
-  assert_eq(count_effects(effects, "abandon_request"), 1, "new request should abandon previous active request")
+  assert_eq(count_effects(effects, "abandon_request"), 0, "new request should not abandon a completed request")
   request = first_effect(effects, "request_full_render")
   assert_truthy(request, "changed node should request a new render")
   local next_overlay = state.overlays[request.request.jobs[1].overlay_id]
@@ -922,6 +923,67 @@ local function test_machine_reducer_cleans_orphans_covered_by_visible_nodes()
     "deleted_confirmed",
     "covered orphan should become confirmed deleted"
   )
+end
+
+local function test_machine_reducer_abandons_idle_request_candidates()
+  reset_modules()
+  local types = require("typst-concealer.machine.types")
+  local reducer = require("typst-concealer.machine.reducer")
+
+  local state = types.initial_state()
+  state.buffers[1] = {
+    bufnr = 1,
+    project_scope_id = "project:1",
+    buffer_version = 3,
+    layout_version = 1,
+    render_epoch = 2,
+    active_request_id = "request:stale",
+    nodes = {
+      ["node:current"] = {
+        node_id = "node:current",
+        bufnr = 1,
+        project_scope_id = "project:1",
+        node_type = "math",
+        source_range = { 5, 0, 7, 1 },
+        display_range = { 5, 0, 7, 1 },
+        source_text = "$current$",
+        source_text_hash = "hash:current",
+        context_hash = "ctx:0",
+        prelude_count = 0,
+        semantics = { display_kind = "block", constraint_kind = "flow" },
+        status = "stable",
+        visible_overlay_id = "overlay:current",
+      },
+    },
+    node_order = { "node:current" },
+  }
+  state.overlays["overlay:current"] = {
+    overlay_id = "overlay:current",
+    owner_node_id = "node:current",
+    owner_bufnr = 1,
+    owner_project_scope_id = "project:1",
+    request_id = "request:old-visible",
+    status = "visible",
+  }
+  state.overlays["overlay:candidate"] = {
+    overlay_id = "overlay:candidate",
+    owner_node_id = "node:deleted",
+    owner_bufnr = 1,
+    owner_project_scope_id = "project:1",
+    request_id = "request:stale",
+    status = "rendering",
+  }
+
+  local effects
+  state, effects = reducer.reduce(state, { type = "full_render_requested", bufnr = 1 })
+
+  assert_eq(state.buffers[1].active_request_id, nil, "idle render request should clear active request")
+  assert_eq(count_effects(effects, "request_full_render"), 0, "idle cleanup should not request rendering")
+  assert_eq(count_effects(effects, "abandon_request"), 1, "idle cleanup should abandon stale watch request")
+  local retire = first_effect(effects, "retire_overlay")
+  assert_truthy(retire ~= nil, "idle cleanup should retire stale request candidates")
+  assert_eq(retire.overlay_id, "overlay:candidate", "idle cleanup should retire non-visible candidate only")
+  assert_eq(state.overlays["overlay:current"].status, "visible", "idle cleanup should keep visible overlays")
 end
 
 local function test_machine_runtime_rebuilds_compat_read_model()
@@ -1233,6 +1295,8 @@ local function main()
   ok("ok machine reducer retires overlapping orphans after commit")
   test_machine_reducer_cleans_orphans_covered_by_visible_nodes()
   ok("ok machine reducer cleans orphans covered by visible nodes")
+  test_machine_reducer_abandons_idle_request_candidates()
+  ok("ok machine reducer abandons idle request candidates")
   test_machine_runtime_rebuilds_compat_read_model()
   ok("ok machine runtime rebuilds compat read model")
   test_machine_runtime_builds_watch_render_job()

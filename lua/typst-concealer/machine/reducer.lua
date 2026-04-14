@@ -376,6 +376,33 @@ local function retire_old_request_candidates(state, buf, old_request_id, effects
   end
 end
 
+local function request_has_pending_overlay(state, buf, request_id)
+  if request_id == nil then
+    return false
+  end
+  for _, overlay in pairs(state.overlays or {}) do
+    if
+      overlay.owner_bufnr == buf.bufnr
+      and overlay.request_id == request_id
+      and overlay.status ~= "visible"
+      and overlay.status ~= "retiring"
+      and overlay.status ~= "retired"
+    then
+      return true
+    end
+  end
+  return false
+end
+
+local function abandon_idle_request(state, buf, effects)
+  if buf.active_request_id == nil then
+    return
+  end
+
+  retire_old_request_candidates(state, buf, buf.active_request_id, effects, nil)
+  buf.active_request_id = nil
+end
+
 local function reduce_nodes_scanned(state, ev)
   local new_state = clone_state(state)
   local effects = {}
@@ -454,6 +481,7 @@ local function reduce_full_render_requested(state, ev)
     end
   end
   if #render_node_ids == 0 then
+    abandon_idle_request(new_state, buf, effects)
     return new_state, effects
   end
 
@@ -623,6 +651,11 @@ local function reduce_overlay_commit_succeeded(state, ev)
     end
   end
   retire_overlapping_orphans(new_state, buf, node, effects)
+  if
+    buf.active_request_id == overlay.request_id and not request_has_pending_overlay(new_state, buf, overlay.request_id)
+  then
+    buf.active_request_id = nil
+  end
 
   return new_state, effects
 end
