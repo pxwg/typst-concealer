@@ -189,6 +189,7 @@ local function cleanup_preview_image(bufnr)
     bs.preview_last_rendered_item = nil
     bs.preview_last_render_key = nil
     bs.preview_render_key = nil
+    require("typst-concealer.machine.runtime").reset_preview_state(bufnr)
     bs.preview_source_image_id = nil
     bs.preview_source_page_stamp = nil
     bs.preview_source_range = nil
@@ -227,6 +228,7 @@ local function cleanup_preview_image(bufnr)
   bs.preview_last_rendered_item = nil
   bs.preview_last_render_key = nil
   bs.preview_render_key = nil
+  require("typst-concealer.machine.runtime").reset_preview_state(bufnr)
   bs.preview_source_image_id = nil
   bs.preview_source_page_stamp = nil
   bs.preview_source_range = nil
@@ -520,6 +522,7 @@ function M.show_rendered_preview_item(bufnr, item, layout)
   bs.preview_item = item
   bs.preview_last_rendered_item = item
   bs.preview_last_render_key = bs.preview_render_key
+  require("typst-concealer.machine.runtime").mark_preview_rendered(bufnr)
   bs.preview_source_image_id = item.source_image_id or item.image_id
   bs.preview_source_page_stamp = item.page_stamp
   bs.preview_source_range = vim.deepcopy(layout.effective_range)
@@ -556,6 +559,7 @@ function M.allocate_preview_item(bufnr, source_item, preview_str, source_str, re
   local bs = state.get_buf_state(bufnr)
   bs.preview_item = preview_item
   bs.preview_render_key = render_key
+  require("typst-concealer.machine.runtime").set_preview_render_key(bufnr, render_key)
   return preview_item
 end
 
@@ -623,7 +627,7 @@ function M.accept_page_update(update)
     return
   end
   extmark_mod.conceal_for_image_id(target_bufnr, image_id, natural_cols, natural_rows, source_rows)
-  state.get_buf_state(bufnr).hover.invalidated = true
+  require("typst-concealer.machine.runtime").invalidate_hover(bufnr)
   if state.hooks.on_page_committed then
     state.hooks.on_page_committed(bufnr)
   end

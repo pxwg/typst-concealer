@@ -190,7 +190,7 @@ local function maybe_resume_visible_full_watch(bufnr)
   if session.has_watch_session(bufnr, "full") then
     return
   end
-  require("typst-concealer.plan").render_buf(bufnr)
+  require("typst-concealer.machine.runtime").render_buf(bufnr)
 end
 
 function M.is_render_allowed(bufnr)
@@ -219,7 +219,7 @@ M.enable_buf = function(bufnr)
     return
   end
   M._enabled_buffers[bufnr] = true
-  require("typst-concealer.plan").render_buf(bufnr)
+  require("typst-concealer.machine.runtime").render_buf(bufnr)
 end
 
 M.disable_buf = function(bufnr)
@@ -228,9 +228,8 @@ M.disable_buf = function(bufnr)
   require("typst-concealer.state").clear_hover_timer(bufnr)
   local session = require("typst-concealer.session")
   session.stop_watch_session(bufnr, "full")
-  local render = require("typst-concealer.plan")
-  render.clear_live_typst_preview(bufnr)
-  render.hard_reset_buf(bufnr)
+  require("typst-concealer.machine.runtime").clear_live_preview(bufnr)
+  require("typst-concealer.plan").hard_reset_buf(bufnr)
 end
 
 M.toggle_buf = function(bufnr)
@@ -244,7 +243,7 @@ end
 
 M.rerender_buf = function(bufnr)
   bufnr = bufnr or vim.fn.bufnr()
-  require("typst-concealer.plan").render_buf(bufnr)
+  require("typst-concealer.machine.runtime").render_buf(bufnr)
 end
 
 -- ── Setup ─────────────────────────────────────────────────────────────────────
@@ -384,7 +383,7 @@ function M.setup(cfg)
     desc = "render file on enter",
     callback = function(ev)
       vim.schedule(function()
-        require("typst-concealer.plan").render_buf(ev.buf)
+        require("typst-concealer.machine.runtime").render_buf(ev.buf)
       end)
     end,
   })
@@ -404,7 +403,7 @@ function M.setup(cfg)
     desc = "render file on write",
     callback = function(ev)
       vim.schedule(function()
-        require("typst-concealer.plan").render_buf(ev.buf)
+        require("typst-concealer.machine.runtime").render_buf(ev.buf)
       end)
     end,
   })
@@ -415,9 +414,9 @@ function M.setup(cfg)
     desc = "re-render on normal-mode text changes so block anchors stay correct",
     callback = function(ev)
       vim.schedule(function()
-        local render = require("typst-concealer.plan")
-        render.render_buf(ev.buf)
-        render.render_live_typst_preview(ev.buf)
+        local runtime = require("typst-concealer.machine.runtime")
+        runtime.render_buf(ev.buf)
+        runtime.render_live_preview(ev.buf)
       end)
     end,
   })
@@ -427,27 +426,7 @@ function M.setup(cfg)
     group = augroup,
     desc = "unconceal on line hover",
     callback = function(ev)
-      require("typst-concealer.plan").render_live_typst_preview(ev.buf)
-
-      local throttle = require("typst-concealer").config.cursor_hover_throttle_ms
-      if throttle <= 0 then
-        -- No throttle: call directly (row-level guard is inside the function)
-        require("typst-concealer.plan").hide_extmarks_at_cursor(ev.buf)
-        return
-      end
-      -- Per-buffer trailing throttle: always process latest cursor position
-      local bs = require("typst-concealer.state").get_buf_state(ev.buf)
-      if bs.hover.throttle_timer == nil then
-        bs.hover.throttle_timer = vim.uv.new_timer()
-      end
-      bs.hover.throttle_timer:stop()
-      bs.hover.throttle_timer:start(
-        throttle,
-        0,
-        vim.schedule_wrap(function()
-          require("typst-concealer.plan").hide_extmarks_at_cursor(ev.buf)
-        end)
-      )
+      require("typst-concealer.machine.runtime").sync_cursor_ui(ev.buf)
     end,
   })
 
@@ -457,7 +436,7 @@ function M.setup(cfg)
     desc = "unconceal when exiting visual mode (no CursorMoved event fires)",
     callback = function(ev)
       if vim.api.nvim_buf_get_name(ev.buf):match(".*%.typ$") then
-        require("typst-concealer.plan").hide_extmarks_at_cursor(ev.buf)
+        require("typst-concealer.machine.runtime").sync_hover(ev.buf)
       end
     end,
   })
@@ -467,7 +446,7 @@ function M.setup(cfg)
     pattern = "*.typ",
     desc = "keep float preview synced while moving in insert mode",
     callback = function(ev)
-      require("typst-concealer.plan").schedule_live_preview_sync(ev.buf, { immediate = true })
+      require("typst-concealer.machine.runtime").schedule_live_preview_sync(ev.buf, { immediate = true })
     end,
   })
 
@@ -478,9 +457,9 @@ function M.setup(cfg)
     callback = function(ev)
       vim.schedule(function()
         maybe_resume_visible_full_watch(ev.buf)
-        local render = require("typst-concealer.plan")
-        render.render_live_typst_preview(ev.buf)
-        render.hide_extmarks_at_cursor(ev.buf)
+        local runtime = require("typst-concealer.machine.runtime")
+        runtime.render_live_preview(ev.buf)
+        runtime.sync_hover(ev.buf)
       end)
     end,
   })
@@ -501,7 +480,7 @@ function M.setup(cfg)
     group = augroup,
     desc = "render live preview float when insert-mode text changes",
     callback = function(ev)
-      require("typst-concealer.plan").schedule_live_preview_sync(ev.buf, { refresh_full = true })
+      require("typst-concealer.machine.runtime").schedule_live_preview_sync(ev.buf, { refresh_full = true })
     end,
   })
 
@@ -511,9 +490,9 @@ function M.setup(cfg)
       desc = "update colour scheme",
       callback = function()
         setup_prelude()
-        local render = require("typst-concealer.plan")
+        local runtime = require("typst-concealer.machine.runtime")
         for bufnr in pairs(M._enabled_buffers) do
-          render.render_buf(bufnr)
+          runtime.render_buf(bufnr)
         end
       end,
     })
@@ -531,8 +510,7 @@ function M.setup(cfg)
     desc = "refresh cell pixel size on terminal resize",
     callback = function(ev)
       refresh_cell_px_size()
-      local render = require("typst-concealer.plan")
-      render.render_buf(ev.buf)
+      require("typst-concealer.machine.runtime").render_buf(ev.buf)
     end,
   })
 
@@ -541,7 +519,7 @@ function M.setup(cfg)
     group = augroup,
     desc = "clear live preview when leaving a typst buffer",
     callback = function(ev)
-      require("typst-concealer.plan").clear_live_typst_preview(ev.buf)
+      require("typst-concealer.machine.runtime").clear_live_preview(ev.buf)
       vim.schedule(function()
         maybe_stop_hidden_full_watch(ev.buf)
       end)

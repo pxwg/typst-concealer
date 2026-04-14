@@ -18,7 +18,58 @@ local function ensure_machine_state()
   if state.machine_state == nil then
     state.machine_state = types.initial_state()
   end
+  state.machine_state.ui = state.machine_state.ui or { buffers = {} }
+  state.machine_state.ui.buffers = state.machine_state.ui.buffers or {}
   return state.machine_state
+end
+
+local function new_ui_buffer()
+  return {
+    hover = {
+      last_cursor_row = nil,
+      last_cursor_col = nil,
+      last_mode = nil,
+      last_lo = nil,
+      last_hi = nil,
+      invalidated = false,
+    },
+    preview = {
+      sync_tick = nil,
+      sync_needs_full = false,
+      render_key = nil,
+      last_render_key = nil,
+    },
+  }
+end
+
+function M.get_ui_buffer(bufnr)
+  local machine_state = ensure_machine_state()
+  local buffers = machine_state.ui.buffers
+  if buffers[bufnr] == nil then
+    buffers[bufnr] = new_ui_buffer()
+  end
+  return buffers[bufnr]
+end
+
+function M.invalidate_hover(bufnr)
+  M.get_ui_buffer(bufnr).hover.invalidated = true
+end
+
+function M.set_preview_render_key(bufnr, render_key)
+  M.get_ui_buffer(bufnr).preview.render_key = render_key
+end
+
+function M.mark_preview_rendered(bufnr)
+  local preview = M.get_ui_buffer(bufnr).preview
+  preview.last_render_key = preview.render_key
+end
+
+function M.reset_preview_state(bufnr)
+  local preview = M.get_ui_buffer(bufnr).preview
+  preview.sync_tick = nil
+  preview.sync_needs_full = false
+  preview.render_key = nil
+  preview.last_render_key = nil
 end
 
 local function get_overlay_and_node(machine_state, overlay_id)
@@ -150,6 +201,9 @@ function M.reset_buffer(bufnr)
   end
   for _, overlay_id in ipairs(to_remove) do
     machine_state.overlays[overlay_id] = nil
+  end
+  if machine_state.ui and machine_state.ui.buffers then
+    machine_state.ui.buffers[bufnr] = nil
   end
 end
 
@@ -303,7 +357,7 @@ local function run_commit_overlay(effect)
     node_id = effect.node_id,
   })
   M.rebuild_buffer_read_model(ensure_machine_state(), effect.bufnr)
-  state.get_buf_state(effect.bufnr).hover.invalidated = true
+  M.invalidate_hover(effect.bufnr)
   if state.hooks.on_page_committed then
     state.hooks.on_page_committed(effect.bufnr)
   end
@@ -369,6 +423,48 @@ function M.dispatch(event, opts)
     M.run_effects(effects)
   end
   return state.machine_state, effects
+end
+
+function M.render_buf(bufnr)
+  require("typst-concealer.plan").render_buf(bufnr)
+end
+
+function M.render_live_preview(bufnr)
+  require("typst-concealer.plan").render_live_typst_preview(bufnr)
+end
+
+function M.clear_live_preview(bufnr)
+  require("typst-concealer.plan").clear_live_typst_preview(bufnr)
+end
+
+function M.sync_hover(bufnr)
+  require("typst-concealer.plan").hide_extmarks_at_cursor(bufnr)
+end
+
+function M.sync_cursor_ui(bufnr)
+  M.render_live_preview(bufnr)
+  local throttle = require("typst-concealer").config.cursor_hover_throttle_ms
+  if throttle <= 0 then
+    M.sync_hover(bufnr)
+    return
+  end
+
+  local bs = state.get_buf_state(bufnr)
+  if bs.hover.throttle_timer == nil then
+    bs.hover.throttle_timer = vim.uv.new_timer()
+  end
+  bs.hover.throttle_timer:stop()
+  bs.hover.throttle_timer:start(
+    throttle,
+    0,
+    vim.schedule_wrap(function()
+      M.sync_hover(bufnr)
+    end)
+  )
+end
+
+function M.schedule_live_preview_sync(bufnr, opts)
+  require("typst-concealer.plan").schedule_live_preview_sync(bufnr, opts)
 end
 
 return M

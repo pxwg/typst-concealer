@@ -727,11 +727,7 @@ function M.render_buf(bufnr)
   })
 
   -- Reset hover guard so hide_extmarks_at_cursor re-evaluates after render
-  state.get_buf_state(bufnr).hover.last_cursor_row = nil
-  state.get_buf_state(bufnr).hover.last_mode = nil
-  state.get_buf_state(bufnr).hover.last_lo = nil
-  state.get_buf_state(bufnr).hover.last_hi = nil
-  state.get_buf_state(bufnr).hover.invalidated = true
+  runtime.invalidate_hover(bufnr)
   M.hide_extmarks_at_cursor(bufnr)
 end
 
@@ -844,18 +840,19 @@ end
 function M.hide_extmarks_at_cursor(bufnr)
   local main = require("typst-concealer")
   local bs = state.get_buf_state(bufnr)
+  local hover = require("typst-concealer.machine.runtime").get_ui_buffer(bufnr).hover
 
   if main._enabled_buffers[bufnr] ~= true or not main.is_render_allowed(bufnr) then
     for id in pairs(bs.currently_hidden_extmark_ids) do
       restore_one_extmark(bufnr, id)
     end
     bs.currently_hidden_extmark_ids = {}
-    bs.hover.last_cursor_row = nil
-    bs.hover.last_cursor_col = nil
-    bs.hover.last_mode = nil
-    bs.hover.last_lo = nil
-    bs.hover.last_hi = nil
-    bs.hover.invalidated = false
+    hover.last_cursor_row = nil
+    hover.last_cursor_col = nil
+    hover.last_mode = nil
+    hover.last_lo = nil
+    hover.last_hi = nil
+    hover.invalidated = false
     return
   end
 
@@ -867,12 +864,12 @@ function M.hide_extmarks_at_cursor(bufnr)
       restore_one_extmark(bufnr, id)
     end
     bs.currently_hidden_extmark_ids = {}
-    bs.hover.last_cursor_row = nil -- force re-process on next call
-    bs.hover.last_cursor_col = nil
-    bs.hover.last_mode = mode
-    bs.hover.last_lo = nil
-    bs.hover.last_hi = nil
-    bs.hover.invalidated = false
+    hover.last_cursor_row = nil -- force re-process on next call
+    hover.last_cursor_col = nil
+    hover.last_mode = mode
+    hover.last_lo = nil
+    hover.last_hi = nil
+    hover.invalidated = false
     return
   end
 
@@ -891,11 +888,11 @@ function M.hide_extmarks_at_cursor(bufnr)
   -- Skip only when the cursor span is unchanged and no render pass has
   -- invalidated the current hide/restore decision.
   if
-    bs.hover.last_mode == mode
-    and bs.hover.last_lo == lo
-    and bs.hover.last_hi == hi
-    and bs.hover.last_cursor_col == cursor_col
-    and not bs.hover.invalidated
+    hover.last_mode == mode
+    and hover.last_lo == lo
+    and hover.last_hi == hi
+    and hover.last_cursor_col == cursor_col
+    and not hover.invalidated
   then
     return
   end
@@ -938,12 +935,12 @@ function M.hide_extmarks_at_cursor(bufnr)
   end
 
   bs.currently_hidden_extmark_ids = new_hidden
-  bs.hover.last_cursor_row = cursor_row
-  bs.hover.last_cursor_col = cursor_col
-  bs.hover.last_mode = mode
-  bs.hover.last_lo = lo
-  bs.hover.last_hi = hi
-  bs.hover.invalidated = false
+  hover.last_cursor_row = cursor_row
+  hover.last_cursor_col = cursor_col
+  hover.last_mode = mode
+  hover.last_lo = lo
+  hover.last_hi = hi
+  hover.invalidated = false
 end
 
 local function clamp(x, lo, hi)
@@ -1361,9 +1358,10 @@ function M.schedule_live_preview_sync(bufnr, opts)
   opts = opts or {}
   local main = require("typst-concealer")
   local bs = state.get_buf_state(bufnr)
+  local preview = require("typst-concealer.machine.runtime").get_ui_buffer(bufnr).preview
   local tick = vim.api.nvim_buf_get_changedtick(bufnr)
-  bs.preview_sync_tick = tick
-  bs.preview_sync_needs_full = bs.preview_sync_needs_full or opts.refresh_full == true
+  preview.sync_tick = tick
+  preview.sync_needs_full = preview.sync_needs_full or opts.refresh_full == true
 
   if bs.preview_sync_timer == nil or bs.preview_sync_timer:is_closing() then
     bs.preview_sync_timer = vim.uv.new_timer()
@@ -1375,11 +1373,11 @@ function M.schedule_live_preview_sync(bufnr, opts)
     delay,
     0,
     vim.schedule_wrap(function()
-      local current_bs = state.get_buf_state(bufnr)
-      local scheduled_tick = current_bs.preview_sync_tick
-      local needs_full = current_bs.preview_sync_needs_full
-      current_bs.preview_sync_tick = nil
-      current_bs.preview_sync_needs_full = false
+      local current_preview = require("typst-concealer.machine.runtime").get_ui_buffer(bufnr).preview
+      local scheduled_tick = current_preview.sync_tick
+      local needs_full = current_preview.sync_needs_full
+      current_preview.sync_tick = nil
+      current_preview.sync_needs_full = false
 
       if not vim.api.nvim_buf_is_valid(bufnr) then
         return
@@ -1430,18 +1428,20 @@ function M.render_live_typst_preview(bufnr)
       return
     end
     local bs = state.get_buf_state(bufnr)
-    if bs.preview_item ~= nil and bs.preview_render_key == render_key and item_has_stable_render(bs.preview_item) then
+    local preview = require("typst-concealer.machine.runtime").get_ui_buffer(bufnr).preview
+    if bs.preview_item ~= nil and preview.render_key == render_key and item_has_stable_render(bs.preview_item) then
       M.present_rendered_preview_item(bufnr, bs.preview_item)
       return
     end
-    if bs.preview_render_key == render_key then
+    if preview.render_key == render_key then
       present_preview_item(bufnr, item, cursor_row, cursor_col)
       return
     end
 
     if item_has_stable_render(bs.preview_item) then
       bs.preview_last_rendered_item = bs.preview_item
-      bs.preview_last_render_key = bs.preview_render_key
+      bs.preview_last_render_key = preview.render_key
+      preview.last_render_key = preview.render_key
     end
     present_preview_item(bufnr, item, cursor_row, cursor_col)
 
@@ -1473,8 +1473,9 @@ end
 -- Register post-render UI reaction hooks so apply.lua can trigger them
 -- without a direct reverse require("typst-concealer.plan") dependency.
 state.hooks.on_page_committed = function(bufnr)
-  M.hide_extmarks_at_cursor(bufnr)
-  M.render_live_typst_preview(bufnr)
+  local runtime = require("typst-concealer.machine.runtime")
+  runtime.sync_hover(bufnr)
+  runtime.render_live_preview(bufnr)
 end
 state.hooks.present_rendered_preview_item = function(bufnr, item)
   M.present_rendered_preview_item(bufnr, item)

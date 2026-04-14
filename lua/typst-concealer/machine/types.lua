@@ -123,7 +123,29 @@ local M = {}
 --- @field buffers table<integer, BufferState>
 --- @field projects table<string, ProjectScope>
 --- @field overlays table<string, OverlayState>
+--- @field ui MachineUIState
 --- @field counters MachineCounters
+
+--- @class MachineUIHoverState
+--- @field last_cursor_row integer|nil
+--- @field last_cursor_col integer|nil
+--- @field last_mode string|nil
+--- @field last_lo integer|nil
+--- @field last_hi integer|nil
+--- @field invalidated boolean
+
+--- @class MachineUIPreviewState
+--- @field sync_tick integer|nil
+--- @field sync_needs_full boolean
+--- @field render_key string|nil
+--- @field last_render_key string|nil
+
+--- @class MachineUIBufferState
+--- @field hover MachineUIHoverState
+--- @field preview MachineUIPreviewState
+
+--- @class MachineUIState
+--- @field buffers table<integer, MachineUIBufferState>
 
 --- @class ScannedNode
 --- @field stable_key string|nil
@@ -188,6 +210,9 @@ function M.initial_state()
     buffers = {},
     projects = {},
     overlays = {},
+    ui = {
+      buffers = {},
+    },
     counters = {
       next_node_id = 1,
       next_overlay_id = 1,

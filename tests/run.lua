@@ -847,6 +847,24 @@ local function test_machine_runtime_resets_buffer_snapshot()
   assert_truthy(state.machine_state.overlays["overlay:2"] ~= nil, "reset should keep other buffer overlays")
 end
 
+local function test_machine_runtime_tracks_ui_state()
+  local state = fresh_state()
+  local runtime = require("typst-concealer.machine.runtime")
+
+  runtime.invalidate_hover(1)
+  local ui = runtime.get_ui_buffer(1)
+  assert_eq(ui.hover.invalidated, true, "hover invalidation should be stored in machine ui state")
+
+  runtime.set_preview_render_key(1, "preview-key")
+  runtime.mark_preview_rendered(1)
+  assert_eq(ui.preview.render_key, "preview-key", "preview render key should be stored in machine ui state")
+  assert_eq(ui.preview.last_render_key, "preview-key", "rendered preview key should be tracked in machine ui state")
+
+  state.machine_state.buffers[1] = { bufnr = 1, nodes = {}, node_order = {} }
+  runtime.reset_buffer(1)
+  assert_eq(state.machine_state.ui.buffers[1], nil, "buffer reset should clear machine ui state")
+end
+
 local function test_commit_plan_reuses_stable_render_for_same_source()
   local state = fresh_state()
   local bufnr = 1
@@ -967,6 +985,8 @@ local function main()
   ok("ok machine runtime builds watch render job")
   test_machine_runtime_resets_buffer_snapshot()
   ok("ok machine runtime resets buffer snapshot")
+  test_machine_runtime_tracks_ui_state()
+  ok("ok machine runtime tracks ui state")
   test_commit_plan_reuses_stable_render_for_same_source()
   ok("ok commit_plan reuses same-source stable renders")
   test_commit_plan_does_not_reuse_render_for_changed_source()
