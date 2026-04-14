@@ -849,6 +849,81 @@ local function test_machine_reducer_retires_overlapping_orphans_after_commit()
   assert_eq(buf.nodes["node:orphan"].visible_overlay_id, nil, "retired orphan should detach visible overlay")
 end
 
+local function test_machine_reducer_cleans_orphans_covered_by_visible_nodes()
+  reset_modules()
+  local types = require("typst-concealer.machine.types")
+  local reducer = require("typst-concealer.machine.reducer")
+
+  local state = types.initial_state()
+  state.buffers[1] = {
+    bufnr = 1,
+    project_scope_id = "project:1",
+    buffer_version = 3,
+    layout_version = 1,
+    render_epoch = 2,
+    nodes = {
+      ["node:current"] = {
+        node_id = "node:current",
+        bufnr = 1,
+        project_scope_id = "project:1",
+        node_type = "math",
+        source_range = { 5, 0, 7, 1 },
+        display_range = { 5, 0, 7, 1 },
+        source_text = "$current$",
+        source_text_hash = "hash:current",
+        context_hash = "ctx:0",
+        prelude_count = 0,
+        semantics = { display_kind = "block", constraint_kind = "flow" },
+        status = "stable",
+        visible_overlay_id = "overlay:current",
+      },
+      ["node:orphan"] = {
+        node_id = "node:orphan",
+        bufnr = 1,
+        project_scope_id = "project:1",
+        node_type = "math",
+        source_range = { 5, 0, 7, 1 },
+        display_range = { 5, 0, 7, 1 },
+        source_text = "$old$",
+        source_text_hash = "hash:old",
+        context_hash = "ctx:0",
+        prelude_count = 0,
+        semantics = { display_kind = "block", constraint_kind = "flow" },
+        status = "orphaned",
+        visible_overlay_id = "overlay:orphan",
+      },
+    },
+    node_order = { "node:current", "node:orphan" },
+  }
+  state.overlays["overlay:current"] = {
+    overlay_id = "overlay:current",
+    owner_node_id = "node:current",
+    owner_bufnr = 1,
+    owner_project_scope_id = "project:1",
+    status = "visible",
+  }
+  state.overlays["overlay:orphan"] = {
+    overlay_id = "overlay:orphan",
+    owner_node_id = "node:orphan",
+    owner_bufnr = 1,
+    owner_project_scope_id = "project:1",
+    status = "visible",
+  }
+
+  local effects
+  state, effects = reducer.reduce(state, { type = "full_render_requested", bufnr = 1 })
+
+  assert_eq(count_effects(effects, "request_full_render"), 0, "covered orphan cleanup should not force rerender")
+  local retire = first_effect(effects, "retire_overlay")
+  assert_truthy(retire ~= nil, "covered orphan should retire on render request cleanup")
+  assert_eq(retire.overlay_id, "overlay:orphan", "cleanup should retire covered orphan overlay")
+  assert_eq(
+    state.buffers[1].nodes["node:orphan"].status,
+    "deleted_confirmed",
+    "covered orphan should become confirmed deleted"
+  )
+end
+
 local function test_machine_runtime_rebuilds_compat_read_model()
   local state = fresh_state()
   local types = require("typst-concealer.machine.types")
@@ -1156,6 +1231,8 @@ local function main()
   ok("ok machine reducer reuses range identity without stable key")
   test_machine_reducer_retires_overlapping_orphans_after_commit()
   ok("ok machine reducer retires overlapping orphans after commit")
+  test_machine_reducer_cleans_orphans_covered_by_visible_nodes()
+  ok("ok machine reducer cleans orphans covered by visible nodes")
   test_machine_runtime_rebuilds_compat_read_model()
   ok("ok machine runtime rebuilds compat read model")
   test_machine_runtime_builds_watch_render_job()

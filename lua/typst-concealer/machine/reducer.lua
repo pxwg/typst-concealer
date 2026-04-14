@@ -193,6 +193,20 @@ local function find_best_old_node(old_nodes, scanned, used_old, project_scope_id
   return best_by_range(old_nodes, scanned, used_old, project_scope_id, bufnr, node_identity_can_range_match)
 end
 
+local function retire_orphan_node(state, orphan, effects)
+  local overlay = state.overlays[orphan.visible_overlay_id]
+  if overlay ~= nil then
+    overlay.status = "retiring"
+    effects[#effects + 1] = {
+      kind = "retire_overlay",
+      overlay_id = overlay.overlay_id,
+    }
+  end
+  orphan.visible_overlay_id = nil
+  orphan.candidate_overlay_id = nil
+  orphan.status = "deleted_confirmed"
+end
+
 local function retire_overlapping_orphans(state, buf, committed_node, effects)
   for _, other_id in ipairs(buf.node_order or {}) do
     if other_id ~= committed_node.node_id then
@@ -203,17 +217,29 @@ local function retire_overlapping_orphans(state, buf, committed_node, effects)
         and other.visible_overlay_id ~= nil
         and row_ranges_overlap(other.display_range, committed_node.display_range)
       then
-        local overlay = state.overlays[other.visible_overlay_id]
-        if overlay ~= nil then
-          overlay.status = "retiring"
-          effects[#effects + 1] = {
-            kind = "retire_overlay",
-            overlay_id = overlay.overlay_id,
-          }
+        retire_orphan_node(state, other, effects)
+      end
+    end
+  end
+end
+
+local function retire_orphans_covered_by_visible_nodes(state, buf, effects)
+  for _, orphan_id in ipairs(buf.node_order or {}) do
+    local orphan = buf.nodes[orphan_id]
+    if orphan ~= nil and orphan.status == "orphaned" and orphan.visible_overlay_id ~= nil then
+      for _, node_id in ipairs(buf.node_order or {}) do
+        local node = buf.nodes[node_id]
+        if
+          node_id ~= orphan_id
+          and node ~= nil
+          and node.status ~= "orphaned"
+          and node.status ~= "deleted_confirmed"
+          and node.visible_overlay_id ~= nil
+          and row_ranges_overlap(orphan.display_range, node.display_range)
+        then
+          retire_orphan_node(state, orphan, effects)
+          break
         end
-        other.visible_overlay_id = nil
-        other.candidate_overlay_id = nil
-        other.status = "deleted_confirmed"
       end
     end
   end
@@ -417,6 +443,8 @@ local function reduce_full_render_requested(state, ev)
   if buf == nil then
     return new_state, effects
   end
+
+  retire_orphans_covered_by_visible_nodes(new_state, buf, effects)
 
   local render_node_ids = {}
   for _, node_id in ipairs(buf.node_order or {}) do
