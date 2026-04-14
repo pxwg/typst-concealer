@@ -85,11 +85,6 @@ local M = {}
 --- @field buffer_version integer
 --- @field layout_version integer
 --- @field extmark_id integer|nil
-
---- @class EventNodeDeletedConfirmed
---- @field type "node_deleted_confirmed"
---- @field bufnr integer
---- @field node_id string
 --- @field image_id integer|nil
 --- @field page_path string|nil
 --- @field page_stamp string|nil
@@ -97,6 +92,11 @@ local M = {}
 --- @field natural_rows integer|nil
 --- @field source_rows integer|nil
 --- @field status OverlayStatus
+
+--- @class EventNodeDeletedConfirmed
+--- @field type "node_deleted_confirmed"
+--- @field bufnr integer
+--- @field node_id string
 
 --- @class EventOverlayResourcesAllocated
 --- @field type "overlay_resources_allocated"
