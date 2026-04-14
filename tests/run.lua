@@ -604,8 +604,8 @@ local function test_machine_reducer_enforces_request_identity_and_delayed_retire
   assert_eq(count_effects(effects, "ensure_overlay_placeholder"), 1, "new node should get a placeholder")
   local request = first_effect(effects, "request_full_render")
   assert_truthy(request, "full render should request watch rendering")
-  local overlay = state.overlays[request.overlay_ids[1]]
-  assert_eq(overlay.request_id, request.request_id, "overlay request id should be immutable candidate identity")
+  local overlay = state.overlays[request.request.jobs[1].overlay_id]
+  assert_eq(overlay.request_id, request.request.request_id, "overlay request id should be immutable candidate identity")
   assert_eq(overlay.page_index, 1, "overlay should record request page index")
 
   local wrong_ready = page_ready_event(overlay, { request_id = "request:wrong" })
@@ -649,7 +649,7 @@ local function test_machine_reducer_enforces_request_identity_and_delayed_retire
   assert_eq(count_effects(effects, "abandon_request"), 1, "new request should abandon previous active request")
   request = first_effect(effects, "request_full_render")
   assert_truthy(request, "changed node should request a new render")
-  local next_overlay = state.overlays[request.overlay_ids[1]]
+  local next_overlay = state.overlays[request.request.jobs[1].overlay_id]
   assert_eq(next_overlay.status, "rendering", "visible stale node should render candidate off-screen")
   assert_truthy(next_overlay.request_id ~= overlay.request_id, "new candidate must not reuse old request identity")
 
@@ -674,7 +674,7 @@ local function test_machine_reducer_orphans_deleted_visible_nodes_until_confirme
   state = reducer.reduce(state, scan_event({ make_scanned_node() }))
   state, effects = reducer.reduce(state, { type = "full_render_requested", bufnr = 1 })
   local request = first_effect(effects, "request_full_render")
-  local overlay = state.overlays[request.overlay_ids[1]]
+  local overlay = state.overlays[request.request.jobs[1].overlay_id]
   state = reducer.reduce(state, page_ready_event(overlay))
   state = reducer.reduce(state, {
     type = "overlay_commit_succeeded",
@@ -796,7 +796,7 @@ local function test_machine_runtime_builds_watch_render_job()
   local machine, effects = reducer.reduce(state.machine_state, scan_event({ make_scanned_node() }))
   machine, effects = reducer.reduce(machine, { type = "full_render_requested", bufnr = 1 })
   local request = first_effect(effects, "request_full_render")
-  local overlay_id = request.overlay_ids[1]
+  local overlay_id = request.request.jobs[1].overlay_id
   state.machine_state = machine
 
   runtime.dispatch({

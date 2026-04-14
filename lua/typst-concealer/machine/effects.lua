@@ -12,13 +12,7 @@ local M = {}
 
 --- @class EffectRequestFullRender
 --- @field kind "request_full_render"
---- @field request_id string
---- @field bufnr integer
---- @field project_scope_id string
---- @field render_epoch integer
---- @field buffer_version integer
---- @field layout_version integer
---- @field overlay_ids string[]
+--- @field request WatchRenderRequest
 
 --- @class EffectCommitOverlay
 --- @field kind "commit_overlay"

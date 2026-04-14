@@ -217,6 +217,31 @@ local function new_overlay(state, buf, node, request_id, page_index)
   return overlay
 end
 
+local function render_job_from_node(node, overlay)
+  return {
+    request_id = overlay.request_id,
+    request_page_index = overlay.page_index,
+    overlay_id = overlay.overlay_id,
+    node_id = node.node_id,
+    bufnr = node.bufnr,
+    project_scope_id = node.project_scope_id,
+    render_epoch = overlay.render_epoch,
+    buffer_version = overlay.buffer_version,
+    layout_version = overlay.layout_version,
+    item_idx = node.item_idx,
+    range = copy_range(node.source_range),
+    display_range = copy_range(node.display_range),
+    display_prefix = node.display_prefix,
+    display_suffix = node.display_suffix,
+    source_text = node.source_text,
+    str = node.source_text,
+    prelude_count = node.prelude_count,
+    semantics = deepcopy(node.semantics),
+    image_id = overlay.image_id,
+    extmark_id = overlay.extmark_id,
+  }
+end
+
 local function should_rerender_node(node)
   return node.status == "stale" or node.status == "pending"
 end
@@ -328,7 +353,7 @@ local function reduce_full_render_requested(state, ev)
   retire_old_request_candidates(new_state, buf, buf.active_request_id, effects, request_id)
   buf.active_request_id = request_id
 
-  local overlay_ids = {}
+  local jobs = {}
   local page_index = 0
   for _, node_id in ipairs(render_node_ids) do
     local node = buf.nodes[node_id]
@@ -336,7 +361,7 @@ local function reduce_full_render_requested(state, ev)
     local overlay = new_overlay(new_state, buf, node, request_id, page_index)
     node.candidate_overlay_id = overlay.overlay_id
     node.status = "pending"
-    overlay_ids[#overlay_ids + 1] = overlay.overlay_id
+    jobs[#jobs + 1] = render_job_from_node(node, overlay)
 
     if node.visible_overlay_id == nil then
       effects[#effects + 1] = {
@@ -352,13 +377,15 @@ local function reduce_full_render_requested(state, ev)
 
   effects[#effects + 1] = {
     kind = "request_full_render",
-    request_id = request_id,
-    bufnr = buf.bufnr,
-    project_scope_id = buf.project_scope_id,
-    render_epoch = buf.render_epoch,
-    buffer_version = buf.buffer_version,
-    layout_version = buf.layout_version,
-    overlay_ids = overlay_ids,
+    request = {
+      request_id = request_id,
+      bufnr = buf.bufnr,
+      project_scope_id = buf.project_scope_id,
+      render_epoch = buf.render_epoch,
+      buffer_version = buf.buffer_version,
+      layout_version = buf.layout_version,
+      jobs = jobs,
+    },
   }
 
   return new_state, effects

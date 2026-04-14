@@ -233,23 +233,24 @@ function M.build_render_job(machine_state, overlay_id)
   }
 end
 
-local function build_watch_request(effect)
+local function prepare_watch_request(effect)
+  local source_request = effect.request or {}
   local jobs = {}
-  for _, overlay_id in ipairs(effect.overlay_ids or {}) do
-    ensure_overlay_resources(overlay_id)
-    local job = M.build_render_job(ensure_machine_state(), overlay_id)
+  for _, source_job in ipairs(source_request.jobs or {}) do
+    ensure_overlay_resources(source_job.overlay_id)
+    local job = M.build_render_job(ensure_machine_state(), source_job.overlay_id)
     if job ~= nil then
       jobs[#jobs + 1] = job
     end
   end
 
   return {
-    request_id = effect.request_id,
-    bufnr = effect.bufnr,
-    project_scope_id = effect.project_scope_id,
-    render_epoch = effect.render_epoch,
-    buffer_version = effect.buffer_version,
-    layout_version = effect.layout_version,
+    request_id = source_request.request_id,
+    bufnr = source_request.bufnr,
+    project_scope_id = source_request.project_scope_id,
+    render_epoch = source_request.render_epoch,
+    buffer_version = source_request.buffer_version,
+    layout_version = source_request.layout_version,
     jobs = jobs,
   }
 end
@@ -259,13 +260,13 @@ local function run_ensure_overlay_placeholder(effect)
 end
 
 local function run_request_full_render(effect)
-  local request = build_watch_request(effect)
+  local request = prepare_watch_request(effect)
   if #request.jobs == 0 then
     return
   end
   local session = require("typst-concealer.session")
   if type(session.render_request_via_watch) == "function" then
-    session.render_request_via_watch(effect.bufnr, request)
+    session.render_request_via_watch(request.bufnr, request)
   end
 end
 

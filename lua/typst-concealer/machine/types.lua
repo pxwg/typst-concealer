@@ -96,7 +96,7 @@ local M = {}
 --- @class EventOverlayResourcesAllocated
 --- @field type "overlay_resources_allocated"
 --- @field overlay_id string
---- @field image_id integer
+--- @field image_id integer|nil
 --- @field extmark_id integer|nil
 
 --- @class BufferState
