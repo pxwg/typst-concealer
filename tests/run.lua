@@ -860,6 +860,28 @@ local function test_machine_runtime_tracks_ui_state()
   assert_eq(ui.preview.render_key, "preview-key", "preview render key should be stored in machine ui state")
   assert_eq(ui.preview.last_render_key, "preview-key", "rendered preview key should be tracked in machine ui state")
 
+  local preview_item = { bufnr = 1 }
+  runtime.prepare_preview_request(1, preview_item)
+  assert_eq(preview_item.preview_request_id, ui.preview.active_request_id, "preview item should carry request identity")
+  assert_eq(ui.preview.status, "rendering", "preview request should mark preview rendering")
+  assert_eq(
+    runtime.accept_preview_page_update({
+      bufnr = 1,
+      preview_request_id = "stale-preview",
+    }, { apply = false }),
+    false,
+    "stale preview page should be rejected"
+  )
+  assert_eq(
+    runtime.accept_preview_page_update({
+      bufnr = 1,
+      preview_request_id = preview_item.preview_request_id,
+    }, { apply = false }),
+    true,
+    "active preview page should be accepted"
+  )
+  assert_eq(ui.preview.status, "ready", "accepted preview page should mark preview ready")
+
   state.machine_state.buffers[1] = { bufnr = 1, nodes = {}, node_order = {} }
   runtime.reset_buffer(1)
   assert_eq(state.machine_state.ui.buffers[1], nil, "buffer reset should clear machine ui state")

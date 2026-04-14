@@ -38,6 +38,9 @@ local function new_ui_buffer()
       sync_needs_full = false,
       render_key = nil,
       last_render_key = nil,
+      active_request_id = nil,
+      next_request_id = 1,
+      status = "idle",
     },
   }
 end
@@ -70,6 +73,40 @@ function M.reset_preview_state(bufnr)
   preview.sync_needs_full = false
   preview.render_key = nil
   preview.last_render_key = nil
+  preview.active_request_id = nil
+  preview.status = "idle"
+end
+
+function M.prepare_preview_request(bufnr, item)
+  if item == nil then
+    return nil
+  end
+  local preview = M.get_ui_buffer(bufnr).preview
+  local n = preview.next_request_id or 1
+  preview.next_request_id = n + 1
+  preview.active_request_id = "preview:" .. tostring(bufnr) .. ":" .. tostring(n)
+  preview.status = "rendering"
+  item.preview_request_id = preview.active_request_id
+  return item
+end
+
+function M.clear_preview_request(bufnr)
+  local preview = M.get_ui_buffer(bufnr).preview
+  preview.active_request_id = nil
+  preview.status = "idle"
+end
+
+function M.accept_preview_page_update(update, opts)
+  opts = opts or {}
+  local preview = M.get_ui_buffer(update.bufnr).preview
+  if update.preview_request_id ~= nil and update.preview_request_id ~= preview.active_request_id then
+    return false
+  end
+  if opts.apply ~= false then
+    require("typst-concealer.apply").accept_page_update(update)
+  end
+  preview.status = "ready"
+  return true
 end
 
 local function get_overlay_and_node(machine_state, overlay_id)
@@ -434,6 +471,7 @@ function M.render_live_preview(bufnr)
 end
 
 function M.clear_live_preview(bufnr)
+  M.clear_preview_request(bufnr)
   require("typst-concealer.plan").clear_live_typst_preview(bufnr)
 end
 
@@ -465,6 +503,11 @@ end
 
 function M.schedule_live_preview_sync(bufnr, opts)
   require("typst-concealer.plan").schedule_live_preview_sync(bufnr, opts)
+end
+
+function M.render_preview_tail(bufnr, item)
+  M.prepare_preview_request(bufnr, item)
+  require("typst-concealer.session").render_preview_tail(bufnr, item)
 end
 
 return M

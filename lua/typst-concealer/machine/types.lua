@@ -139,6 +139,9 @@ local M = {}
 --- @field sync_needs_full boolean
 --- @field render_key string|nil
 --- @field last_render_key string|nil
+--- @field active_request_id string|nil
+--- @field next_request_id integer
+--- @field status "idle"|"rendering"|"ready"
 
 --- @class MachineUIBufferState
 --- @field hover MachineUIHoverState

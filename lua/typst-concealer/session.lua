@@ -991,6 +991,10 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
   if update == nil then
     return false
   end
+  if item.preview_request_id ~= nil then
+    update.preview_request_id = item.preview_request_id
+    return require("typst-concealer.machine.runtime").accept_preview_page_update(update)
+  end
   require("typst-concealer.apply").accept_page_update(update)
   return true
 end

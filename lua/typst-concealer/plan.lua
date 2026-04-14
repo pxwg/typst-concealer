@@ -1343,6 +1343,7 @@ end
 --- Stop the live preview tail page and remove its extmark/image.
 --- @param bufnr integer
 function M.clear_live_typst_preview(bufnr)
+  require("typst-concealer.machine.runtime").clear_preview_request(bufnr)
   require("typst-concealer.session").clear_preview_tail(bufnr)
   cleanup_preview_image(bufnr)
 end
@@ -1460,7 +1461,7 @@ function M.render_live_typst_preview(bufnr)
       render_key,
       shared_extmark_id
     )
-    require("typst-concealer.session").render_preview_tail(bufnr, preview_item)
+    require("typst-concealer.machine.runtime").render_preview_tail(bufnr, preview_item)
     return
   end
 
