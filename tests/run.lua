@@ -433,6 +433,16 @@ local function test_session_render_request_tracks_current_request()
     assert_eq(next(session.page_state), nil, "new request should reset page state")
     assert_truthy(session.last_input_text ~= nil, "new request should write watch input")
 
+    local stale_page_1 = session.output_prefix .. "-1.png"
+    local stale_page_2 = session.output_prefix .. "-2.png"
+    write_file(stale_page_1, "old-page-1")
+    write_file(stale_page_2, "old-page-2")
+    session.page_state = {
+      [1] = { rendered = "old-stamp", last_seen = "old-stamp" },
+      [2] = { rendered = "old-stamp", last_seen = "old-stamp" },
+    }
+    session.last_page_count = 2
+
     local old_request = session.current_request
     local request2 = vim.deepcopy(request)
     request2.request_id = "request:2"
@@ -440,6 +450,10 @@ local function test_session_render_request_tracks_current_request()
     session_mod.render_request_via_watch(bufnr, request2)
     assert_eq(old_request.status, "abandoned", "replaced request should be abandoned")
     assert_eq(session.current_request.request_id, "request:2", "session should install replacement request")
+    assert_eq(vim.uv.fs_stat(stale_page_1), nil, "replacement request should clear stale page 1")
+    assert_eq(vim.uv.fs_stat(stale_page_2), nil, "replacement request should clear stale page 2")
+    assert_eq(next(session.page_state), nil, "replacement request should reset page state before polling")
+    assert_truthy(session.last_input_text ~= nil, "replacement request should force a watch input write")
 
     session_mod.stop_watch_session(bufnr, "full")
   end)
