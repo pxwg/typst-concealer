@@ -57,6 +57,10 @@ local function row_gap_len(a, b)
   return 0
 end
 
+local function row_ranges_overlap(a, b)
+  return row_overlap_len(a, b) > 0
+end
+
 local function col_delta_len(a, b)
   return math.abs(a[2] - b[2]) + math.abs(a[4] - b[4])
 end
@@ -89,6 +93,9 @@ local function node_matches_scan(node, scanned, project_scope_id, bufnr)
   if node == nil or scanned == nil then
     return false
   end
+  if node.status == "deleted_confirmed" then
+    return false
+  end
   if node.bufnr ~= bufnr or node.project_scope_id ~= project_scope_id then
     return false
   end
@@ -98,36 +105,53 @@ local function node_matches_scan(node, scanned, project_scope_id, bufnr)
   return node.source_text_hash == scanned.source_text_hash and node.context_hash == scanned.context_hash
 end
 
-local function find_best_old_node(old_nodes, scanned, used_old, project_scope_id, bufnr)
-  if scanned.stable_key ~= nil then
-    for _, old in pairs(old_nodes or {}) do
-      if
-        not used_old[old.node_id]
-        and old.stable_key == scanned.stable_key
-        and old.bufnr == bufnr
-        and old.project_scope_id == project_scope_id
-      then
-        return old
-      end
-    end
+local function node_identity_can_range_match(node, scanned, project_scope_id, bufnr)
+  if node == nil or scanned == nil then
+    return false
+  end
+  if node.status == "deleted_confirmed" then
+    return false
+  end
+  if node.bufnr ~= bufnr or node.project_scope_id ~= project_scope_id then
+    return false
+  end
+  if node.node_type ~= scanned.node_type then
+    return false
   end
 
+  local overlap = row_overlap_len(node.source_range, scanned.source_range)
+  local gap = row_gap_len(node.source_range, scanned.source_range)
+  return overlap > 0 or gap <= 1
+end
+
+local function node_identity_rank(node)
+  if node.status == "orphaned" then
+    return 1
+  end
+  return 2
+end
+
+local function best_by_range(old_nodes, scanned, used_old, project_scope_id, bufnr, predicate)
   local best = nil
+  local best_rank = -1
   local best_overlap = -1
   local best_gap = math.huge
   local best_col_delta = math.huge
 
   for _, old in pairs(old_nodes or {}) do
-    if not used_old[old.node_id] and node_matches_scan(old, scanned, project_scope_id, bufnr) then
+    if not used_old[old.node_id] and predicate(old, scanned, project_scope_id, bufnr) then
+      local rank = node_identity_rank(old)
       local overlap = row_overlap_len(old.source_range, scanned.source_range)
       local gap = row_gap_len(old.source_range, scanned.source_range)
       local col_delta = col_delta_len(old.source_range, scanned.source_range)
       if
-        overlap > best_overlap
-        or (overlap == best_overlap and gap < best_gap)
-        or (overlap == best_overlap and gap == best_gap and col_delta < best_col_delta)
+        rank > best_rank
+        or (rank == best_rank and overlap > best_overlap)
+        or (rank == best_rank and overlap == best_overlap and gap < best_gap)
+        or (rank == best_rank and overlap == best_overlap and gap == best_gap and col_delta < best_col_delta)
       then
         best = old
+        best_rank = rank
         best_overlap = overlap
         best_gap = gap
         best_col_delta = col_delta
@@ -136,6 +160,63 @@ local function find_best_old_node(old_nodes, scanned, used_old, project_scope_id
   end
 
   return best
+end
+
+local function find_stable_key_node(old_nodes, scanned, used_old, project_scope_id, bufnr)
+  if scanned.stable_key == nil then
+    return nil
+  end
+  for _, old in pairs(old_nodes or {}) do
+    if
+      not used_old[old.node_id]
+      and old.status ~= "deleted_confirmed"
+      and old.stable_key == scanned.stable_key
+      and old.bufnr == bufnr
+      and old.project_scope_id == project_scope_id
+    then
+      return old
+    end
+  end
+end
+
+local function find_best_old_node(old_nodes, scanned, used_old, project_scope_id, bufnr)
+  local stable = find_stable_key_node(old_nodes, scanned, used_old, project_scope_id, bufnr)
+  if stable ~= nil then
+    return stable
+  end
+
+  local exact = best_by_range(old_nodes, scanned, used_old, project_scope_id, bufnr, node_matches_scan)
+  if exact ~= nil then
+    return exact
+  end
+
+  return best_by_range(old_nodes, scanned, used_old, project_scope_id, bufnr, node_identity_can_range_match)
+end
+
+local function retire_overlapping_orphans(state, buf, committed_node, effects)
+  for _, other_id in ipairs(buf.node_order or {}) do
+    if other_id ~= committed_node.node_id then
+      local other = buf.nodes[other_id]
+      if
+        other ~= nil
+        and other.status == "orphaned"
+        and other.visible_overlay_id ~= nil
+        and row_ranges_overlap(other.display_range, committed_node.display_range)
+      then
+        local overlay = state.overlays[other.visible_overlay_id]
+        if overlay ~= nil then
+          overlay.status = "retiring"
+          effects[#effects + 1] = {
+            kind = "retire_overlay",
+            overlay_id = overlay.overlay_id,
+          }
+        end
+        other.visible_overlay_id = nil
+        other.candidate_overlay_id = nil
+        other.status = "deleted_confirmed"
+      end
+    end
+  end
 end
 
 local function node_render_inputs_equal(node, scanned)
@@ -513,6 +594,7 @@ local function reduce_overlay_commit_succeeded(state, ev)
       }
     end
   end
+  retire_overlapping_orphans(new_state, buf, node, effects)
 
   return new_state, effects
 end

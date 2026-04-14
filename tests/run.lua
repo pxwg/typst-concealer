@@ -728,6 +728,127 @@ local function test_machine_reducer_orphans_deleted_visible_nodes_until_confirme
   assert_eq(effects[1].overlay_id, overlay.overlay_id, "confirmed delete should retire the orphan overlay")
 end
 
+local function test_machine_reducer_reuses_range_identity_without_stable_key()
+  reset_modules()
+  local types = require("typst-concealer.machine.types")
+  local reducer = require("typst-concealer.machine.reducer")
+
+  local state = types.initial_state()
+  local effects
+  state, effects = reducer.reduce(
+    state,
+    scan_event({
+      make_scanned_node({
+        stable_key = nil,
+        source_range = { 5, 0, 7, 1 },
+        display_range = { 5, 0, 7, 1 },
+        source_text = "$\n  alpha beta\n$",
+        source_text_hash = "hash:alpha-beta",
+      }),
+    })
+  )
+  local node_id = state.buffers[1].node_order[1]
+  state, effects = reducer.reduce(state, { type = "full_render_requested", bufnr = 1 })
+  local request = first_effect(effects, "request_full_render")
+  local overlay = state.overlays[request.request.jobs[1].overlay_id]
+  state = reducer.reduce(state, page_ready_event(overlay))
+  state = reducer.reduce(state, {
+    type = "overlay_commit_succeeded",
+    overlay_id = overlay.overlay_id,
+    node_id = overlay.owner_node_id,
+  })
+
+  state, effects = reducer.reduce(
+    state,
+    scan_event({
+      make_scanned_node({
+        stable_key = nil,
+        source_range = { 5, 0, 7, 1 },
+        display_range = { 5, 0, 7, 1 },
+        source_text = "$\n  alpha beta gamma\n$",
+        source_text_hash = "hash:alpha-beta-gamma",
+      }),
+    }, { buffer_version = 2 })
+  )
+  local buf = state.buffers[1]
+  assert_eq(buf.node_order[1], node_id, "range fallback should keep node identity when source changes")
+  assert_eq(buf.nodes[node_id].status, "stale", "changed range-matched node should become stale")
+  assert_eq(
+    buf.nodes[node_id].visible_overlay_id,
+    overlay.overlay_id,
+    "old overlay should remain until replacement commits"
+  )
+  assert_eq(#buf.node_order, 1, "range-matched edits should not create orphan nodes")
+end
+
+local function test_machine_reducer_retires_overlapping_orphans_after_commit()
+  reset_modules()
+  local types = require("typst-concealer.machine.types")
+  local reducer = require("typst-concealer.machine.reducer")
+
+  local state = types.initial_state()
+  local effects
+  state = reducer.reduce(
+    state,
+    scan_event({
+      make_scanned_node({
+        stable_key = nil,
+        source_range = { 5, 0, 7, 1 },
+        display_range = { 5, 0, 7, 1 },
+      }),
+    })
+  )
+  state, effects = reducer.reduce(state, { type = "full_render_requested", bufnr = 1 })
+  local request = first_effect(effects, "request_full_render")
+  local overlay = state.overlays[request.request.jobs[1].overlay_id]
+  state = reducer.reduce(state, page_ready_event(overlay))
+
+  local buf = state.buffers[1]
+  buf.nodes["node:orphan"] = {
+    node_id = "node:orphan",
+    bufnr = 1,
+    project_scope_id = "project:1",
+    node_type = "math",
+    source_range = { 5, 0, 7, 1 },
+    display_range = { 5, 0, 7, 1 },
+    source_text = "$old$",
+    source_text_hash = "hash:old",
+    context_hash = "ctx:0",
+    prelude_count = 0,
+    semantics = { display_kind = "block", constraint_kind = "flow" },
+    status = "orphaned",
+    visible_overlay_id = "overlay:orphan",
+  }
+  buf.node_order[#buf.node_order + 1] = "node:orphan"
+  state.overlays["overlay:orphan"] = {
+    overlay_id = "overlay:orphan",
+    owner_node_id = "node:orphan",
+    owner_bufnr = 1,
+    owner_project_scope_id = "project:1",
+    request_id = "request:old",
+    page_index = 1,
+    render_epoch = 1,
+    buffer_version = 1,
+    layout_version = 1,
+    image_id = 99,
+    extmark_id = 199,
+    status = "visible",
+  }
+
+  state, effects = reducer.reduce(state, {
+    type = "overlay_commit_succeeded",
+    overlay_id = overlay.overlay_id,
+    node_id = overlay.owner_node_id,
+  })
+
+  local retire = first_effect(effects, "retire_overlay")
+  buf = state.buffers[1]
+  assert_truthy(retire ~= nil, "committing replacement should retire overlapping orphan overlays")
+  assert_eq(retire.overlay_id, "overlay:orphan", "retire effect should target the overlapping orphan")
+  assert_eq(buf.nodes["node:orphan"].status, "deleted_confirmed", "retired orphan should become confirmed deleted")
+  assert_eq(buf.nodes["node:orphan"].visible_overlay_id, nil, "retired orphan should detach visible overlay")
+end
+
 local function test_machine_runtime_rebuilds_compat_read_model()
   local state = fresh_state()
   local types = require("typst-concealer.machine.types")
@@ -1031,6 +1152,10 @@ local function main()
   ok("ok machine reducer enforces request identity and delayed retire")
   test_machine_reducer_orphans_deleted_visible_nodes_until_confirmed()
   ok("ok machine reducer orphans deleted visible nodes until confirmed")
+  test_machine_reducer_reuses_range_identity_without_stable_key()
+  ok("ok machine reducer reuses range identity without stable key")
+  test_machine_reducer_retires_overlapping_orphans_after_commit()
+  ok("ok machine reducer retires overlapping orphans after commit")
   test_machine_runtime_rebuilds_compat_read_model()
   ok("ok machine runtime rebuilds compat read model")
   test_machine_runtime_builds_watch_render_job()
