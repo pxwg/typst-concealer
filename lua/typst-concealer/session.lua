@@ -808,6 +808,7 @@ local function write_session_document(session, mode)
     return
   end
   session.last_input_text = doc_str
+  session.last_input_write_count = (session.last_input_write_count or 0) + 1
 end
 
 --- @param bufnr integer
@@ -1306,6 +1307,7 @@ function M.ensure_watch_session(bufnr)
     poll_interval_ms = nil,
     last_page_count = 0,
     last_input_text = nil,
+    last_input_write_count = 0,
     last_preview_sidecar_text = nil,
     wrapper_cache = {
       item_fragments = {},
@@ -1451,6 +1453,9 @@ function M.render_request_via_watch(bufnr, request)
 
   local current_request = replace_current_request(session, request)
   clear_request_output_pages(session, current_request.page_count)
+  -- Rewriting the same Typst document is still required after clearing pages:
+  -- watch only regenerates the fixed output paths when the input file changes.
+  session.last_input_text = nil
   session.base_items = current_request.jobs
   session.prelude_chunks = snapshot_full_context_preludes(bufnr)
   if session.preview_active and session.preview_sidecar_item ~= nil then

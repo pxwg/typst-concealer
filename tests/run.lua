@@ -433,6 +433,7 @@ local function test_session_render_request_tracks_current_request()
     assert_eq(session.base_items[1].overlay_id, "overlay:1", "request jobs should become watch base items")
     assert_eq(next(session.page_state), nil, "new request should reset page state")
     assert_truthy(session.last_input_text ~= nil, "new request should write watch input")
+    local first_input_write_count = session.last_input_write_count
 
     local stale_page_1 = session.output_prefix .. "-1.png"
     local stale_page_2 = session.output_prefix .. "-2.png"
@@ -454,7 +455,11 @@ local function test_session_render_request_tracks_current_request()
     assert_eq(vim.uv.fs_stat(stale_page_1), nil, "replacement request should clear stale page 1")
     assert_eq(vim.uv.fs_stat(stale_page_2), nil, "replacement request should clear stale page 2")
     assert_eq(next(session.page_state), nil, "replacement request should reset page state before polling")
-    assert_truthy(session.last_input_text ~= nil, "replacement request should force a watch input write")
+    assert_eq(
+      session.last_input_write_count,
+      first_input_write_count + 1,
+      "replacement request should force a watch input write"
+    )
 
     session_mod.stop_watch_session(bufnr, "full")
   end)
