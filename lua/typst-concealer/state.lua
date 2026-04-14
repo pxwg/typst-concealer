@@ -42,6 +42,7 @@ M.image_ids_in_use = {}
 --- @field poll_interval_ms integer|nil
 --- @field last_page_count integer
 --- @field last_input_text string|nil
+--- @field last_input_write_count integer
 --- @field last_preview_sidecar_text string|nil
 --- @field wrapper_cache table|nil
 --- @field current_request CurrentWatchRequest|nil
