@@ -39,6 +39,11 @@ local M = {}
 --- @field inputs_signature string
 --- @field preamble_signature string
 --- @field context_signature string
+--- @field buf_dir string|nil
+--- @field buf_path string|nil
+--- @field cwd string|nil
+--- @field inputs string[]|nil
+--- @field preamble_path string|nil
 
 --- @class NodeSemantics
 --- @field constraint_kind ConstraintKind

@@ -295,13 +295,6 @@ local function hash_string(value)
   return vim.fn.sha256(value or "")
 end
 
-local function project_scope_id(bufnr)
-  return table.concat({
-    vim.api.nvim_buf_get_name(bufnr) or "",
-    vim.fn.getcwd() or "",
-  }, "\0")
-end
-
 local function context_hash(prelude_count)
   local parts = { tostring(prelude_count or 0) }
   for i = 1, prelude_count or 0 do
@@ -719,10 +712,11 @@ function M.render_buf(bufnr)
   state.buffer_render_state[bufnr].runtime_preludes = state.runtime_preludes
 
   local runtime = require("typst-concealer.machine.runtime")
+  local project_scope = require("typst-concealer.project-scope").resolve(bufnr, "full")
   runtime.dispatch({
     type = "nodes_scanned",
     bufnr = bufnr,
-    project_scope_id = project_scope_id(bufnr),
+    project_scope_id = project_scope.project_scope_id,
     buffer_version = vim.api.nvim_buf_get_changedtick(bufnr),
     layout_version = vim.o.columns,
     scanned_nodes = scanned_nodes,

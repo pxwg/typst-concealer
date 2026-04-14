@@ -20,6 +20,7 @@ M.image_ids_in_use = {}
 --- @class typst_watch_session
 --- @field kind 'full'
 --- @field bufnr integer
+--- @field project_scope_id string|nil
 --- @field handle uv_process_t|nil
 --- @field stdout uv_pipe_t|nil
 --- @field stderr uv_pipe_t|nil

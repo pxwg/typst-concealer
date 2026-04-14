@@ -494,14 +494,6 @@ local function update_quickfix_from_stderr(session)
   rebuild_quickfix(session.bufnr)
 end
 
-local function get_buf_dir(bufnr)
-  local buf_file = vim.api.nvim_buf_get_name(bufnr)
-  if buf_file == nil or buf_file == "" then
-    return vim.uv.cwd()
-  end
-  return vim.fn.fnamemodify(buf_file, ":h")
-end
-
 --- Returns (and creates) a per-buffer cache directory.
 --- Prefer placing it inside source_root so generated watch inputs stay within
 --- the same Typst project root as real source files.
@@ -564,17 +556,6 @@ end
 local function get_watch_session(bufnr, kind)
   local bucket = state.watch_sessions[bufnr]
   return bucket and bucket[kind] or nil
-end
-
-local function resolve_root_base(configured_root, cwd, project_root, buf_dir)
-  local function normalize(path)
-    if type(path) ~= "string" or path == "" then
-      return nil
-    end
-    return vim.fs.normalize(vim.fn.fnamemodify(path, ":p")):gsub("/$", "")
-  end
-
-  return normalize(configured_root) or normalize(cwd) or normalize(project_root) or normalize(buf_dir)
 end
 
 --- Report whether a watch session exists and is still alive.
@@ -1233,8 +1214,10 @@ function M.ensure_watch_session(bufnr)
   local stderr = vim.uv.new_pipe()
 
   local path_rewrite = require("typst-concealer.path-rewrite")
-  local buf_dir = get_buf_dir(bufnr)
-  local project_root = path_rewrite.get_project_root(buf_dir)
+  local project_scope = require("typst-concealer.project-scope").resolve(bufnr, kind)
+  local buf_dir = project_scope.buf_dir
+  local source_root = project_scope.source_root
+  local effective_root = project_scope.effective_root
   -- Strip any --root from compiler_args (typst rejects duplicates). Source root
   -- comes only from get_root or project auto-detection.
   local filtered_compiler_args = {}
@@ -1253,37 +1236,16 @@ function M.ensure_watch_session(bufnr)
     end
   end
 
-  local buf_path = vim.api.nvim_buf_get_name(bufnr)
-  local cwd = vim.fn.getcwd()
-  local configured_root = nil
-  if type(config.get_root) == "function" then
-    local ok, result = pcall(config.get_root, bufnr, buf_path, cwd, kind)
-    if ok and type(result) == "string" and result ~= "" then
-      configured_root = result
-    end
-  end
-
-  local source_root = resolve_root_base(configured_root, cwd, project_root, buf_dir)
   local input_path = session_input_path(bufnr, source_root)
-  local effective_root = source_root
   local template, prefix = session_output_template(bufnr)
   local preview_sidecar_path = session_preview_sidecar_path(bufnr, source_root)
-
-  -- Collect extra --input pairs from get_inputs.
-  local extra_inputs = {}
-  if type(config.get_inputs) == "function" then
-    local ok, result = pcall(config.get_inputs, bufnr, buf_path, cwd, kind)
-    if ok and type(result) == "table" then
-      extra_inputs = result
-    end
-  end
 
   local args = { "watch", input_path, template, "--ppi=" .. (state._render_ppi or config.ppi) }
   for _, arg in ipairs(filtered_compiler_args) do
     args[#args + 1] = arg
   end
   args[#args + 1] = "--root=" .. effective_root
-  for _, s in ipairs(extra_inputs) do
+  for _, s in ipairs(project_scope.inputs or {}) do
     args[#args + 1] = "--input"
     args[#args + 1] = s
   end
@@ -1318,6 +1280,7 @@ function M.ensure_watch_session(bufnr)
   local session = {
     kind = kind,
     bufnr = bufnr,
+    project_scope_id = project_scope.project_scope_id,
     handle = nil,
     stdout = stdout,
     stderr = stderr,
