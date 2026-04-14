@@ -2,3 +2,18 @@
 // TODO: (code (let ... )) should be added to preludes below
 // TODO: (code (ident)) should be rendered, like maths
 // TODO: (code (block ...)) should be rendered, like maths
+
+Phase 1 remaining architecture checklist:
+
+- Move hover conceal / unconceal state into the machine. Current code still uses
+  the legacy read model rebuilt by machine.runtime.
+- Move live preview and preview-tail rendering into a preview reducer. Current
+  preview pages still use apply.accept_page_update.
+- Route cursor/mode/text-change UI event intent through machine events instead
+  of direct render-layer calls.
+- Finish resource allocation abstraction. Runtime currently allocates image and
+  extmark resources, then writes them back through overlay_resources_allocated.
+  The boundary is explicit but still runtime-owned.
+- Re-evaluate fixed output path isolation after real watch testing. The current
+  mitigation clears request pages, resets page_state, and forces an input write
+  on request replacement.
