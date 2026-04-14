@@ -2,6 +2,7 @@
 --- Converts reducer effects into Neovim/session/extmark side effects.
 
 local reducer = require("typst-concealer.machine.reducer")
+local resources = require("typst-concealer.machine.resources")
 local state = require("typst-concealer.state")
 local types = require("typst-concealer.machine.types")
 
@@ -255,7 +256,7 @@ local function dispatch_without_effects(event)
 end
 
 local function allocate_image_id(bufnr)
-  return require("typst-concealer.apply")._new_image_id(bufnr)
+  return resources.allocate_image_id(bufnr)
 end
 
 local function ensure_overlay_resources(overlay_id, opts)
@@ -269,7 +270,7 @@ local function ensure_overlay_resources(overlay_id, opts)
   local image_id = overlay.image_id or allocate_image_id(overlay.owner_bufnr)
   local extmark_id = overlay.extmark_id
   if opts.place_extmark == true and extmark_id == nil then
-    extmark_id = require("typst-concealer.extmark").place_render_extmark(
+    extmark_id = resources.place_overlay_extmark(
       overlay.owner_bufnr,
       image_id,
       node.display_range,
@@ -408,16 +409,7 @@ local function run_retire_overlay(effect)
   end
 
   local bufnr = overlay.owner_bufnr
-  if overlay.extmark_id ~= nil then
-    state.prepare_extmark_reuse(bufnr, overlay.extmark_id)
-    pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id, overlay.extmark_id)
-  end
-  if overlay.image_id ~= nil then
-    require("typst-concealer.extmark").clear_image(overlay.image_id)
-    state.image_id_to_extmark[overlay.image_id] = nil
-    state.item_by_image_id[overlay.image_id] = nil
-    state.image_ids_in_use[overlay.image_id] = nil
-  end
+  resources.release_overlay_resources(bufnr, overlay.image_id, overlay.extmark_id)
 
   overlay.status = "retired"
   M.rebuild_buffer_read_model(machine_state, bufnr)

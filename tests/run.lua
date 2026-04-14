@@ -49,6 +49,7 @@ local function reset_modules()
   package.loaded["typst-concealer.machine.types"] = nil
   package.loaded["typst-concealer.machine.reducer"] = nil
   package.loaded["typst-concealer.machine.effects"] = nil
+  package.loaded["typst-concealer.machine.resources"] = nil
   package.loaded["typst-concealer.machine.runtime"] = nil
   package.loaded["typst-concealer.wrapper"] = nil
   package.loaded["typst-concealer.path-rewrite"] = nil
@@ -887,6 +888,30 @@ local function test_machine_runtime_tracks_ui_state()
   assert_eq(state.machine_state.ui.buffers[1], nil, "buffer reset should clear machine ui state")
 end
 
+local function test_machine_resources_share_legacy_allocation_pool()
+  local state = fresh_state()
+  state.pid = 700
+  local resources = require("typst-concealer.machine.resources")
+  local image_id = resources.allocate_image_id(1)
+  assert_eq(image_id, 700, "machine resources should allocate from state pid")
+  assert_eq(state.image_ids_in_use[image_id], 1, "machine allocation should reserve the image id")
+
+  local apply = require("typst-concealer.apply")
+  local legacy_image_id = apply._new_image_id(2)
+  assert_eq(legacy_image_id, 701, "legacy apply allocation should share the machine resource pool")
+  assert_eq(state.image_ids_in_use[legacy_image_id], 2, "legacy allocation should reserve through resources")
+
+  state.image_id_to_extmark[image_id] = 901
+  state.item_by_image_id[image_id] = { image_id = image_id }
+  with_stubbed_extmark(function(calls)
+    resources.release_overlay_resources(1, image_id, nil)
+    assert_eq(calls.cleared[1], image_id, "resource release should clear the terminal image")
+  end)
+  assert_eq(state.image_ids_in_use[image_id], nil, "resource release should free the image id")
+  assert_eq(state.image_id_to_extmark[image_id], nil, "resource release should unindex extmark mapping")
+  assert_eq(state.item_by_image_id[image_id], nil, "resource release should unindex item mapping")
+end
+
 local function test_commit_plan_reuses_stable_render_for_same_source()
   local state = fresh_state()
   local bufnr = 1
@@ -1009,6 +1034,8 @@ local function main()
   ok("ok machine runtime resets buffer snapshot")
   test_machine_runtime_tracks_ui_state()
   ok("ok machine runtime tracks ui state")
+  test_machine_resources_share_legacy_allocation_pool()
+  ok("ok machine resources share legacy allocation pool")
   test_commit_plan_reuses_stable_render_for_same_source()
   ok("ok commit_plan reuses same-source stable renders")
   test_commit_plan_does_not_reuse_render_for_changed_source()

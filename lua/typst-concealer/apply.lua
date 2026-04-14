@@ -3,6 +3,7 @@
 --- Receives PlannedItem[] from render.lua (the planner) and produces AppliedItem[].
 
 local state = require("typst-concealer.state")
+local resources = require("typst-concealer.machine.resources")
 local M = {}
 
 --- @class PlannedItem
@@ -41,21 +42,7 @@ local M = {}
 --- @param bufnr integer
 --- @return integer
 local function new_image_id(bufnr)
-  local pid = state.pid
-  for i = pid, 2 ^ 16 + pid - 1 do
-    if state.image_ids_in_use[i] == nil then
-      state.image_ids_in_use[i] = bufnr
-      return i
-    end
-  end
-  -- Overflow: reset and retry
-  print(
-    "[typst-concealer] >65536 image ids in use, overflowing. "
-      .. "This is probably a bug, you're looking at a very long document or a lot of documents.\n"
-      .. "Open an issue if you see this, the cap can be increased if someone actually needs it.\n"
-  )
-  state.image_ids_in_use = {}
-  return new_image_id(bufnr)
+  return resources.allocate_image_id(bufnr)
 end
 
 M._new_image_id = new_image_id
@@ -67,12 +54,7 @@ local function cleanup_item(bufnr, item)
   if item == nil then
     return
   end
-  local extmark = require("typst-concealer.extmark")
-  state.prepare_extmark_reuse(bufnr, item.extmark_id)
-  pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id, item.extmark_id)
-  extmark.clear_image(item.image_id)
-  state.image_id_to_extmark[item.image_id] = nil
-  state.item_by_image_id[item.image_id] = nil
+  resources.release_overlay_resources(bufnr, item.image_id, item.extmark_id)
 end
 
 M.cleanup_item = cleanup_item
