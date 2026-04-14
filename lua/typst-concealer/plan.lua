@@ -281,10 +281,6 @@ local function collect_incremental_units(bufnr, root, query, prev_units, pending
   return merge_units_in_rows(prev_units, new_units, start_row, end_row)
 end
 
-local function new_image_id(bufnr)
-  return require("typst-concealer.apply")._new_image_id(bufnr)
-end
-
 local function clear_diagnostics(bufnr)
   vim.schedule(function()
     vim.diagnostic.reset(state.ns_id, bufnr)
