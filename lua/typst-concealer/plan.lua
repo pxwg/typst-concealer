@@ -416,6 +416,52 @@ local function get_math_symbol_span_at_cursor(item, row, col, mode)
   return nil
 end
 
+local function preview_item_context_key(item)
+  local bstate = state.buffer_render_state[item.bufnr] or {}
+  local prelude_chunks = bstate.runtime_preludes or state.runtime_preludes or {}
+  local prelude_count = math.max(0, math.min(item.prelude_count or 0, #prelude_chunks))
+  local semantics = item.semantics or {}
+  local ok_main, main = pcall(require, "typst-concealer")
+  local config = ok_main and main.config or {}
+  local parts = {
+    "preview-context-v2",
+    tostring(prelude_count),
+    tostring(item.node_type or ""),
+    tostring(semantics.constraint_kind or ""),
+    tostring(semantics.display_kind or ""),
+    tostring(semantics.render_whole_line == true),
+    tostring(state._cell_px_w or ""),
+    tostring(state._cell_px_h or ""),
+    tostring(state._render_ppi or config.ppi or ""),
+    config.header or "",
+    (ok_main and main._styling_prelude) or "",
+  }
+  for i = 1, prelude_count do
+    parts[#parts + 1] = prelude_chunks[i] or ""
+  end
+  return hash_string(table.concat(parts, "\0"))
+end
+
+local function preview_render_key(item, source_text, cursor_row, cursor_col, span)
+  local parts = {
+    "preview-render-v2",
+    table.concat(item.range, ":"),
+    preview_item_context_key(item),
+    tostring(cursor_row),
+    tostring(cursor_col),
+    source_text,
+  }
+  if span == nil then
+    parts[#parts + 1] = "plain"
+  else
+    parts[#parts + 1] = tostring(span.start_row)
+    parts[#parts + 1] = tostring(span.start_col)
+    parts[#parts + 1] = tostring(span.end_row)
+    parts[#parts + 1] = tostring(span.end_col)
+  end
+  return hash_string(table.concat(parts, "\0"))
+end
+
 local function make_highlighted_preview_math(item, cursor_row, cursor_col, mode)
   if item == nil or item.node_type ~= "math" then
     return nil, nil, nil
@@ -428,24 +474,12 @@ local function make_highlighted_preview_math(item, cursor_row, cursor_col, mode)
 
   local span = get_math_symbol_span_at_cursor(item, cursor_row, cursor_col, mode)
   if span == nil then
-    local key = table.concat(item.range, ":")
-      .. ":plain:"
-      .. tostring(cursor_row)
-      .. ":"
-      .. tostring(cursor_col)
-      .. ":"
-      .. source_text
+    local key = preview_render_key(item, source_text, cursor_row, cursor_col, nil)
     return source_text, key, source_text
   end
 
   if not cursor_in_range(item.range, span.start_row, span.start_col, { include_right_edge = false }) then
-    local key = table.concat(item.range, ":")
-      .. ":plain:"
-      .. tostring(cursor_row)
-      .. ":"
-      .. tostring(cursor_col)
-      .. ":"
-      .. source_text
+    local key = preview_render_key(item, source_text, cursor_row, cursor_col, nil)
     return source_text, key, source_text
   end
 
@@ -453,17 +487,7 @@ local function make_highlighted_preview_math(item, cursor_row, cursor_col, mode)
   local suffix = get_text_slice(item.bufnr, span.end_row, span.end_col, item.range[3], item.range[4])
   local replacement = "#text(red)[$" .. span.text .. "$]"
   local rendered = prefix .. replacement .. suffix
-  local key = table.concat(item.range, ":")
-    .. ":"
-    .. tostring(span.start_row)
-    .. ":"
-    .. tostring(span.start_col)
-    .. ":"
-    .. tostring(span.end_row)
-    .. ":"
-    .. tostring(span.end_col)
-    .. ":"
-    .. source_text
+  local key = preview_render_key(item, source_text, cursor_row, cursor_col, span)
   return rendered, key, source_text
 end
 

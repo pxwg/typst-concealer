@@ -1333,42 +1333,29 @@ local function stable_hash(text)
 end
 
 --- @param item table
---- @return string
-local function normalize_item_source(item)
-  if type(item.str) == "table" then
-    return table.concat(item.str)
-  end
-  if type(item.str) == "string" then
-    return item.str
-  end
-  return ""
-end
-
---- @param item table
 --- @return integer
 local function item_source_rows(item)
   local range = item.range or { 0, 0, 0, 0 }
   return math.max(1, (range[3] or 0) - (range[1] or 0) + 1)
 end
 
---- Rewrite the preview formula exactly as wrapper.lua would rewrite an item
---- body, but keep it in a sidecar file so the preview main document remains
---- stable across nodes sharing the same prelude/wrapper context.
+--- Build the preview sidecar exactly like a full-render slot: runtime prelude,
+--- wrapper, and the current preview body all live in the included file.  The
+--- preview main document stays stable and only includes this context-owned
+--- sidecar, matching the full service render layout.
 --- @param item table
 --- @param project_scope table
+--- @param prelude_chunks string[]
 --- @return string
-local function rewrite_preview_sidecar_source(item, project_scope)
-  local text = normalize_item_source(item)
-  if project_scope.buf_dir == nil or project_scope.source_root == nil or project_scope.effective_root == nil then
-    return text
-  end
-
-  return require("typst-concealer.path-rewrite").rewrite_paths(text, {
-    bufnr = item.bufnr,
-    buf_dir = project_scope.buf_dir,
-    source_root = project_scope.source_root,
-    effective_root = project_scope.effective_root,
-  })
+local function build_preview_service_sidecar_source(item, project_scope, prelude_chunks)
+  local text = require("typst-concealer.wrapper").build_slot_document(
+    item,
+    project_scope.buf_dir,
+    project_scope.source_root,
+    project_scope.effective_root,
+    prelude_chunks
+  )
+  return text
 end
 
 --- @param service typst_compiler_service
@@ -2581,9 +2568,9 @@ local function preview_prelude_signature(prelude_chunks, prelude_count)
 end
 
 --- Build the stable preview main document and sidecar metadata for one
---- prelude/wrapper context.  The main document intentionally contains only an
---- include of the context-owned sidecar; actual formula updates are written to
---- the sidecar immediately before the request is sent to the service.
+--- prelude/wrapper context.  The main document intentionally contains only the
+--- global document context plus an include of the context-owned sidecar; the
+--- sidecar itself contains the runtime prelude, wrapper, and current formula.
 --- @param bufnr integer
 --- @param service typst_compiler_service
 --- @param item table
@@ -2634,6 +2621,8 @@ local function build_preview_service_spec(bufnr, service, item, project_scope, p
   include_item.str = '#include "' .. sidecar_root_relative_path .. '"\n'
   include_item.source_str = nil
   include_item.source_text = nil
+  include_item.prelude_count = 0
+  include_item.skip_wrapper = true
 
   service._preview_wrapper_caches = service._preview_wrapper_caches or {}
   service._preview_wrapper_caches[context_hash] = service._preview_wrapper_caches[context_hash]
@@ -2656,7 +2645,7 @@ local function build_preview_service_spec(bufnr, service, item, project_scope, p
     cache_dir = cache_dir,
     source_text = doc_str,
     sidecar_path = sidecar_path,
-    sidecar_text = rewrite_preview_sidecar_source(item, project_scope),
+    sidecar_text = build_preview_service_sidecar_source(probe_item, project_scope, prelude_chunks),
   }
 end
 

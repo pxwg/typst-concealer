@@ -638,10 +638,7 @@ local function test_session_render_request_via_service_writes_json()
     )
     local full_slot_include = msg.source_text:match('#include%s+"([^"]*/full/slots/slot%-000001%.typ)"')
     assert_truthy(full_slot_include ~= nil, "service main source should include a stable slot sidecar")
-    assert_truthy(
-      msg.source_text:find("$x$", 1, true) == nil,
-      "service main source should not inline formula text"
-    )
+    assert_truthy(msg.source_text:find("$x$", 1, true) == nil, "service main source should not inline formula text")
     local full_slot_path = full_slot_include:sub(1, 1) == "/" and (root .. full_slot_include)
       or vim.fs.joinpath(root, full_slot_include)
     local full_slot_text = table.concat(vim.fn.readfile(full_slot_path), "\n")
@@ -649,8 +646,8 @@ local function test_session_render_request_via_service_writes_json()
     assert_startswith(prewarm_msg.request_id, "preview-prewarm:", "preview prewarm should carry a prewarm id")
     assert_truthy(prewarm_msg.cache_key:find("^preview:", 1, false) ~= nil, "preview prewarm should use preview cache")
     assert_truthy(
-      prewarm_msg.source_text:find("#let warm-color = red", 1, true) ~= nil,
-      "preview prewarm should include the full prelude snapshot"
+      prewarm_msg.source_text:find("#let warm-color = red", 1, true) == nil,
+      "preview prewarm main source should not inline runtime prelude"
     )
     assert_truthy(
       prewarm_msg.source_text:find('#include "', 1, true) ~= nil,
@@ -659,6 +656,19 @@ local function test_session_render_request_via_service_writes_json()
     assert_truthy(
       prewarm_msg.source_text:find("$x$", 1, true) == nil,
       "preview prewarm main source should not inline formula text"
+    )
+    local prewarm_include_path = prewarm_msg.source_text:match('#include%s+"([^"]+)"')
+    assert_truthy(prewarm_include_path ~= nil, "preview prewarm should include a sidecar")
+    local prewarm_sidecar_path = prewarm_include_path:sub(1, 1) == "/" and (root .. prewarm_include_path)
+      or vim.fs.joinpath(root, prewarm_include_path)
+    local prewarm_sidecar_text = table.concat(vim.fn.readfile(prewarm_sidecar_path), "\n")
+    assert_truthy(
+      prewarm_sidecar_text:find("#let warm-color = red", 1, true) ~= nil,
+      "preview prewarm sidecar should include the full prelude snapshot"
+    )
+    assert_truthy(
+      prewarm_sidecar_text:find("$x$", 1, true) ~= nil,
+      "preview prewarm sidecar should contain formula text"
     )
     assert_eq(state.active_service_requests[bufnr].request_id, "request:service:1", "service request should be active")
 
@@ -740,9 +750,13 @@ local function test_session_render_request_via_service_writes_json()
       "sent preview should still use the warmed main source"
     )
     local include_path = sent_preview_msg.source_text:match('#include%s+"([^"]+)"')
-    assert_truthy(include_path ~= nil, "sent preview should include a formula sidecar")
+    assert_truthy(include_path ~= nil, "sent preview should include a preview sidecar")
     local sidecar_path = include_path:sub(1, 1) == "/" and (root .. include_path) or vim.fs.joinpath(root, include_path)
     local sidecar_text = table.concat(vim.fn.readfile(sidecar_path), "\n")
+    assert_truthy(
+      sidecar_text:find("#let warm-color = red", 1, true) ~= nil,
+      "sent preview sidecar should keep the full prelude snapshot"
+    )
     assert_truthy(
       sidecar_text:find("$#text(red)[$x$]$", 1, true) ~= nil,
       "sent preview should write highlighted source to the sidecar"
@@ -1329,11 +1343,11 @@ local function test_service_diagnostics_mapping()
         type = "compile_result",
         request_id = ctx.request.request_id,
         status = "error",
-      pages = {},
-      diagnostics = {
+        pages = {},
+        diagnostics = {
           { line = 1, column = 1, message = "wrapper failed" },
-      },
-    })
+        },
+      })
       wait_until_service_request_cleared(ctx.state, ctx.bufnr)
       local item = ctx.state.watch_diagnostics[ctx.bufnr].full[1]
       assert_eq(item.filename, meta.generated_input_path, "generated diagnostic should point to generated input")
@@ -1344,42 +1358,38 @@ local function test_service_diagnostics_mapping()
     end
   )
 
-  make_service_response_harness(
-    "diagnostics-slot-generated",
-    {
-      do_diagnostics = true,
-      runtime_preludes = { "#let broken = )\n" },
-      jobs = {
-        {
-          request_page_index = 1,
-          slot_id = "slot:1",
-          overlay_id = "overlay:slot-generated",
-          node_id = "node:slot-generated",
-          prelude_count = 1,
-        },
+  make_service_response_harness("diagnostics-slot-generated", {
+    do_diagnostics = true,
+    runtime_preludes = { "#let broken = )\n" },
+    jobs = {
+      {
+        request_page_index = 1,
+        slot_id = "slot:1",
+        overlay_id = "overlay:slot-generated",
+        node_id = "node:slot-generated",
+        prelude_count = 1,
       },
     },
-    function(ctx)
-      local meta = ctx.state.active_service_requests[ctx.bufnr]
-      local slot_path = next(meta.slot_line_maps or {})
-      feed_service_response(ctx.full_stdout, {
-        type = "compile_result",
-        request_id = ctx.request.request_id,
-        status = "error",
-        pages = {},
-        diagnostics = {
-          { file = slot_path, line = 1, column = 1, message = "slot wrapper failed" },
-        },
-      })
-      wait_until_service_request_cleared(ctx.state, ctx.bufnr)
-      local item = ctx.state.watch_diagnostics[ctx.bufnr].full[1]
-      assert_eq(item.filename, slot_path, "slot wrapper diagnostic should point to generated sidecar")
-      assert_truthy(
-        item.text:find("%[service/generated%] slot wrapper failed") ~= nil,
-        "slot wrapper diagnostic should use generated prefix"
-      )
-    end
-  )
+  }, function(ctx)
+    local meta = ctx.state.active_service_requests[ctx.bufnr]
+    local slot_path = next(meta.slot_line_maps or {})
+    feed_service_response(ctx.full_stdout, {
+      type = "compile_result",
+      request_id = ctx.request.request_id,
+      status = "error",
+      pages = {},
+      diagnostics = {
+        { file = slot_path, line = 1, column = 1, message = "slot wrapper failed" },
+      },
+    })
+    wait_until_service_request_cleared(ctx.state, ctx.bufnr)
+    local item = ctx.state.watch_diagnostics[ctx.bufnr].full[1]
+    assert_eq(item.filename, slot_path, "slot wrapper diagnostic should point to generated sidecar")
+    assert_truthy(
+      item.text:find("%[service/generated%] slot wrapper failed") ~= nil,
+      "slot wrapper diagnostic should use generated prefix"
+    )
+  end)
 
   make_service_response_harness("diagnostics-external", { do_diagnostics = true }, function(ctx)
     local external = vim.fs.joinpath(ctx.root, "external.typ")
@@ -2277,9 +2287,27 @@ local function test_machine_reducer_stable_slots_include_clean_pages_for_one_dir
   state = reducer.reduce(
     state,
     scan_event({
-      make_scanned_node({ item_idx = 1, source_range = { 0, 0, 0, 3 }, display_range = { 0, 0, 0, 3 }, source_text = "$a$", source_text_hash = "hash:a" }),
-      make_scanned_node({ item_idx = 2, source_range = { 1, 0, 1, 3 }, display_range = { 1, 0, 1, 3 }, source_text = "$b$", source_text_hash = "hash:b" }),
-      make_scanned_node({ item_idx = 3, source_range = { 2, 0, 2, 3 }, display_range = { 2, 0, 2, 3 }, source_text = "$c$", source_text_hash = "hash:c" }),
+      make_scanned_node({
+        item_idx = 1,
+        source_range = { 0, 0, 0, 3 },
+        display_range = { 0, 0, 0, 3 },
+        source_text = "$a$",
+        source_text_hash = "hash:a",
+      }),
+      make_scanned_node({
+        item_idx = 2,
+        source_range = { 1, 0, 1, 3 },
+        display_range = { 1, 0, 1, 3 },
+        source_text = "$b$",
+        source_text_hash = "hash:b",
+      }),
+      make_scanned_node({
+        item_idx = 3,
+        source_range = { 2, 0, 2, 3 },
+        display_range = { 2, 0, 2, 3 },
+        source_text = "$c$",
+        source_text_hash = "hash:c",
+      }),
     })
   )
   local effects
@@ -2289,9 +2317,27 @@ local function test_machine_reducer_stable_slots_include_clean_pages_for_one_dir
   state = reducer.reduce(
     state,
     scan_event({
-      make_scanned_node({ item_idx = 1, source_range = { 0, 0, 0, 3 }, display_range = { 0, 0, 0, 3 }, source_text = "$a$", source_text_hash = "hash:a" }),
-      make_scanned_node({ item_idx = 2, source_range = { 1, 0, 1, 4 }, display_range = { 1, 0, 1, 4 }, source_text = "$bb$", source_text_hash = "hash:bb" }),
-      make_scanned_node({ item_idx = 3, source_range = { 2, 0, 2, 3 }, display_range = { 2, 0, 2, 3 }, source_text = "$c$", source_text_hash = "hash:c" }),
+      make_scanned_node({
+        item_idx = 1,
+        source_range = { 0, 0, 0, 3 },
+        display_range = { 0, 0, 0, 3 },
+        source_text = "$a$",
+        source_text_hash = "hash:a",
+      }),
+      make_scanned_node({
+        item_idx = 2,
+        source_range = { 1, 0, 1, 4 },
+        display_range = { 1, 0, 1, 4 },
+        source_text = "$bb$",
+        source_text_hash = "hash:bb",
+      }),
+      make_scanned_node({
+        item_idx = 3,
+        source_range = { 2, 0, 2, 3 },
+        display_range = { 2, 0, 2, 3 },
+        source_text = "$c$",
+        source_text_hash = "hash:c",
+      }),
     }, { buffer_version = 2 })
   )
   state, effects = reducer.reduce(state, { type = "full_render_requested", bufnr = 1 })
@@ -2312,8 +2358,20 @@ local function test_machine_reducer_stable_slots_append_insertions_without_shift
   state = reducer.reduce(
     state,
     scan_event({
-      make_scanned_node({ item_idx = 1, source_range = { 0, 0, 0, 3 }, display_range = { 0, 0, 0, 3 }, source_text = "$a$", source_text_hash = "hash:a" }),
-      make_scanned_node({ item_idx = 2, source_range = { 2, 0, 2, 3 }, display_range = { 2, 0, 2, 3 }, source_text = "$b$", source_text_hash = "hash:b" }),
+      make_scanned_node({
+        item_idx = 1,
+        source_range = { 0, 0, 0, 3 },
+        display_range = { 0, 0, 0, 3 },
+        source_text = "$a$",
+        source_text_hash = "hash:a",
+      }),
+      make_scanned_node({
+        item_idx = 2,
+        source_range = { 2, 0, 2, 3 },
+        display_range = { 2, 0, 2, 3 },
+        source_text = "$b$",
+        source_text_hash = "hash:b",
+      }),
     })
   )
   local first_id = state.buffers[1].node_order[1]
@@ -2327,9 +2385,27 @@ local function test_machine_reducer_stable_slots_append_insertions_without_shift
   state = reducer.reduce(
     state,
     scan_event({
-      make_scanned_node({ item_idx = 1, source_range = { 0, 0, 0, 3 }, display_range = { 0, 0, 0, 3 }, source_text = "$c$", source_text_hash = "hash:c" }),
-      make_scanned_node({ item_idx = 2, source_range = { 1, 0, 1, 3 }, display_range = { 1, 0, 1, 3 }, source_text = "$a$", source_text_hash = "hash:a" }),
-      make_scanned_node({ item_idx = 3, source_range = { 3, 0, 3, 3 }, display_range = { 3, 0, 3, 3 }, source_text = "$b$", source_text_hash = "hash:b" }),
+      make_scanned_node({
+        item_idx = 1,
+        source_range = { 0, 0, 0, 3 },
+        display_range = { 0, 0, 0, 3 },
+        source_text = "$c$",
+        source_text_hash = "hash:c",
+      }),
+      make_scanned_node({
+        item_idx = 2,
+        source_range = { 1, 0, 1, 3 },
+        display_range = { 1, 0, 1, 3 },
+        source_text = "$a$",
+        source_text_hash = "hash:a",
+      }),
+      make_scanned_node({
+        item_idx = 3,
+        source_range = { 3, 0, 3, 3 },
+        display_range = { 3, 0, 3, 3 },
+        source_text = "$b$",
+        source_text_hash = "hash:b",
+      }),
     }, { buffer_version = 2 })
   )
 
@@ -2356,9 +2432,27 @@ local function test_machine_reducer_stable_slots_tombstone_deletions_without_shi
   state = reducer.reduce(
     state,
     scan_event({
-      make_scanned_node({ item_idx = 1, source_range = { 0, 0, 0, 3 }, display_range = { 0, 0, 0, 3 }, source_text = "$a$", source_text_hash = "hash:a" }),
-      make_scanned_node({ item_idx = 2, source_range = { 1, 0, 1, 3 }, display_range = { 1, 0, 1, 3 }, source_text = "$b$", source_text_hash = "hash:b" }),
-      make_scanned_node({ item_idx = 3, source_range = { 2, 0, 2, 3 }, display_range = { 2, 0, 2, 3 }, source_text = "$c$", source_text_hash = "hash:c" }),
+      make_scanned_node({
+        item_idx = 1,
+        source_range = { 0, 0, 0, 3 },
+        display_range = { 0, 0, 0, 3 },
+        source_text = "$a$",
+        source_text_hash = "hash:a",
+      }),
+      make_scanned_node({
+        item_idx = 2,
+        source_range = { 1, 0, 1, 3 },
+        display_range = { 1, 0, 1, 3 },
+        source_text = "$b$",
+        source_text_hash = "hash:b",
+      }),
+      make_scanned_node({
+        item_idx = 3,
+        source_range = { 2, 0, 2, 3 },
+        display_range = { 2, 0, 2, 3 },
+        source_text = "$c$",
+        source_text_hash = "hash:c",
+      }),
     })
   )
   local first_slot = state.buffers[1].nodes[state.buffers[1].node_order[1]].slot_id
@@ -2371,8 +2465,20 @@ local function test_machine_reducer_stable_slots_tombstone_deletions_without_shi
   state = reducer.reduce(
     state,
     scan_event({
-      make_scanned_node({ item_idx = 1, source_range = { 0, 0, 0, 3 }, display_range = { 0, 0, 0, 3 }, source_text = "$a$", source_text_hash = "hash:a" }),
-      make_scanned_node({ item_idx = 2, source_range = { 1, 0, 1, 3 }, display_range = { 1, 0, 1, 3 }, source_text = "$c$", source_text_hash = "hash:c" }),
+      make_scanned_node({
+        item_idx = 1,
+        source_range = { 0, 0, 0, 3 },
+        display_range = { 0, 0, 0, 3 },
+        source_text = "$a$",
+        source_text_hash = "hash:a",
+      }),
+      make_scanned_node({
+        item_idx = 2,
+        source_range = { 1, 0, 1, 3 },
+        display_range = { 1, 0, 1, 3 },
+        source_text = "$c$",
+        source_text_hash = "hash:c",
+      }),
     }, { buffer_version = 2 })
   )
   local buf = state.buffers[1]
