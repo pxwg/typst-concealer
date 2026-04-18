@@ -527,6 +527,22 @@ local function should_preserve_preview(bufnr, cursor_row, cursor_col)
   return bs.preview_image ~= nil and cursor_near_range(bs.preview_source_range, cursor_row, cursor_col)
 end
 
+local function stable_preview_to_keep(bs)
+  if bs == nil or bs.preview_image == nil then
+    return nil, false
+  end
+  if item_has_stable_render(bs.preview_item) and bs.preview_image.image_id == bs.preview_item.image_id then
+    return bs.preview_item, true
+  end
+  if
+    item_has_stable_render(bs.preview_last_rendered_item)
+    and bs.preview_image.image_id == bs.preview_last_rendered_item.image_id
+  then
+    return bs.preview_last_rendered_item, false
+  end
+  return nil, false
+end
+
 local function preview_left_pad_cols(bufnr, range)
   local winid = vim.fn.bufwinid(bufnr)
   if winid == -1 then
@@ -1388,22 +1404,34 @@ function M.render_live_typst_preview(bufnr)
       return
     end
     if preview.render_key == render_key then
+      local previous_stable_preview = stable_preview_to_keep(bs)
+      if previous_stable_preview ~= nil then
+        return
+      end
       present_preview_item(bufnr, item, cursor_row, cursor_col)
       return
     end
 
-    if item_has_stable_render(bs.preview_item) then
-      bs.preview_last_rendered_item = bs.preview_item
+    local previous_preview_item = bs.preview_item
+    local previous_stable_preview, previous_stable_is_active = stable_preview_to_keep(bs)
+    if previous_stable_preview ~= nil then
+      bs.preview_last_rendered_item = previous_stable_preview
+    end
+    if previous_stable_is_active then
       bs.preview_last_render_key = preview.render_key
       preview.last_render_key = preview.render_key
     end
-    present_preview_item(bufnr, item, cursor_row, cursor_col)
+    if previous_stable_preview == nil then
+      present_preview_item(bufnr, item, cursor_row, cursor_col)
+    end
 
     local shared_extmark_id = bs.preview_image and bs.preview_image.extmark_id or nil
     if
-      bs.preview_item ~= nil and (bs.preview_image == nil or bs.preview_item.image_id ~= bs.preview_image.image_id)
+      previous_preview_item ~= nil
+      and previous_preview_item ~= previous_stable_preview
+      and (bs.preview_image == nil or previous_preview_item.image_id ~= bs.preview_image.image_id)
     then
-      cleanup_preview_item_request(bufnr, bs.preview_item, { keep_extmark = shared_extmark_id ~= nil })
+      cleanup_preview_item_request(bufnr, previous_preview_item, { keep_extmark = shared_extmark_id ~= nil })
     end
 
     local preview_item = require("typst-concealer.apply").allocate_preview_item(

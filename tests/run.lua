@@ -43,6 +43,7 @@ local function reset_modules()
   package.loaded["typst-concealer"] = nil
   package.loaded["typst-concealer.state"] = nil
   package.loaded["typst-concealer.apply"] = nil
+  package.loaded["typst-concealer.plan"] = nil
   package.loaded["typst-concealer.cursor-visibility"] = nil
   package.loaded["typst-concealer.extmark"] = nil
   package.loaded["typst-concealer.session"] = nil
@@ -162,6 +163,7 @@ local function with_stubbed_extmark(fn)
     created = {},
     concealed = {},
     unconcealed = {},
+    virtual = {},
   }
 
   package.loaded["typst-concealer.extmark"] = {
@@ -219,6 +221,19 @@ local function with_stubbed_extmark(fn)
         extmark_id = extmark_id,
       }
       return true
+    end,
+    show_virtual_image = function(bufnr, extmark_id, anchor_row, render_image_id, natural_cols, natural_rows, opts)
+      local id = extmark_id or (render_image_id + 20000)
+      calls.virtual[#calls.virtual + 1] = {
+        bufnr = bufnr,
+        extmark_id = id,
+        anchor_row = anchor_row,
+        render_image_id = render_image_id,
+        natural_cols = natural_cols,
+        natural_rows = natural_rows,
+        opts = opts,
+      }
+      return id
     end,
   }
 
@@ -1522,6 +1537,142 @@ local function test_preview_service_uses_last_page_after_context()
     assert_eq(vim.uv.fs_stat(context_path), nil, "preview context artifact should be cleaned")
     assert_truthy(vim.uv.fs_stat(preview_path) ~= nil, "accepted preview artifact should stay live")
   end)
+end
+
+local function test_live_preview_keeps_old_highlight_until_replacement_commits()
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "$x+y$" })
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_win_set_cursor(0, { 1, 2 })
+
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    _enabled_buffers = { [bufnr] = true },
+    _styling_prelude = "",
+    is_render_allowed = function()
+      return true
+    end,
+    config = {
+      live_preview_enabled = true,
+      use_compiler_service = false,
+      ppi = 300,
+      header = "",
+      compiler_args = {},
+      conceal_in_normal = false,
+      cursor_hover_throttle_ms = 0,
+    },
+  }
+
+  local preview_requests = {}
+  package.loaded["typst-concealer.session"] = {
+    render_preview_tail = function(_, item)
+      preview_requests[#preview_requests + 1] = item
+    end,
+    clear_preview_tail = function() end,
+  }
+
+  local source_item = make_render_item({
+    bufnr = bufnr,
+    range = { 0, 0, 0, 5 },
+    display_range = { 0, 0, 0, 5 },
+    str = "$x+y$",
+    image_id = 101,
+    extmark_id = 201,
+    page_path = "/tmp/source.png",
+    page_stamp = "source",
+    natural_cols = 5,
+    natural_rows = 1,
+    source_rows = 1,
+  })
+  state.buffer_render_state[bufnr] = {
+    full_items = { source_item },
+    lingering_items = {},
+    line_to_items = { [0] = { source_item } },
+    runtime_preludes = {},
+  }
+  state.item_by_image_id[source_item.image_id] = source_item
+  state.image_id_to_extmark[source_item.image_id] = source_item.extmark_id
+  state.image_ids_in_use[source_item.image_id] = bufnr
+
+  local old_preview = make_render_item({
+    bufnr = bufnr,
+    range = { 0, 0, 0, 5 },
+    display_range = { 0, 0, 0, 5 },
+    str = "$#text(red)[$x$]+y$",
+    source_str = "$x+y$",
+    image_id = 301,
+    extmark_id = 401,
+    page_path = "/tmp/old-highlight.png",
+    page_stamp = "old-highlight",
+    natural_cols = 6,
+    natural_rows = 1,
+    source_rows = 1,
+    render_target = "preview_float",
+    source_image_id = source_item.image_id,
+  })
+  state.item_by_image_id[old_preview.image_id] = old_preview
+  state.image_id_to_extmark[old_preview.image_id] = old_preview.extmark_id
+  state.image_ids_in_use[old_preview.image_id] = bufnr
+
+  local bs = state.get_buf_state(bufnr)
+  bs.preview_item = old_preview
+  bs.preview_last_rendered_item = old_preview
+  bs.preview_render_key = "old-key"
+  bs.preview_image = {
+    extmark_id = old_preview.extmark_id,
+    target_bufnr = bufnr,
+    natural_cols = old_preview.natural_cols,
+    natural_rows = old_preview.natural_rows,
+    image_id = old_preview.image_id,
+  }
+  bs.preview_source_image_id = source_item.image_id
+  bs.preview_source_page_stamp = old_preview.page_stamp
+  bs.preview_source_range = vim.deepcopy(source_item.range)
+
+  local runtime = require("typst-concealer.machine.runtime")
+  runtime.set_preview_render_key(bufnr, "old-key")
+  runtime.mark_preview_rendered(bufnr)
+
+  local original_get_parser = vim.treesitter.get_parser
+  vim.treesitter.get_parser = function()
+    return {
+      parse = function()
+        return {
+          {
+            root = function()
+              return {
+                named_descendant_for_range = function()
+                  return nil
+                end,
+              }
+            end,
+          },
+        }
+      end,
+    }
+  end
+
+  local ok_run, err = pcall(function()
+    with_stubbed_extmark(function(calls)
+      require("typst-concealer.plan").render_live_typst_preview(bufnr)
+      require("typst-concealer.plan").render_live_typst_preview(bufnr)
+
+      assert_eq(#calls.virtual, 0, "replacement preview should not show the unhighlighted source image first")
+      assert_eq(#calls.cleared, 0, "old highlighted preview image should remain allocated while replacement renders")
+      assert_eq(bs.preview_image.image_id, old_preview.image_id, "old highlighted preview should stay visible")
+      assert_eq(state.item_by_image_id[old_preview.image_id], old_preview, "old preview image should remain indexed")
+      assert_eq(#preview_requests, 1, "replacement preview request should be dispatched")
+      assert_truthy(preview_requests[1].preview_request_id ~= nil, "replacement preview request should carry identity")
+      assert_eq(preview_requests[1].extmark_id, old_preview.extmark_id, "replacement should reuse the visible extmark")
+      assert_truthy(preview_requests[1].image_id ~= old_preview.image_id, "replacement should allocate a new image id")
+    end)
+  end)
+
+  vim.treesitter.get_parser = original_get_parser
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+  if not ok_run then
+    error(err)
+  end
 end
 
 local function test_service_artifact_cleanup_preserves_live_paths()
@@ -3351,6 +3502,8 @@ local function main()
   ok("ok preview service routing and stale cleanup")
   test_preview_service_uses_last_page_after_context()
   ok("ok preview service uses last page after context")
+  test_live_preview_keeps_old_highlight_until_replacement_commits()
+  ok("ok live preview keeps old highlight until replacement commits")
   test_service_artifact_cleanup_preserves_live_paths()
   ok("ok service artifact cleanup preserves live paths")
   test_wrapper_cache_tracks_root_signature()
