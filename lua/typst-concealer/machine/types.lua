@@ -18,9 +18,17 @@ local M = {}
 --- | "retiring"
 --- | "retired"
 
---- @alias WatchRequestStatus
+--- @alias SlotStatus
+--- | "dirty"
+--- | "clean"
+--- | "tombstone"
+
+--- @alias RenderRequestStatus
 --- | "active"
 --- | "abandoned"
+--- | "completed"
+--- | "failed"
+--- | "superseded"
 
 --- @alias NodeType "math" | "code"
 --- @alias ConstraintKind "intrinsic" | "flow"
@@ -52,6 +60,7 @@ local M = {}
 
 --- @class NodeState
 --- @field node_id string
+--- @field slot_id string|nil
 --- @field stable_key string|nil
 --- @field bufnr integer
 --- @field project_scope_id string
@@ -72,9 +81,30 @@ local M = {}
 --- @field last_rendered_epoch integer|nil
 --- @field last_buffer_version integer
 --- @field last_layout_version integer
+--- @field missing_since_buffer_version integer|nil
+
+--- @class SlotState
+--- @field slot_id string
+--- @field page_index integer
+--- @field node_id string|nil
+--- @field source_text string
+--- @field source_text_hash string|nil
+--- @field source_range Range4|nil
+--- @field source_rows integer
+--- @field context_hash string|nil
+--- @field prelude_count integer
+--- @field node_type NodeType|nil
+--- @field semantics NodeSemantics|nil
+--- @field display_range Range4|nil
+--- @field visible_overlay_id string|nil
+--- @field candidate_overlay_id string|nil
+--- @field status SlotStatus
+--- @field dirty boolean|nil
+--- @field pending_request_id string|nil
 
 --- @class OverlayState
 --- @field overlay_id string
+--- @field slot_id string|nil
 --- @field owner_node_id string
 --- @field owner_bufnr integer
 --- @field owner_project_scope_id string
@@ -91,6 +121,9 @@ local M = {}
 --- @field natural_cols integer|nil
 --- @field natural_rows integer|nil
 --- @field source_rows integer|nil
+--- @field binding_buffer_version integer|nil
+--- @field binding_layout_version integer|nil
+--- @field binding_display_range Range4|nil
 --- @field status OverlayStatus
 
 --- @class EventNodeDeletedConfirmed
@@ -103,6 +136,13 @@ local M = {}
 --- @field overlay_id string
 --- @field image_id integer|nil
 --- @field extmark_id integer|nil
+--- @field binding_buffer_version integer|nil
+--- @field binding_layout_version integer|nil
+--- @field binding_display_range Range4|nil
+
+--- @class EventOverlayBindingsBatchSucceeded
+--- @field type "overlay_bindings_batch_succeeded"
+--- @field entries table[]
 
 --- @class BufferState
 --- @field bufnr integer
@@ -113,6 +153,11 @@ local M = {}
 --- @field active_request_id string|nil
 --- @field nodes table<string, NodeState>
 --- @field node_order string[]
+--- @field slots table<string, SlotState>
+--- @field slot_order string[]
+--- @field next_slot_id integer
+--- @field shape_epoch integer
+--- @field render_context_hash string|nil
 
 --- @class MachineCounters
 --- @field next_node_id integer
@@ -168,6 +213,7 @@ local M = {}
 --- @field request_id string
 --- @field request_page_index integer
 --- @field overlay_id string
+--- @field slot_id string|nil
 --- @field node_id string
 --- @field bufnr integer
 --- @field project_scope_id string
@@ -185,27 +231,46 @@ local M = {}
 --- @field display_suffix string|nil
 --- @field image_id integer
 --- @field extmark_id integer|nil
+--- @field is_stub boolean|nil
+--- @field is_tombstone boolean|nil
+--- @field slot_status SlotStatus|nil
+--- @field slot_dirty boolean|nil
 
---- @class WatchRenderRequest
+--- @class RenderRequest
 --- @field request_id string
 --- @field bufnr integer
 --- @field project_scope_id string
 --- @field render_epoch integer
 --- @field buffer_version integer
 --- @field layout_version integer
+--- @field shape_epoch integer|nil
 --- @field jobs RenderJob[]
 
---- @class CurrentWatchRequest
+--- @class RenderRequestMeta
 --- @field request_id string
+--- @field bufnr integer|nil
 --- @field render_epoch integer
 --- @field buffer_version integer
 --- @field layout_version integer
 --- @field project_scope_id string
 --- @field jobs RenderJob[]
---- @field page_to_overlay table<integer, string>
---- @field overlay_to_page table<string, integer>
+--- @field page_to_overlay table<integer, string>|nil watch adapter only
+--- @field overlay_to_page table<string, integer>|nil watch adapter only
+--- @field page_to_slot table<integer, string>|nil
+--- @field slot_to_node table<string, string>|nil
+--- @field slot_to_overlay table<string, string>|nil
 --- @field page_count integer
---- @field status WatchRequestStatus
+--- @field status RenderRequestStatus
+--- @field line_map table[]|nil
+--- @field slot_line_maps table<string, table>|nil
+--- @field generated_slot_paths table<string, string>|nil
+--- @field generated_context_path string|nil
+--- @field generated_input_path string|nil
+
+--- Compatibility aliases for legacy watch-session annotations.
+--- @alias WatchRequestStatus RenderRequestStatus
+--- @alias WatchRenderRequest RenderRequest
+--- @alias CurrentWatchRequest RenderRequestMeta
 
 --- @return MachineState
 function M.initial_state()

@@ -1,20 +1,24 @@
---- Watch session management for typst-concealer.
---- Manages long-running `typst watch` processes and polling for rendered pages.
---- When a legacy preview page is stable, delegates to apply.accept_page_update.
---- Machine-owned full pages are emitted as overlay_page_ready events.
+--- Render backend session management for typst-concealer.
+--- Manages legacy `typst watch` sessions and Rust compiler-service processes.
+--- Watch pages still use file polling; service pages use explicit JSON-lines
+--- request/response boundaries. Machine-owned full pages are emitted as
+--- overlay_page_ready events.
 ---
---- TypstBackend interface (current: Typst only)
+--- TypstBackend interface
 ---   M.render_items_via_watch(bufnr, items)          dispatch full items to the watch session
+---   M.render_request_via_service(bufnr, request)    dispatch full overlay request to Rust service
 ---   M.render_preview_tail(bufnr, item)              update the preview tail page
 ---   M.clear_preview_tail(bufnr)                     disable the preview tail page
 ---   M.ensure_watch_session(bufnr)                   start/reuse the full watch session
+---   M.ensure_compiler_service(bufnr)                start/reuse the Rust compiler service
 ---   M.stop_watch_session(bufnr, kind)               kill and clean up a session
+---   M.stop_compiler_service(bufnr)                  kill and clean up compiler service
 ---   M.stop_watch_sessions_for_buf(bufnr)            kill the buffer session
 
 local state = require("typst-concealer.state")
 local M = {}
 
---- Generate quickfix title for all watch diagnostics belonging to a buffer.
+--- Generate quickfix title for all render diagnostics belonging to a buffer.
 --- @param bufnr integer
 --- @return string
 local function qf_title(bufnr)
@@ -25,7 +29,7 @@ local function qf_title(bufnr)
   return ("typst-concealer: %s"):format(name)
 end
 
---- Rebuild the global quickfix list for a buffer from active watch diagnostics.
+--- Rebuild the global quickfix list for a buffer from active render diagnostics.
 --- @param bufnr integer
 local function rebuild_quickfix(bufnr)
   local bucket = state.watch_diagnostics[bufnr] or {}
@@ -324,12 +328,68 @@ local function safe_unlink(path)
   end
 end
 
+--- Return true when a service PNG path is still referenced by a live overlay
+--- or preview item. Service PNG names are content-addressed, so a stale
+--- response can point at the same file as the currently visible render.
+--- @param path string|nil
+--- @return boolean
+local function service_page_path_in_use(path)
+  if type(path) ~= "string" or path == "" then
+    return false
+  end
+
+  local target = normalize_path(path)
+  local machine_state = state.machine_state
+  for _, overlay in pairs((machine_state and machine_state.overlays) or {}) do
+    if overlay.page_path ~= nil and overlay.status ~= "retired" and normalize_path(overlay.page_path) == target then
+      return true
+    end
+  end
+
+  for _, bstate in pairs(state.buffer_render_state or {}) do
+    for _, item in ipairs(bstate.full_items or {}) do
+      if item.page_path ~= nil and normalize_path(item.page_path) == target then
+        return true
+      end
+    end
+    for _, item in ipairs(bstate.lingering_items or {}) do
+      if item.page_path ~= nil and normalize_path(item.page_path) == target then
+        return true
+      end
+    end
+  end
+
+  for _, bs in pairs(state.buffers or {}) do
+    for _, item in ipairs({ bs.preview_item, bs.preview_last_rendered_item }) do
+      if item ~= nil and item.page_path ~= nil and normalize_path(item.page_path) == target then
+        return true
+      end
+    end
+  end
+
+  return false
+end
+
+--- @param path string|nil
+local function safe_unlink_service_artifact(path)
+  if type(path) ~= "string" or path == "" then
+    return
+  end
+  if not service_page_path_in_use(path) then
+    safe_unlink(path)
+  end
+end
+
+M._service_page_path_in_use = service_page_path_in_use
+M._safe_unlink_service_artifact = safe_unlink_service_artifact
+
 --- @param path string
 --- @param text string
 --- @return boolean, string?
 local function write_file_in_place(path, text)
   local dir = vim.fn.fnamemodify(path, ":h")
   local base = vim.fn.fnamemodify(path, ":t")
+  vim.fn.mkdir(dir, "p")
   local tmp_path = string.format("%s/.%s.tmp-%d", dir, base, vim.uv.hrtime())
   local fd, open_err = vim.uv.fs_open(tmp_path, "w", tonumber("644", 8))
   if not fd then
@@ -347,6 +407,25 @@ local function write_file_in_place(path, text)
     return false, rename_err
   end
   return true
+end
+
+--- @param path string
+--- @param text string
+--- @return boolean, string?, boolean
+local function write_file_if_changed(path, text)
+  local stat = vim.uv.fs_stat(path)
+  if stat ~= nil then
+    local fd = vim.uv.fs_open(path, "r", tonumber("644", 8))
+    if fd ~= nil then
+      local existing = vim.uv.fs_read(fd, stat.size, 0)
+      vim.uv.fs_close(fd)
+      if existing == text then
+        return true, nil, false
+      end
+    end
+  end
+  local ok, err = write_file_in_place(path, text)
+  return ok, err, ok
 end
 
 --- @param bufnr integer
@@ -373,7 +452,7 @@ local function resolve_preamble_include_line(bufnr, effective_root, kind)
   return '#include "' .. typst_path .. '"\n'
 end
 
---- Write debugging artifacts next to the generated watch input so path rewrite
+--- Write debugging artifacts next to the generated input so path rewrite
 --- issues can be inspected from the exact Typst source that was compiled.
 --- @param session typst_watch_session
 --- @param doc_str string
@@ -495,7 +574,7 @@ local function update_quickfix_from_stderr(session)
 end
 
 --- Returns (and creates) a per-buffer cache directory.
---- Prefer placing it inside source_root so generated watch inputs stay within
+--- Prefer placing it inside source_root so generated inputs stay within
 --- the same Typst project root as real source files.
 --- @param bufnr integer
 --- @param source_root string|nil
@@ -526,6 +605,69 @@ local function get_cache_dir(bufnr, source_root)
   local dir = base_dir .. "/" .. safe_name .. "-" .. string.format("%04x", h)
   vim.fn.mkdir(dir, "p")
   return dir
+end
+
+--- Remove unreferenced service-generated PNGs and preview sidecars for a buffer
+--- cache directory. PNG deletion goes through safe_unlink_service_artifact
+--- because service output paths are content-addressed and may be shared.
+--- @param dir string|nil
+local function cleanup_service_cache_dir(dir)
+  if dir == nil or dir == "" then
+    return
+  end
+  local scan = vim.uv.fs_scandir(dir)
+  if scan == nil then
+    return
+  end
+  while true do
+    local name, typ = vim.uv.fs_scandir_next(scan)
+    if name == nil then
+      break
+    end
+    if typ == "file" and (name:match("%.png$") or name:match("^%.typst%-concealer%-preview%-.*%.typ$")) then
+      local path = dir .. "/" .. name
+      if name:match("%.png$") then
+        safe_unlink_service_artifact(path)
+      else
+        safe_unlink(path)
+      end
+    end
+  end
+end
+
+--- @param dir string|nil
+local function cleanup_service_workspace_dir(dir)
+  if dir == nil or dir == "" then
+    return
+  end
+  local scan = vim.uv.fs_scandir(dir)
+  if scan == nil then
+    return
+  end
+  while true do
+    local name, typ = vim.uv.fs_scandir_next(scan)
+    if name == nil then
+      break
+    end
+    local path = dir .. "/" .. name
+    if typ == "directory" then
+      cleanup_service_workspace_dir(path)
+      pcall(vim.uv.fs_rmdir, path)
+    elseif typ == "file" then
+      if name:match("%.png$") then
+        safe_unlink_service_artifact(path)
+      elseif name:match("%.typ$") or name:match("^%.") then
+        safe_unlink(path)
+      end
+    end
+  end
+end
+
+function M._cleanup_service_workspace_for_buf(bufnr)
+  cleanup_service_workspace_dir(state.service_workspace_dirs and state.service_workspace_dirs[bufnr])
+  if state.service_workspace_dirs then
+    state.service_workspace_dirs[bufnr] = nil
+  end
 end
 
 --- Generates the fixed input path for a watch session.
@@ -578,33 +720,65 @@ local function compose_session_items(session)
   return items
 end
 
---- @param request WatchRenderRequest
---- @return CurrentWatchRequest
-local function build_current_request(request)
-  local page_to_overlay = {}
-  local overlay_to_page = {}
+--- @param request RenderRequest
+--- @return RenderRequestMeta
+local function build_render_request_meta(request)
   local jobs = request.jobs or {}
+  local page_to_slot = {}
+  local slot_to_node = {}
+  local slot_to_overlay = {}
 
   for i, job in ipairs(jobs) do
     local page_index = job.request_page_index or i
     job.request_id = request.request_id
     job.request_page_index = page_index
-    page_to_overlay[page_index] = job.overlay_id
-    overlay_to_page[job.overlay_id] = page_index
+    job.slot_id = job.slot_id or ("slot:" .. tostring(page_index))
+    if job.slot_id ~= nil then
+      page_to_slot[page_index] = job.slot_id
+      if job.node_id ~= nil then
+        slot_to_node[job.slot_id] = job.node_id
+      end
+      if job.overlay_id ~= nil then
+        slot_to_overlay[job.slot_id] = job.overlay_id
+      end
+    end
   end
 
   return {
     request_id = request.request_id,
+    bufnr = request.bufnr,
     render_epoch = request.render_epoch,
     buffer_version = request.buffer_version,
     layout_version = request.layout_version,
+    shape_epoch = request.shape_epoch or 0,
     project_scope_id = request.project_scope_id,
     jobs = jobs,
-    page_to_overlay = page_to_overlay,
-    overlay_to_page = overlay_to_page,
+    page_to_slot = page_to_slot,
+    slot_to_node = slot_to_node,
+    slot_to_overlay = slot_to_overlay,
     page_count = #jobs,
     status = "active",
   }
+end
+
+--- Watch adapter metadata retains fixed output page maps required by typst
+--- watch polling. Service code uses build_render_request_meta directly.
+--- @param request RenderRequest
+--- @return RenderRequestMeta
+local function build_watch_request_meta(request)
+  local meta = build_render_request_meta(request)
+  local page_to_overlay = {}
+  local overlay_to_page = {}
+  for i, job in ipairs(meta.jobs or {}) do
+    local page_index = job.request_page_index or i
+    if job.overlay_id ~= nil then
+      page_to_overlay[page_index] = job.overlay_id
+      overlay_to_page[job.overlay_id] = page_index
+    end
+  end
+  meta.page_to_overlay = page_to_overlay
+  meta.overlay_to_page = overlay_to_page
+  return meta
 end
 
 local function is_active_request_page(session, i)
@@ -616,7 +790,7 @@ local function replace_current_request(session, request)
   if session.current_request ~= nil then
     session.current_request.status = "abandoned"
   end
-  session.current_request = build_current_request(request)
+  session.current_request = build_watch_request_meta(request)
   return session.current_request
 end
 
@@ -648,6 +822,11 @@ end
 local FAST_POLL_INTERVAL_MS = 30
 local IDLE_POLL_INTERVAL_MS = 80
 local try_render_session_page
+local on_service_response
+local finish_service_response
+local get_compiler_service
+local send_next_service_payload
+local service_cache_key
 
 --- @param session typst_watch_session
 --- @return boolean
@@ -902,6 +1081,7 @@ end
 --- @param bufnr integer
 function M.stop_watch_sessions_for_buf(bufnr)
   M.stop_watch_session(bufnr, "full")
+  M.stop_compiler_service(bufnr)
 end
 
 --- Called when a rendered page file is stable enough to inspect.
@@ -1001,7 +1181,7 @@ local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original
 end
 
 --- @param session typst_watch_session
---- @param request CurrentWatchRequest
+--- @param request RenderRequestMeta
 --- @param request_page_index integer
 --- @param job RenderJob
 --- @param page_path string
@@ -1038,6 +1218,814 @@ local function on_request_page_rendered(session, request, request_page_index, jo
     source_rows = update.source_rows,
   })
   return true
+end
+
+--- @param width_px integer
+--- @param height_px integer
+--- @param job RenderJob
+--- @return integer
+local function compute_natural_cols(width_px, height_px, job)
+  width_px = tonumber(width_px) or 1
+  height_px = tonumber(height_px) or 1
+  if width_px <= 0 then
+    width_px = 1
+  end
+  if height_px <= 0 then
+    height_px = 1
+  end
+
+  local source_rows = job.range[3] - job.range[1] + 1
+  local natural_cols
+  if state._cell_px_w and state._cell_px_h then
+    natural_cols = math.max(1, math.floor(width_px / state._cell_px_w + 0.5))
+    if source_rows == 1 and not (job.semantics and job.semantics.display_kind == "block") then
+      local aspect = width_px / height_px
+      natural_cols = math.max(1, math.floor(state._cell_px_h * aspect / state._cell_px_w + 0.5))
+    end
+  elseif source_rows == 1 and not (job.semantics and job.semantics.display_kind == "block") then
+    natural_cols = math.max(1, math.floor((width_px / height_px) * 2))
+  else
+    natural_cols = math.ceil((width_px / height_px) * 2) * source_rows
+  end
+
+  local kitty_codes = require("typst-concealer.kitty-codes")
+  if natural_cols >= #kitty_codes.diacritics then
+    natural_cols = #kitty_codes.diacritics - 1
+  end
+  return natural_cols
+end
+
+--- @param width_px integer
+--- @param height_px integer
+--- @param job RenderJob
+--- @return integer
+local function compute_natural_rows(width_px, height_px, job)
+  width_px = tonumber(width_px) or 1
+  height_px = tonumber(height_px) or 1
+  if width_px <= 0 then
+    width_px = 1
+  end
+  if height_px <= 0 then
+    height_px = 1
+  end
+
+  local source_rows = job.range[3] - job.range[1] + 1
+  if state._cell_px_w and state._cell_px_h then
+    if source_rows == 1 and not (job.semantics and job.semantics.display_kind == "block") then
+      return 1
+    end
+    return math.max(1, math.floor(height_px / state._cell_px_h + 0.5))
+  end
+  return source_rows
+end
+
+--- Extract --input key=value pairs from compiler_args and project_scope.inputs.
+--- @param config table
+--- @param project_scope table
+--- @return table<string, string>
+local function extract_service_inputs(config, project_scope)
+  local inputs = {}
+  if config.compiler_args then
+    local i = 1
+    while i <= #config.compiler_args do
+      local arg = config.compiler_args[i]
+      if arg == "--input" and i + 1 <= #config.compiler_args then
+        local kv = config.compiler_args[i + 1]
+        local eq = kv:find("=", 1, true)
+        if eq then
+          inputs[kv:sub(1, eq - 1)] = kv:sub(eq + 1)
+        end
+        i = i + 2
+      elseif arg:sub(1, 8) == "--input=" then
+        local kv = arg:sub(9)
+        local eq = kv:find("=", 1, true)
+        if eq then
+          inputs[kv:sub(1, eq - 1)] = kv:sub(eq + 1)
+        end
+        i = i + 1
+      else
+        i = i + 1
+      end
+    end
+  end
+  for _, s in ipairs(project_scope.inputs or {}) do
+    local eq = s:find("=", 1, true)
+    if eq ~= nil then
+      inputs[s:sub(1, eq - 1)] = s:sub(eq + 1)
+    end
+  end
+  return inputs
+end
+
+--- @param text string
+--- @return string
+local function stable_hash(text)
+  local ok, digest = pcall(vim.fn.sha256, text)
+  if ok and type(digest) == "string" and digest ~= "" then
+    return digest:sub(1, 16)
+  end
+
+  local h = 0
+  for i = 1, #text do
+    h = (h * 31 + text:byte(i)) % 0xFFFFFFFF
+  end
+  return string.format("%08x", h)
+end
+
+--- @param item table
+--- @return string
+local function normalize_item_source(item)
+  if type(item.str) == "table" then
+    return table.concat(item.str)
+  end
+  if type(item.str) == "string" then
+    return item.str
+  end
+  return ""
+end
+
+--- @param item table
+--- @return integer
+local function item_source_rows(item)
+  local range = item.range or { 0, 0, 0, 0 }
+  return math.max(1, (range[3] or 0) - (range[1] or 0) + 1)
+end
+
+--- Rewrite the preview formula exactly as wrapper.lua would rewrite an item
+--- body, but keep it in a sidecar file so the preview main document remains
+--- stable across nodes sharing the same prelude/wrapper context.
+--- @param item table
+--- @param project_scope table
+--- @return string
+local function rewrite_preview_sidecar_source(item, project_scope)
+  local text = normalize_item_source(item)
+  if project_scope.buf_dir == nil or project_scope.source_root == nil or project_scope.effective_root == nil then
+    return text
+  end
+
+  return require("typst-concealer.path-rewrite").rewrite_paths(text, {
+    bufnr = item.bufnr,
+    buf_dir = project_scope.buf_dir,
+    source_root = project_scope.source_root,
+    effective_root = project_scope.effective_root,
+  })
+end
+
+--- @param service typst_compiler_service
+--- @param sidecar_path string
+--- @param sidecar_text string
+--- @return fun(): boolean, string?
+local function make_preview_sidecar_prepare(service, sidecar_path, sidecar_text)
+  return function()
+    service._preview_sidecar_texts = service._preview_sidecar_texts or {}
+    if service._preview_sidecar_texts[sidecar_path] == sidecar_text and vim.uv.fs_stat(sidecar_path) ~= nil then
+      return true
+    end
+    local ok, err = write_file_in_place(sidecar_path, sidecar_text)
+    if ok then
+      service._preview_sidecar_texts[sidecar_path] = sidecar_text
+    end
+    return ok, err
+  end
+end
+
+local function root_relative(path, effective_root)
+  return require("typst-concealer.path-rewrite").encode_root_relative(path, effective_root)
+end
+
+--- @param request RenderRequest
+--- @param project_scope table
+--- @param workspace table
+--- @param context_text string
+--- @return string
+local function build_full_main_document(request, project_scope, workspace, context_text)
+  local parts = {}
+  if context_text ~= nil and context_text ~= "" then
+    parts[#parts + 1] = context_text
+    if context_text:sub(-1) ~= "\n" then
+      parts[#parts + 1] = "\n"
+    end
+    parts[#parts + 1] = "#pagebreak(weak: true)\n"
+  end
+  for idx, job in ipairs(request.jobs or {}) do
+    if idx > 1 then
+      parts[#parts + 1] = "#pagebreak()\n"
+    end
+    local slot_path = require("typst-concealer.workspace").slot_path(workspace, job.slot_id or idx)
+    parts[#parts + 1] = '#include "' .. root_relative(slot_path, project_scope.effective_root) .. '"\n'
+  end
+  return table.concat(parts)
+end
+
+--- @param service typst_compiler_service
+--- @param writes table[]
+--- @return fun(): boolean, string?
+local function make_full_sidecar_prepare(service, writes)
+  return function()
+    service._full_sidecar_texts = service._full_sidecar_texts or {}
+    for _, entry in ipairs(writes or {}) do
+      local path = entry.path
+      local text = entry.text or ""
+      if service._full_sidecar_texts[path] ~= text or vim.uv.fs_stat(path) == nil then
+        local ok, err = write_file_if_changed(path, text)
+        if not ok then
+          return false, err
+        end
+        service._full_sidecar_texts[path] = text
+      end
+    end
+    return true
+  end
+end
+
+--- @param request RenderRequest
+--- @param project_scope table
+--- @param prelude_chunks string[]
+--- @param preamble_include_line string
+--- @param config table
+--- @return table
+local function build_full_service_spec(request, project_scope, prelude_chunks, preamble_include_line, config)
+  local wrapper = require("typst-concealer.wrapper")
+  local workspace_mod = require("typst-concealer.workspace")
+  local workspace = workspace_mod.for_buffer(request.bufnr, project_scope.source_root)
+  local context_text = wrapper.build_context_document(
+    request.bufnr,
+    project_scope.buf_dir,
+    project_scope.source_root,
+    project_scope.effective_root,
+    preamble_include_line
+  )
+  local main_text = build_full_main_document(request, project_scope, workspace, context_text)
+  local writes = {
+    { path = workspace.context_path, text = context_text, kind = "context" },
+    { path = workspace.main_path, text = main_text, kind = "main" },
+  }
+  local slot_line_maps = {}
+  local generated_slot_paths = {}
+
+  for _, job in ipairs(request.jobs or {}) do
+    local slot_path = workspace_mod.slot_path(workspace, job.slot_id)
+    generated_slot_paths[job.slot_id] = slot_path
+    local slot_text, slot_map = wrapper.build_slot_document(
+      job,
+      project_scope.buf_dir,
+      project_scope.source_root,
+      project_scope.effective_root,
+      prelude_chunks
+    )
+    if slot_map ~= nil then
+      slot_map.filename = vim.api.nvim_buf_get_name(job.bufnr)
+      slot_line_maps[normalize_path(slot_path)] = slot_map
+    end
+    if job.slot_dirty == true or vim.uv.fs_stat(slot_path) == nil then
+      writes[#writes + 1] = {
+        path = slot_path,
+        text = slot_text,
+        kind = "slot",
+        slot_id = job.slot_id,
+      }
+    end
+  end
+
+  return {
+    workspace = workspace,
+    source_text = main_text,
+    writes = writes,
+    slot_line_maps = slot_line_maps,
+    generated_slot_paths = generated_slot_paths,
+    generated_input_path = workspace.main_path,
+    generated_context_path = workspace.context_path,
+    output_dir = workspace.outputs_dir,
+    cache_key = service_cache_key(project_scope, "full", request.shape_epoch or 0),
+  }
+end
+
+--- @param resp table
+local function cleanup_request_artifacts(resp)
+  for _, page in ipairs(resp.pages or {}) do
+    if type(page.path) == "string" and page.path ~= "" then
+      safe_unlink_service_artifact(page.path)
+    end
+  end
+end
+
+local function cleanup_service_pages(pages)
+  for _, page in ipairs(pages or {}) do
+    if type(page.path) == "string" and page.path ~= "" then
+      safe_unlink_service_artifact(page.path)
+    end
+  end
+end
+
+local function is_integer(value)
+  return type(value) == "number" and value == math.floor(value)
+end
+
+local function select_last_service_page(resp)
+  if type(resp.pages) ~= "table" or #resp.pages == 0 then
+    return nil, {}
+  end
+
+  local selected = nil
+  local selected_pos = nil
+  local selected_page_index = nil
+  for pos, page in ipairs(resp.pages) do
+    local page_index = tonumber(page.page_index)
+    if is_integer(page_index) and (selected_page_index == nil or page_index > selected_page_index) then
+      selected = page
+      selected_pos = pos
+      selected_page_index = page_index
+    end
+  end
+
+  if selected == nil then
+    selected = resp.pages[#resp.pages]
+    selected_pos = #resp.pages
+  end
+
+  local leading_pages = {}
+  for pos, page in ipairs(resp.pages) do
+    if pos ~= selected_pos then
+      leading_pages[#leading_pages + 1] = page
+    end
+  end
+
+  return selected, leading_pages
+end
+
+--- Validate the compiler-service page contract before dispatching any page.
+--- @param meta RenderRequestMeta
+--- @param resp table
+--- @return boolean, table|string
+local function validate_service_pages(meta, resp)
+  if type(resp.pages) ~= "table" then
+    return false, "missing pages array"
+  end
+  local expected_pages = meta.page_count or 0
+  local total_pages = #resp.pages
+  if total_pages < expected_pages then
+    return false, ("page count mismatch: expected at least %d, got %d"):format(expected_pages, total_pages)
+  end
+
+  local seen = {}
+  local pages_by_doc_index = {}
+  local pages_by_request_index = {}
+  for _, page in ipairs(resp.pages) do
+    local raw_page_index = tonumber(page.page_index)
+    if not is_integer(raw_page_index) then
+      return false, "page_index must be an integer"
+    end
+    if raw_page_index < 0 then
+      return false, ("page_index out of range: %s"):format(tostring(page.page_index))
+    end
+    if seen[raw_page_index] then
+      return false, ("duplicate page_index: %d"):format(raw_page_index)
+    end
+    seen[raw_page_index] = true
+    if type(page.path) ~= "string" or page.path == "" then
+      return false, "page path must be a non-empty string"
+    end
+    if (tonumber(page.width_px) or 0) <= 0 or (tonumber(page.height_px) or 0) <= 0 then
+      return false, "page width/height must be positive"
+    end
+    pages_by_doc_index[raw_page_index + 1] = page
+  end
+
+  for i = 1, total_pages do
+    if pages_by_doc_index[i] == nil then
+      return false, ("missing page_index: %d"):format(i - 1)
+    end
+  end
+
+  local leading_page_count = total_pages - expected_pages
+  pages_by_request_index.leading_pages = {}
+  pages_by_request_index.leading_page_count = leading_page_count
+  pages_by_request_index.total_pages = total_pages
+  for i = 1, leading_page_count do
+    pages_by_request_index.leading_pages[#pages_by_request_index.leading_pages + 1] = pages_by_doc_index[i]
+  end
+  for request_index = 1, expected_pages do
+    pages_by_request_index[request_index] = pages_by_doc_index[leading_page_count + request_index]
+  end
+
+  return true, pages_by_request_index
+end
+
+--- @param bufnr integer
+--- @param meta RenderRequestMeta
+--- @return boolean, string?
+local function validate_service_request_fresh(bufnr, meta)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return false, "buffer is no longer valid"
+  end
+  local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
+  if tonumber(meta.buffer_version) ~= changedtick then
+    return false,
+      ("buffer changedtick mismatch: expected %s, got %s"):format(tostring(meta.buffer_version), tostring(changedtick))
+  end
+  local ms = state.machine_state
+  local buf = ms and ms.buffers and ms.buffers[bufnr] or nil
+  if buf == nil then
+    return false, "machine buffer is gone"
+  end
+  if buf.active_request_id ~= meta.request_id then
+    return false,
+      ("active request mismatch: expected %s, got %s"):format(
+        tostring(meta.request_id),
+        tostring(buf.active_request_id)
+      )
+  end
+  if buf.project_scope_id ~= meta.project_scope_id then
+    return false, "project scope changed"
+  end
+  if tonumber(buf.layout_version) ~= tonumber(meta.layout_version) then
+    return false, "layout version changed"
+  end
+  return true
+end
+
+--- @param meta RenderRequestMeta
+--- @return boolean, string?
+local function validate_service_job_ranges(meta)
+  for _, job in ipairs(meta.jobs or {}) do
+    if job.is_stub or job.overlay_id == nil then
+      goto continue_validate
+    end
+    local expected_str = job.source_str or job.source_text or job.str
+    if expected_str ~= nil and range_to_string(job.bufnr, job.range) ~= expected_str then
+      return false, ("source range changed for %s"):format(tostring(job.overlay_id))
+    end
+    ::continue_validate::
+  end
+  return true
+end
+
+--- @param bufnr integer
+--- @param meta RenderRequestMeta
+--- @param reason string
+--- @param event_type string
+local function dispatch_request_cleanup(bufnr, meta, reason, event_type)
+  if meta ~= nil then
+    meta.status = event_type == "render_request_superseded" and "superseded" or "failed"
+  end
+  if state.active_service_requests and state.active_service_requests[bufnr] == meta then
+    state.active_service_requests[bufnr] = nil
+  end
+  if meta == nil or meta.request_id == nil then
+    return
+  end
+  require("typst-concealer.machine.runtime").dispatch({
+    type = event_type,
+    bufnr = bufnr,
+    request_id = meta and meta.request_id or nil,
+    reason = reason,
+  })
+end
+
+--- @param bufnr integer
+--- @param meta RenderRequestMeta|nil
+--- @param reason string
+local function fail_full_service_request(bufnr, meta, reason)
+  dispatch_request_cleanup(bufnr, meta, reason, "render_request_failed")
+end
+
+--- @param bufnr integer
+--- @param meta RenderRequestMeta|nil
+--- @param reason string
+local function supersede_full_service_request(bufnr, meta, reason)
+  dispatch_request_cleanup(bufnr, meta, reason, "render_request_superseded")
+end
+
+M._validate_service_pages = validate_service_pages
+
+--- @param bufnr integer
+--- @param meta table|nil
+--- @param diagnostics table[]|nil
+local function handle_compile_diagnostics(bufnr, meta, diagnostics)
+  local config = require("typst-concealer").config
+  if not config.do_diagnostics then
+    return
+  end
+
+  local function generated_path(path)
+    if type(path) ~= "string" or path == "" then
+      return false
+    end
+    local norm = normalize_path(path)
+    if meta ~= nil and normalize_path(meta.generated_input_path) == norm then
+      return true
+    end
+    if meta ~= nil and normalize_path(meta.generated_context_path) == norm then
+      return true
+    end
+    return false
+  end
+
+  local items = {}
+  for _, diag in ipairs(diagnostics or {}) do
+    local line = tonumber(diag.line) or 1
+    local column = tonumber(diag.column) or 1
+    local filename = diag.file
+    local prefix = "[service]"
+
+    if filename == nil or filename == "" then
+      local mapped = meta and map_generated_pos(meta.line_map, line, column) or nil
+      if mapped ~= nil and mapped.exact == true then
+        filename = mapped.filename
+        line = mapped.lnum
+        column = mapped.col
+      else
+        filename = (meta and meta.generated_input_path) or vim.api.nvim_buf_get_name(bufnr)
+        prefix = "[service/generated]"
+      end
+    else
+      local resolved_filename = resolve_typst_source_path({
+        bufnr = bufnr,
+        buf_dir = meta and meta.buf_dir or nil,
+        source_root = meta and meta.source_root or nil,
+        effective_root = meta and meta.effective_root or nil,
+      }, filename)
+      local slot_map = meta and meta.slot_line_maps and meta.slot_line_maps[normalize_path(resolved_filename)] or nil
+      if slot_map ~= nil then
+        local mapped = map_generated_pos({ slot_map }, line, column)
+        if mapped ~= nil and mapped.exact == true then
+          filename = mapped.filename
+          line = mapped.lnum
+          column = mapped.col
+          prefix = "[service]"
+        else
+          filename = resolved_filename
+          prefix = "[service/generated]"
+        end
+      elseif generated_path(resolved_filename) then
+        filename = resolved_filename
+        prefix = "[service/generated]"
+      else
+        filename = resolved_filename
+        prefix = "[service/external]"
+      end
+    end
+
+    items[#items + 1] = {
+      filename = filename,
+      lnum = line,
+      col = column,
+      text = ("%s %s"):format(prefix, diag.message or "typst compile error"),
+      type = diag.severity == "warning" and "W" or "E",
+    }
+  end
+
+  state.watch_diagnostics[bufnr] = state.watch_diagnostics[bufnr] or {}
+  state.watch_diagnostics[bufnr].full = items
+  rebuild_quickfix(bufnr)
+end
+
+--- Handle a preview compile response from the service.
+--- @param bufnr integer
+--- @param service_kind '"full"'|'"preview"'
+--- @param resp table
+--- @return boolean true if this was a preview response
+local function try_handle_preview_service_response(bufnr, service_kind, resp)
+  if service_kind ~= "preview" then
+    return false
+  end
+  local pmeta = state.active_preview_service_requests and state.active_preview_service_requests[bufnr]
+  if pmeta == nil or pmeta.request_id ~= resp.request_id then
+    return false
+  end
+
+  -- Matched a preview request — consume it regardless of status.
+  state.active_preview_service_requests[bufnr] = nil
+  state._last_preview_service_bench = {
+    request_id = resp.request_id,
+    total_pages = #(resp.pages or {}),
+    compile_us = resp.compile_us,
+    render_us = resp.render_us,
+    rendered_pages = resp.rendered_pages,
+    request_sent_at = pmeta.sent_at,
+    response_at = vim.uv.hrtime(),
+  }
+
+  if resp.status ~= "ok" or not resp.pages or #resp.pages == 0 then
+    cleanup_request_artifacts(resp)
+    return true
+  end
+
+  local page, leading_pages = select_last_service_page(resp)
+  if type(page.path) ~= "string" then
+    cleanup_request_artifacts(resp)
+    return true
+  end
+
+  local item = pmeta.item
+  local update = build_page_update(bufnr, page.path, item, item.range, nil)
+  if update == nil then
+    cleanup_request_artifacts(resp)
+    return true
+  end
+
+  update.preview_request_id = item.preview_request_id
+  local accepted = require("typst-concealer.machine.runtime").accept_preview_page_update(update)
+  cleanup_service_pages(leading_pages)
+  if not accepted then
+    safe_unlink_service_artifact(page.path)
+  end
+  return true
+end
+
+--- Handle a preview backend prewarm response.  Prewarm pages are never shown;
+--- they exist only to populate the service world's prelude/import/font caches.
+--- @param bufnr integer
+--- @param service_kind '"full"'|'"preview"'
+--- @param resp table
+--- @return boolean
+local function try_handle_preview_prewarm_response(bufnr, service_kind, resp)
+  local service = get_compiler_service(bufnr, service_kind)
+  local inflight = service and service.inflight or nil
+  if
+    service_kind ~= "preview"
+    or inflight == nil
+    or inflight.request_id ~= resp.request_id
+    or inflight.is_prewarm ~= true
+  then
+    return false
+  end
+
+  cleanup_request_artifacts(resp)
+  service.preview_warmed_signatures = service.preview_warmed_signatures or {}
+  if resp.status == "ok" and inflight.preview_context_hash ~= nil then
+    service.preview_warmed_signatures[inflight.preview_context_hash] = true
+  end
+  state._last_preview_prewarm_bench = {
+    request_id = resp.request_id,
+    context_hash = inflight.preview_context_hash,
+    total_pages = #(resp.pages or {}),
+    compile_us = resp.compile_us,
+    render_us = resp.render_us,
+    rendered_pages = resp.rendered_pages,
+    response_at = vim.uv.hrtime(),
+  }
+  finish_service_response(bufnr, service_kind, resp.request_id)
+  return true
+end
+
+--- @param bufnr integer
+--- @param service_kind '"full"'|'"preview"'
+--- @param resp table  pre-decoded JSON response from the compiler service
+on_service_response = function(bufnr, service_kind, resp)
+  if type(resp) ~= "table" or resp.type ~= "compile_result" then
+    return
+  end
+
+  if try_handle_preview_prewarm_response(bufnr, service_kind, resp) then
+    return
+  end
+
+  -- Check preview requests first (they have distinct request_ids).
+  if try_handle_preview_service_response(bufnr, service_kind, resp) then
+    finish_service_response(bufnr, service_kind, resp.request_id)
+    return
+  end
+
+  if service_kind ~= "full" then
+    cleanup_request_artifacts(resp)
+    finish_service_response(bufnr, service_kind, resp.request_id)
+    return
+  end
+
+  local meta = state.active_service_requests and state.active_service_requests[bufnr]
+  if meta == nil or meta.request_id ~= resp.request_id or meta.status ~= "active" then
+    cleanup_request_artifacts(resp)
+    finish_service_response(bufnr, service_kind, resp.request_id)
+    return
+  end
+
+  if resp.status ~= "ok" then
+    handle_compile_diagnostics(bufnr, meta, resp.diagnostics)
+    cleanup_request_artifacts(resp)
+    fail_full_service_request(bufnr, meta, resp.status or "compile failed")
+    finish_service_response(bufnr, service_kind, resp.request_id)
+    return
+  end
+
+  handle_compile_diagnostics(bufnr, meta, resp.diagnostics)
+
+  local ok_pages, pages_or_err = validate_service_pages(meta, resp)
+  if not ok_pages then
+    cleanup_request_artifacts(resp)
+    fail_full_service_request(bufnr, meta, pages_or_err)
+    vim.schedule(function()
+      vim.notify(
+        "[typst-concealer] compiler service page contract failed: " .. tostring(pages_or_err),
+        vim.log.levels.ERROR
+      )
+    end)
+    finish_service_response(bufnr, service_kind, resp.request_id)
+    return
+  end
+
+  local fresh, stale_reason = validate_service_request_fresh(bufnr, meta)
+  if not fresh then
+    cleanup_request_artifacts(resp)
+    supersede_full_service_request(bufnr, meta, stale_reason or "stale service response")
+    finish_service_response(bufnr, service_kind, resp.request_id)
+    return
+  end
+
+  local ranges_ok, range_reason = validate_service_job_ranges(meta)
+  if not ranges_ok then
+    cleanup_request_artifacts(resp)
+    supersede_full_service_request(bufnr, meta, range_reason or "source range changed")
+    finish_service_response(bufnr, service_kind, resp.request_id)
+    return
+  end
+
+  local t_lua_start = vim.uv.hrtime()
+  local dispatched = 0
+  local skipped_cached = 0
+
+  local runtime = require("typst-concealer.machine.runtime")
+  local pages_by_request_index = pages_or_err
+  local batch_entries = {}
+  for page_index = 1, meta.page_count or 0 do
+    local page = pages_by_request_index[page_index]
+    local job = meta.jobs[page_index]
+    if job ~= nil then
+      -- Skip stub jobs — these are stable slots with no active overlay
+      if job.is_stub or job.overlay_id == nil then
+        skipped_cached = skipped_cached + 1
+        goto continue_page
+      end
+
+      -- Skip re-dispatching for cached (unchanged) pages whose overlay is
+      -- already visible — avoids redundant image uploads and extmark updates.
+      if page.cached then
+        local ms = state.machine_state
+        local overlay = ms and ms.overlays and ms.overlays[job.overlay_id]
+        if overlay and overlay.status == "visible" and overlay.page_path == page.path then
+          skipped_cached = skipped_cached + 1
+          goto continue_page
+        end
+      end
+
+      local width_px = tonumber(page.width_px) or 1
+      local height_px = tonumber(page.height_px) or 1
+      batch_entries[#batch_entries + 1] = {
+        request_id = resp.request_id,
+        request_page_index = page_index,
+        overlay_id = job.overlay_id,
+        owner_node_id = job.node_id,
+        owner_bufnr = job.bufnr,
+        owner_project_scope_id = job.project_scope_id,
+        render_epoch = job.render_epoch,
+        buffer_version = job.buffer_version,
+        layout_version = job.layout_version,
+        page_path = page.path,
+        page_stamp = nil,
+        natural_cols = compute_natural_cols(width_px, height_px, job),
+        natural_rows = compute_natural_rows(width_px, height_px, job),
+        source_rows = job.range[3] - job.range[1] + 1,
+      }
+      dispatched = dispatched + 1
+      ::continue_page::
+    end
+  end
+
+  if #batch_entries > 0 then
+    runtime.dispatch({
+      type = "overlay_pages_batch_ready",
+      entries = batch_entries,
+    })
+  end
+  runtime.dispatch({
+    type = "render_request_completed",
+    bufnr = bufnr,
+    request_id = resp.request_id,
+  })
+  cleanup_service_pages(pages_by_request_index.leading_pages)
+
+  local lua_us = math.floor((vim.uv.hrtime() - t_lua_start) / 1000)
+
+  if state.active_service_requests[bufnr] == meta then
+    meta.status = "completed"
+    state.active_service_requests[bufnr] = nil
+  end
+
+  -- Store benchmark data for retrieval
+  state._last_service_bench = {
+    request_id = resp.request_id,
+    total_pages = #(resp.pages or {}),
+    leading_pages = pages_by_request_index.leading_page_count or 0,
+    dispatched = dispatched,
+    skipped_cached = skipped_cached,
+    compile_us = resp.compile_us,
+    render_us = resp.render_us,
+    rendered_pages = resp.rendered_pages,
+    lua_dispatch_us = lua_us,
+    request_sent_at = meta.sent_at,
+    response_at = vim.uv.hrtime(),
+  }
+  finish_service_response(bufnr, service_kind, resp.request_id)
 end
 
 --- @param session typst_watch_session
@@ -1412,6 +2400,583 @@ function M.ensure_watch_session(bufnr)
   return session
 end
 
+--- Report whether a compiler service exists and is still alive.
+--- @param bufnr integer
+--- @return boolean
+function M.has_compiler_service(bufnr)
+  local bucket = state.compiler_services and state.compiler_services[bufnr]
+  local service = bucket and bucket.full or nil
+  return service ~= nil and service.dead ~= true
+end
+
+--- @param bufnr integer
+--- @return table
+local function get_service_bucket(bufnr)
+  state.compiler_services = state.compiler_services or {}
+  state.compiler_services[bufnr] = state.compiler_services[bufnr] or {}
+  return state.compiler_services[bufnr]
+end
+
+--- @param bufnr integer
+--- @param kind '"full"'|'"preview"'
+--- @return typst_compiler_service|nil
+get_compiler_service = function(bufnr, kind)
+  local bucket = state.compiler_services and state.compiler_services[bufnr]
+  return bucket and bucket[kind] or nil
+end
+
+local function close_pipe(pipe)
+  if pipe ~= nil and not pipe:is_closing() then
+    pipe:close()
+  end
+end
+
+--- Start or reuse the Rust compiler service for bufnr.
+--- @param bufnr integer
+--- @param kind '"full"'|'"preview"'|nil
+--- @return typst_compiler_service|nil
+function M.ensure_compiler_service(bufnr, kind)
+  kind = kind or "full"
+  local bucket = get_service_bucket(bufnr)
+  local existing = bucket[kind]
+  if existing ~= nil and existing.dead ~= true then
+    return existing
+  end
+
+  local main = require("typst-concealer")
+  local service_path = main.config.service_binary or "typst-concealer-service"
+  local stdin = vim.uv.new_pipe()
+  local stdout = vim.uv.new_pipe()
+  local stderr = vim.uv.new_pipe()
+  local service
+  local handle
+
+  handle = vim.uv.spawn(service_path, {
+    stdio = { stdin, stdout, stderr },
+    args = {},
+  }, function()
+    if service ~= nil then
+      service.dead = true
+      local inflight_request_id = service.inflight and service.inflight.request_id or nil
+      local pending_full = service.pending_full_request
+      local pending_preview = service.pending_preview_request
+      service.inflight = nil
+      service.pending_full_request = nil
+      service.pending_preview_request = nil
+      service.pending_prewarm_requests = nil
+      vim.schedule(function()
+        mark_inflight_service_request_failed(bufnr, inflight_request_id, "compiler service exited")
+        mark_service_payload_failed(bufnr, pending_full, "compiler service exited")
+        mark_service_payload_failed(bufnr, pending_preview, "compiler service exited")
+      end)
+    end
+    local current_bucket = state.compiler_services and state.compiler_services[bufnr]
+    if current_bucket ~= nil and current_bucket[kind] == service then
+      current_bucket[kind] = nil
+      if next(current_bucket) == nil then
+        state.compiler_services[bufnr] = nil
+      end
+    end
+    close_pipe(stdin)
+    close_pipe(stdout)
+    close_pipe(stderr)
+    if handle ~= nil and not handle:is_closing() then
+      handle:close()
+    end
+  end)
+
+  if handle == nil then
+    close_pipe(stdin)
+    close_pipe(stdout)
+    close_pipe(stderr)
+    vim.schedule(function()
+      vim.notify("[typst-concealer] failed to spawn compiler service: " .. service_path, vim.log.levels.ERROR)
+    end)
+    return nil
+  end
+
+  service = {
+    handle = handle,
+    stdin = stdin,
+    stdout = stdout,
+    stderr = stderr,
+    bufnr = bufnr,
+    kind = kind,
+    dead = false,
+    line_buffer = "",
+    stderr_line_buffer = "",
+    cache_dir = nil,
+  }
+
+  stdout:read_start(function(err, data)
+    if err ~= nil or data == nil then
+      return
+    end
+    service.line_buffer = service.line_buffer .. data
+    while true do
+      local nl = service.line_buffer:find("\n", 1, true)
+      if nl == nil then
+        break
+      end
+      local line = service.line_buffer:sub(1, nl - 1)
+      service.line_buffer = service.line_buffer:sub(nl + 1)
+      if line ~= "" then
+        -- Decode JSON in the UV callback to keep the main-thread work minimal.
+        local decode_ok, resp = pcall(vim.json.decode, line)
+        if decode_ok and type(resp) == "table" then
+          vim.schedule(function()
+            on_service_response(bufnr, kind, resp)
+          end)
+        end
+      end
+    end
+  end)
+
+  stderr:read_start(function(err, data)
+    if err ~= nil or data == nil or data == "" then
+      return
+    end
+    service.stderr_line_buffer = (service.stderr_line_buffer or "") .. data
+    while true do
+      local nl = service.stderr_line_buffer:find("\n", 1, true)
+      if nl == nil then
+        break
+      end
+      local line = vim.trim(service.stderr_line_buffer:sub(1, nl - 1))
+      service.stderr_line_buffer = service.stderr_line_buffer:sub(nl + 1)
+      if line ~= "" then
+        vim.schedule(function()
+          vim.notify("[typst-concealer-service] " .. line, vim.log.levels.WARN)
+        end)
+      end
+    end
+  end)
+
+  bucket[kind] = service
+  return service
+end
+
+--- @param project_scope table
+--- @param kind '"full"'|'"preview"'
+--- @param shape_epoch integer|nil
+--- @return string
+service_cache_key = function(project_scope, kind, shape_epoch)
+  return table.concat({
+    kind,
+    tostring(project_scope.project_scope_id or ""),
+    tostring(project_scope.effective_root or ""),
+    tostring(shape_epoch or 0),
+  }, ":")
+end
+
+--- @param prelude_chunks string[]
+--- @param prelude_count integer
+--- @return string
+local function preview_prelude_signature(prelude_chunks, prelude_count)
+  local parts = { tostring(prelude_count) }
+  for i = 1, prelude_count do
+    parts[#parts + 1] = prelude_chunks[i] or ""
+  end
+  return table.concat(parts, "\0")
+end
+
+--- Build the stable preview main document and sidecar metadata for one
+--- prelude/wrapper context.  The main document intentionally contains only an
+--- include of the context-owned sidecar; actual formula updates are written to
+--- the sidecar immediately before the request is sent to the service.
+--- @param bufnr integer
+--- @param service typst_compiler_service
+--- @param item table
+--- @param project_scope table
+--- @param prelude_chunks string[]
+--- @param preamble_include_line string
+--- @return table|nil
+local function build_preview_service_spec(bufnr, service, item, project_scope, prelude_chunks, preamble_include_line)
+  local main = require("typst-concealer")
+  local config = main.config
+  local wrapper = require("typst-concealer.wrapper")
+
+  local prelude_count = math.max(0, math.min(item.prelude_count or 0, #prelude_chunks))
+  local probe_item = vim.deepcopy(item)
+  probe_item.prelude_count = prelude_count
+  probe_item.range = probe_item.range or { 0, 0, 0, 0 }
+  probe_item.node_type = probe_item.node_type or "math"
+  probe_item.semantics = probe_item.semantics or { display_kind = "inline", constraint_kind = "intrinsic" }
+
+  local source_rows = item_source_rows(probe_item)
+  local wrap_prefix, wrap_suffix = wrapper.build_wrapper(probe_item, source_rows)
+  local context_text = table.concat({
+    project_scope.buf_dir or "",
+    project_scope.source_root or "",
+    project_scope.effective_root or "",
+    tostring(state._cell_px_w or ""),
+    tostring(state._cell_px_h or ""),
+    tostring(state._render_ppi or config.ppi or ""),
+    config.header or "",
+    main._styling_prelude or "",
+    preamble_include_line or "",
+    preview_prelude_signature(prelude_chunks, prelude_count),
+    tostring(probe_item.node_type or ""),
+    tostring(probe_item.semantics and probe_item.semantics.constraint_kind or ""),
+    tostring(probe_item.semantics and probe_item.semantics.display_kind or ""),
+    tostring(source_rows),
+    wrap_prefix,
+    wrap_suffix,
+  }, "\0")
+  local context_hash = stable_hash(context_text)
+
+  local cache_dir = get_cache_dir(bufnr, project_scope.source_root)
+  local sidecar_path = cache_dir .. "/.typst-concealer-preview-" .. context_hash .. ".typ"
+  local sidecar_root_relative_path =
+    require("typst-concealer.path-rewrite").encode_root_relative(sidecar_path, project_scope.effective_root)
+
+  local include_item = vim.deepcopy(probe_item)
+  include_item.str = '#include "' .. sidecar_root_relative_path .. '"\n'
+  include_item.source_str = nil
+  include_item.source_text = nil
+
+  service._preview_wrapper_caches = service._preview_wrapper_caches or {}
+  service._preview_wrapper_caches[context_hash] = service._preview_wrapper_caches[context_hash]
+    or { item_fragments = {} }
+  local doc_str = wrapper.build_batch_document(
+    { include_item },
+    project_scope.buf_dir,
+    project_scope.source_root,
+    project_scope.effective_root,
+    "full",
+    prelude_chunks,
+    preamble_include_line,
+    false,
+    service._preview_wrapper_caches[context_hash]
+  )
+
+  return {
+    context_hash = context_hash,
+    cache_key = service_cache_key(project_scope, "preview") .. ":" .. context_hash,
+    cache_dir = cache_dir,
+    source_text = doc_str,
+    sidecar_path = sidecar_path,
+    sidecar_text = rewrite_preview_sidecar_source(item, project_scope),
+  }
+end
+
+--- @param item table|nil
+--- @param bufnr integer
+--- @param prelude_chunks string[]
+--- @return table
+local function make_preview_prewarm_item(item, bufnr, prelude_chunks)
+  local out = item ~= nil and vim.deepcopy(item) or {}
+  out.bufnr = out.bufnr or bufnr
+  out.range = out.range and vim.deepcopy(out.range) or { 0, 0, 0, 3 }
+  out.str = "$x$"
+  out.source_str = "$x$"
+  out.source_text = "$x$"
+  out.prelude_count = out.prelude_count or #prelude_chunks
+  out.node_type = out.node_type or "math"
+  out.semantics = out.semantics or { display_kind = "inline", constraint_kind = "intrinsic" }
+  out.request_id = nil
+  out.preview_request_id = nil
+  out.image_id = nil
+  out.extmark_id = nil
+  return out
+end
+
+--- @param bufnr integer
+--- @param payload table|nil
+--- @param reason string
+local function mark_service_payload_failed(bufnr, payload, reason)
+  if payload == nil then
+    return
+  end
+  if payload.kind == "full" then
+    local meta = payload.meta
+    if meta == nil and state.active_service_requests then
+      local active = state.active_service_requests[bufnr]
+      if active ~= nil and active.request_id == payload.request_id then
+        meta = active
+      end
+    end
+    fail_full_service_request(bufnr, meta, reason)
+  elseif payload.kind == "preview" and payload.is_prewarm ~= true then
+    local active = state.active_preview_service_requests and state.active_preview_service_requests[bufnr]
+    if active ~= nil and active.request_id == payload.request_id then
+      state.active_preview_service_requests[bufnr] = nil
+    end
+  end
+end
+
+--- @param bufnr integer
+--- @param request_id string|nil
+--- @param reason string
+local function mark_inflight_service_request_failed(bufnr, request_id, reason)
+  if request_id == nil then
+    return
+  end
+  local meta = state.active_service_requests and state.active_service_requests[bufnr]
+  if meta ~= nil and meta.request_id == request_id then
+    fail_full_service_request(bufnr, meta, reason)
+  end
+  local preview = state.active_preview_service_requests and state.active_preview_service_requests[bufnr]
+  if preview ~= nil and preview.request_id == request_id then
+    state.active_preview_service_requests[bufnr] = nil
+  end
+end
+
+--- @param service typst_compiler_service
+--- @param payload table
+--- @return boolean
+local function write_service_payload(service, payload)
+  if service == nil or service.dead == true or service.stdin == nil or service.stdin:is_closing() then
+    return false
+  end
+  if payload.prepare ~= nil then
+    local ok, err = payload.prepare()
+    if not ok then
+      if payload.on_prepare_failed ~= nil then
+        payload.on_prepare_failed(err)
+      end
+      vim.schedule(function()
+        vim.notify("[typst-concealer] failed to prepare compiler request: " .. tostring(err), vim.log.levels.ERROR)
+      end)
+      return false
+    end
+  end
+
+  local sent_at = vim.uv.hrtime()
+  service.inflight = {
+    kind = payload.kind,
+    request_id = payload.request_id,
+    is_prewarm = payload.is_prewarm == true,
+    preview_context_hash = payload.preview_context_hash,
+  }
+  if payload.meta ~= nil then
+    payload.meta.sent_at = sent_at
+  end
+
+  service.stdin:write(payload.message .. "\n", function(err)
+    if err ~= nil then
+      if service.inflight ~= nil and service.inflight.request_id == payload.request_id then
+        service.inflight = nil
+      end
+      vim.schedule(function()
+        mark_service_payload_failed(service.bufnr, payload, "stdin write failed")
+        vim.notify("[typst-concealer] failed to write compiler request: " .. tostring(err), vim.log.levels.ERROR)
+        if send_next_service_payload ~= nil then
+          send_next_service_payload(service)
+        end
+      end)
+    end
+  end)
+  return true
+end
+
+--- @param bufnr integer
+--- @param service typst_compiler_service
+--- @param payload table
+local function send_or_queue_service_payload(bufnr, service, payload)
+  if service.inflight ~= nil then
+    if payload.is_prewarm == true then
+      service.preview_warmed_signatures = service.preview_warmed_signatures or {}
+      if service.preview_warmed_signatures[payload.preview_context_hash] then
+        return true
+      end
+      if service.inflight.preview_context_hash == payload.preview_context_hash then
+        return true
+      end
+      service.pending_prewarm_requests = service.pending_prewarm_requests or {}
+      for _, pending in ipairs(service.pending_prewarm_requests) do
+        if pending.preview_context_hash == payload.preview_context_hash then
+          return true
+        end
+      end
+      service.pending_prewarm_requests[#service.pending_prewarm_requests + 1] = payload
+    elseif payload.kind == "preview" then
+      service.pending_preview_request = payload
+    else
+      if service.pending_full_request ~= nil then
+        supersede_full_service_request(bufnr, service.pending_full_request.meta, "pending full request superseded")
+      end
+      service.pending_full_request = payload
+    end
+    return true
+  end
+
+  return write_service_payload(service, payload)
+end
+
+--- @param bufnr integer
+--- @param service_kind '"full"'|'"preview"'
+--- @param request_id string
+send_next_service_payload = function(service)
+  if service == nil then
+    return
+  end
+  local payload = service.pending_full_request or service.pending_preview_request
+  service.pending_full_request = nil
+  service.pending_preview_request = nil
+  if payload == nil and service.pending_prewarm_requests ~= nil then
+    payload = table.remove(service.pending_prewarm_requests, 1)
+    if #service.pending_prewarm_requests == 0 then
+      service.pending_prewarm_requests = nil
+    end
+  end
+  if payload ~= nil then
+    local sent = write_service_payload(service, payload)
+    if not sent then
+      mark_service_payload_failed(service.bufnr, payload, "failed to send queued compiler request")
+      send_next_service_payload(service)
+    end
+  end
+end
+
+--- @param bufnr integer
+--- @param service_kind '"full"'|'"preview"'
+--- @param request_id string
+finish_service_response = function(bufnr, service_kind, request_id)
+  local service = get_compiler_service(bufnr, service_kind)
+  if service == nil then
+    return
+  end
+  if service.inflight ~= nil and service.inflight.request_id == request_id then
+    service.inflight = nil
+  end
+  send_next_service_payload(service)
+end
+
+--- @param bufnr integer
+--- @param service typst_compiler_service|nil
+--- @param jobs table[]|nil
+--- @param project_scope table
+--- @param config table
+--- @param prelude_chunks string[]
+--- @param preamble_include_line string
+local function prewarm_preview_service(
+  bufnr,
+  service,
+  jobs,
+  project_scope,
+  config,
+  prelude_chunks,
+  preamble_include_line
+)
+  if service == nil or service.dead == true then
+    return
+  end
+
+  local inputs = extract_service_inputs(config, project_scope)
+  local candidates = {}
+  if jobs ~= nil and #jobs > 0 then
+    for _, job in ipairs(jobs) do
+      candidates[#candidates + 1] = make_preview_prewarm_item(job, bufnr, prelude_chunks)
+    end
+  else
+    candidates[#candidates + 1] = make_preview_prewarm_item(nil, bufnr, prelude_chunks)
+  end
+
+  service.preview_warmed_signatures = service.preview_warmed_signatures or {}
+  local seen = {}
+  for _, item in ipairs(candidates) do
+    local spec = build_preview_service_spec(bufnr, service, item, project_scope, prelude_chunks, preamble_include_line)
+    if spec ~= nil and not seen[spec.context_hash] then
+      seen[spec.context_hash] = true
+      if not service.preview_warmed_signatures[spec.context_hash] then
+        local request_id = ("preview-prewarm:%d:%s"):format(bufnr, spec.context_hash)
+        local ok, msg = pcall(vim.json.encode, {
+          type = "compile",
+          request_id = request_id,
+          cache_key = spec.cache_key,
+          source_text = spec.source_text,
+          root = project_scope.effective_root,
+          inputs = inputs,
+          output_dir = spec.cache_dir,
+          ppi = state._render_ppi or config.ppi,
+        })
+        if ok then
+          service.cache_dir = spec.cache_dir
+          state.service_cache_dirs = state.service_cache_dirs or {}
+          state.service_cache_dirs[bufnr] = spec.cache_dir
+          send_or_queue_service_payload(bufnr, service, {
+            kind = "preview",
+            request_id = request_id,
+            message = msg,
+            is_prewarm = true,
+            preview_context_hash = spec.context_hash,
+            prepare = make_preview_sidecar_prepare(service, spec.sidecar_path, spec.sidecar_text),
+          })
+        else
+          vim.schedule(function()
+            vim.notify(
+              "[typst-concealer] failed to encode preview prewarm request: " .. tostring(msg),
+              vim.log.levels.ERROR
+            )
+          end)
+        end
+      end
+    end
+  end
+end
+
+--- Stop a Rust compiler service and remove service-generated PNGs.
+--- @param bufnr integer
+--- @param kind '"full"'|'"preview"'|nil
+function M.stop_compiler_service(bufnr, kind)
+  local bucket = state.compiler_services and state.compiler_services[bufnr]
+  if bucket == nil then
+    cleanup_service_cache_dir(state.service_cache_dirs and state.service_cache_dirs[bufnr])
+    M._cleanup_service_workspace_for_buf(bufnr)
+    if state.service_cache_dirs then
+      state.service_cache_dirs[bufnr] = nil
+    end
+    return
+  end
+
+  local kinds = kind and { kind } or { "full", "preview" }
+  for _, service_kind in ipairs(kinds) do
+    local service = bucket[service_kind]
+    if service ~= nil then
+      service.dead = true
+      bucket[service_kind] = nil
+
+      if service_kind == "full" and state.active_service_requests and state.active_service_requests[bufnr] then
+        supersede_full_service_request(bufnr, state.active_service_requests[bufnr], "compiler service stopped")
+      end
+      if service_kind == "preview" and state.active_preview_service_requests then
+        state.active_preview_service_requests[bufnr] = nil
+      end
+
+      mark_service_payload_failed(bufnr, service.pending_full_request, "compiler service stopped")
+      mark_service_payload_failed(bufnr, service.pending_preview_request, "compiler service stopped")
+      service.inflight = nil
+      service.pending_full_request = nil
+      service.pending_preview_request = nil
+      service.pending_prewarm_requests = nil
+
+      if service.stdin ~= nil and not service.stdin:is_closing() then
+        service.stdin:write(vim.json.encode({ type = "shutdown" }) .. "\n")
+      end
+
+      close_pipe(service.stdin)
+      close_pipe(service.stdout)
+      close_pipe(service.stderr)
+      if service.handle ~= nil and not service.handle:is_closing() then
+        service.handle:kill(15)
+        service.handle:close()
+      end
+    end
+  end
+
+  if next(bucket) == nil then
+    if state.compiler_services then
+      state.compiler_services[bufnr] = nil
+    end
+    cleanup_service_cache_dir(state.service_cache_dirs and state.service_cache_dirs[bufnr])
+    M._cleanup_service_workspace_for_buf(bufnr)
+    if state.service_cache_dirs then
+      state.service_cache_dirs[bufnr] = nil
+    end
+  end
+end
+
 --- Send a batch of items to the full watch session for rendering.
 --- @param bufnr integer
 --- @param items table[]
@@ -1442,9 +3007,179 @@ function M.render_items_via_watch(bufnr, items)
   refresh_session_poll_interval(session)
 end
 
+--- Send a machine-owned full render request to the compiler service.
+--- @param bufnr integer
+--- @param request RenderRequest
+function M.render_request_via_service(bufnr, request)
+  local early_meta = build_render_request_meta(request)
+  local service = M.ensure_compiler_service(bufnr, "full")
+  if service == nil or service.stdin == nil or service.stdin:is_closing() then
+    fail_full_service_request(bufnr, early_meta, "compiler service unavailable")
+    return
+  end
+  -- Start the preview backend with the same buffer/project lifetime so the
+  -- first cursor preview does not pay process startup while full rendering is
+  -- busy. It compiles only preview requests, so it cannot block full updates.
+  local preview_service = M.ensure_compiler_service(bufnr, "preview")
+
+  local project_scope = require("typst-concealer.project-scope").resolve(bufnr, "full")
+  local main = require("typst-concealer")
+  local config = main.config
+  local prelude_chunks = snapshot_full_context_preludes(bufnr)
+  local preamble_include_line = resolve_preamble_include_line(bufnr, project_scope.effective_root, "full")
+  local spec = build_full_service_spec(request, project_scope, prelude_chunks, preamble_include_line, config)
+  service.cache_dir = spec.output_dir
+  state.service_cache_dirs = state.service_cache_dirs or {}
+  state.service_cache_dirs[bufnr] = spec.output_dir
+  state.service_workspace_dirs = state.service_workspace_dirs or {}
+  state.service_workspace_dirs[bufnr] = spec.workspace.root
+
+  local current_request = build_render_request_meta(request)
+  current_request.line_map = nil
+  current_request.slot_line_maps = spec.slot_line_maps
+  current_request.generated_slot_paths = spec.generated_slot_paths
+  current_request.project_scope_id = project_scope.project_scope_id or current_request.project_scope_id
+  current_request.buf_dir = project_scope.buf_dir
+  current_request.source_root = project_scope.source_root
+  current_request.effective_root = project_scope.effective_root
+  current_request.generated_input_path = spec.generated_input_path
+  current_request.generated_context_path = spec.generated_context_path
+
+  local old = state.active_service_requests and state.active_service_requests[bufnr]
+  if old ~= nil then
+    old.status = "abandoned"
+  end
+  state.active_service_requests = state.active_service_requests or {}
+  current_request.queued_at = vim.uv.hrtime()
+  state.active_service_requests[bufnr] = current_request
+
+  if config.do_diagnostics then
+    clear_quickfix(bufnr, "full")
+  end
+
+  local inputs = extract_service_inputs(config, project_scope)
+
+  local ok, msg = pcall(vim.json.encode, {
+    type = "compile",
+    request_id = request.request_id,
+    cache_key = spec.cache_key,
+    source_text = spec.source_text,
+    root = project_scope.effective_root,
+    inputs = inputs,
+    output_dir = spec.output_dir,
+    ppi = state._render_ppi or config.ppi,
+  })
+  if not ok then
+    fail_full_service_request(bufnr, current_request, "failed to encode compiler request")
+    vim.schedule(function()
+      vim.notify("[typst-concealer] failed to encode compiler request: " .. tostring(msg), vim.log.levels.ERROR)
+    end)
+    return
+  end
+
+  local sent = send_or_queue_service_payload(bufnr, service, {
+    kind = "full",
+    request_id = request.request_id,
+    message = msg,
+    meta = current_request,
+    prepare = make_full_sidecar_prepare(service, spec.writes),
+    on_prepare_failed = function(err)
+      fail_full_service_request(bufnr, current_request, "failed to prepare sidecars: " .. tostring(err))
+    end,
+  })
+  if not sent then
+    fail_full_service_request(bufnr, current_request, "failed to send compiler request")
+    return
+  end
+
+  prewarm_preview_service(
+    bufnr,
+    preview_service,
+    request.jobs,
+    project_scope,
+    config,
+    prelude_chunks,
+    preamble_include_line
+  )
+end
+
+--- Send a preview item to the compiler service for rendering.
+--- @param bufnr integer
+--- @param item table  preview item from allocate_preview_item
+function M.render_preview_tail_via_service(bufnr, item)
+  local service = M.ensure_compiler_service(bufnr, "preview")
+  if service == nil or service.stdin == nil or service.stdin:is_closing() then
+    return
+  end
+
+  local project_scope = require("typst-concealer.project-scope").resolve(bufnr, "full")
+  local main = require("typst-concealer")
+  local config = main.config
+  local prelude_chunks = snapshot_full_context_preludes(bufnr)
+  local preamble_include_line = resolve_preamble_include_line(bufnr, project_scope.effective_root, "full")
+  local spec = build_preview_service_spec(bufnr, service, item, project_scope, prelude_chunks, preamble_include_line)
+  if spec == nil then
+    return
+  end
+
+  local request_id = item.preview_request_id
+  if request_id == nil then
+    return
+  end
+
+  -- Track the preview request so the response handler can route it.
+  state.active_preview_service_requests = state.active_preview_service_requests or {}
+  local preview_meta = {
+    request_id = request_id,
+    item = item,
+    queued_at = vim.uv.hrtime(),
+  }
+  state.active_preview_service_requests[bufnr] = preview_meta
+
+  local inputs = extract_service_inputs(config, project_scope)
+  service.cache_dir = spec.cache_dir
+  state.service_cache_dirs = state.service_cache_dirs or {}
+  state.service_cache_dirs[bufnr] = spec.cache_dir
+
+  local ok, msg = pcall(vim.json.encode, {
+    type = "compile",
+    request_id = request_id,
+    cache_key = spec.cache_key,
+    source_text = spec.source_text,
+    root = project_scope.effective_root,
+    inputs = inputs,
+    output_dir = spec.cache_dir,
+    ppi = state._render_ppi or config.ppi,
+  })
+  if not ok then
+    vim.schedule(function()
+      vim.notify("[typst-concealer] failed to encode preview request: " .. tostring(msg), vim.log.levels.ERROR)
+    end)
+    return
+  end
+
+  local sent = send_or_queue_service_payload(bufnr, service, {
+    kind = "preview",
+    request_id = request_id,
+    message = msg,
+    meta = preview_meta,
+    preview_context_hash = spec.context_hash,
+    prepare = make_preview_sidecar_prepare(service, spec.sidecar_path, spec.sidecar_text),
+    on_prepare_failed = function()
+      local active = state.active_preview_service_requests and state.active_preview_service_requests[bufnr]
+      if active ~= nil and active.request_id == request_id then
+        state.active_preview_service_requests[bufnr] = nil
+      end
+    end,
+  })
+  if not sent then
+    state.active_preview_service_requests[bufnr] = nil
+  end
+end
+
 --- Send a machine-owned full render request to the watch session.
 --- @param bufnr integer
---- @param request WatchRenderRequest
+--- @param request RenderRequest
 function M.render_request_via_watch(bufnr, request)
   local session = M.ensure_watch_session(bufnr)
   if session == nil then

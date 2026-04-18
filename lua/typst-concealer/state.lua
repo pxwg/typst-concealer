@@ -1,7 +1,7 @@
 --- Shared mutable state for typst-concealer.
 --- Lua module caching guarantees a single instance.
 --- Write access is intentionally concentrated: apply.lua owns resource indices,
---- plan.lua owns per-buffer render state; session.lua owns watch sessions.
+--- plan.lua owns per-buffer render state; session.lua owns render backends.
 local M = {}
 local machine_types = require("typst-concealer.machine.types")
 
@@ -45,7 +45,7 @@ M.image_ids_in_use = {}
 --- @field last_input_write_count integer
 --- @field last_preview_sidecar_text string|nil
 --- @field wrapper_cache table|nil
---- @field current_request CurrentWatchRequest|nil
+--- @field current_request RenderRequestMeta|nil
 --- @field stderr_chunks string[]
 --- @field dead boolean|nil
 --- @field buf_dir string
@@ -55,7 +55,39 @@ M.image_ids_in_use = {}
 --- @type { [integer]: { full?: typst_watch_session } }
 M.watch_sessions = {}
 
---- Aggregated watch diagnostics per buffer/session kind for quickfix injection.
+--- @class typst_compiler_service
+--- @field handle uv_process_t|nil
+--- @field stdin uv_pipe_t|nil
+--- @field stdout uv_pipe_t|nil
+--- @field stderr uv_pipe_t|nil
+--- @field bufnr integer
+--- @field kind "full"|"preview"|nil
+--- @field dead boolean|nil
+--- @field line_buffer string
+--- @field stderr_line_buffer string
+--- @field cache_dir string|nil
+--- @field inflight { kind: string, request_id: string, is_prewarm: boolean|nil, preview_context_hash: string|nil }|nil
+--- @field pending_full_request table|nil
+--- @field pending_preview_request table|nil
+--- @field pending_prewarm_requests table[]|nil
+--- @field preview_warmed_signatures table<string, boolean>|nil
+
+--- @type { [integer]: { full?: typst_compiler_service, preview?: typst_compiler_service } }
+M.compiler_services = {}
+
+--- @type { [integer]: RenderRequestMeta|nil }
+M.active_service_requests = {}
+
+--- @type { [integer]: { request_id: string, item: table }|nil }
+M.active_preview_service_requests = {}
+
+--- @type { [integer]: string|nil }
+M.service_cache_dirs = {}
+
+--- @type { [integer]: string|nil }
+M.service_workspace_dirs = {}
+
+--- Aggregated render diagnostics per buffer/session kind for quickfix injection.
 --- @type { [integer]: { full?: table[] } }
 M.watch_diagnostics = {}
 
@@ -180,16 +212,24 @@ function M.clear_preview_timer(bufnr)
     return
   end
   local timer = bs.preview_sync_timer
-  if timer == nil then
-    return
+  if timer ~= nil then
+    if not timer:is_closing() then
+      timer:stop()
+      timer:close()
+    end
+    bs.preview_sync_timer = nil
   end
-  if not timer:is_closing() then
-    timer:stop()
-    timer:close()
-  end
-  bs.preview_sync_timer = nil
   bs.preview_sync_tick = nil
   bs.preview_sync_needs_full = false
+
+  local ft = bs._full_render_timer
+  if ft ~= nil then
+    if not ft:is_closing() then
+      ft:stop()
+      ft:close()
+    end
+    bs._full_render_timer = nil
+  end
 end
 
 --- Release sub-extmarks (ns_id2) attached to extmark_id before reuse or deletion.

@@ -2,7 +2,7 @@
 --- Builds the Typst source that wraps each snippet so it renders at the correct
 --- cell-grid dimensions.
 ---
---- TypstBackend interface (current: Typst only)
+--- Typst document assembly interface
 ---   M.build_batch_document(items) -> string    assembled multi-page Typst source
 ---   M.build_item_fragment(item, ...)           assembled single-item fragment for inclusion
 ---   M.build_wrapper(item, source_rows)         per-item wrapper dispatch
@@ -81,6 +81,32 @@ local function build_header_text(config, main, maybe_rewrite, preamble_include_l
   return table.concat(parts)
 end
 
+--- Build document-level context text for service sidecar rendering.
+--- @param bufnr integer
+--- @param buf_dir string|nil
+--- @param source_root string|nil
+--- @param effective_root string|nil
+--- @param preamble_include_line string|nil
+--- @return string
+function M.build_context_document(bufnr, buf_dir, source_root, effective_root, preamble_include_line)
+  local main = require("typst-concealer")
+  local config = main.config
+  local do_rewrite = buf_dir ~= nil and source_root ~= nil and effective_root ~= nil
+  local pr = do_rewrite and require("typst-concealer.path-rewrite") or nil
+  local function maybe_rewrite(text)
+    if pr == nil then
+      return text
+    end
+    return pr.rewrite_paths(text, {
+      bufnr = bufnr,
+      buf_dir = buf_dir,
+      source_root = source_root,
+      effective_root = effective_root,
+    })
+  end
+  return build_header_text(config, main, maybe_rewrite, preamble_include_line)
+end
+
 --- Returns the column width of the window displaying bufnr (falls back to current window).
 --- @param bufnr integer
 --- @return integer
@@ -107,7 +133,9 @@ local function current_window_width_pt(bufnr)
   return usable_cols * approx_cell_w_pt
 end
 
---- Inline/intrinsic sizing wrapper: fits content to an exact terminal cell grid.
+--- Inline/intrinsic sizing wrapper.
+--- Single-line items keep their measured width to avoid transparent right-side
+--- padding; multi-line items still snap to the terminal cell grid.
 --- @param source_rows integer
 --- @return string prefix, string suffix   both "" when cell size is unknown
 function M.make_inline_sizing_wrap(source_rows)
@@ -120,11 +148,9 @@ function M.make_inline_sizing_wrap(source_rows)
         string.format(
           "]; let __d = measure(__it); let __mh = %gpt; let __mw = %gpt;"
             .. " let __rows = __d.height / __mh;"
-            .. " let __cols = calc.max(1, calc.ceil(__d.width / __mw - 0.001));"
-            .. " let __tw = __cols * __mw;"
-            .. " if __rows <= 1.5 { block(width: __tw, height: __mh, clip: true, align(horizon, __it)) }"
+            .. " if __rows <= 1.5 { block(width: __d.width, height: __mh, clip: true, align(horizon, __it)) }"
             .. " else { let __r = calc.max(1, calc.ceil(__rows - 0.001));"
-            .. " block(width: __tw, height: __r * __mh, align(horizon, __it)) } }\n",
+            .. " block(width: __d.width, height: __r * __mh, align(horizon, __it)) } }\n",
           baseline_pt,
           cell_w_pt
         )
@@ -245,6 +271,82 @@ function M.build_item_fragment(item, buf_dir, source_root, effective_root, prelu
   return table.concat(parts)
 end
 
+--- Build one full-render slot sidecar. The returned map covers only the user
+--- body inside the generated sidecar; wrapper/prelude errors intentionally stay
+--- attributed to the sidecar file.
+--- @param item table
+--- @param buf_dir string|nil
+--- @param source_root string|nil
+--- @param effective_root string|nil
+--- @param prelude_chunks string[]|nil
+--- @return string, table|nil
+function M.build_slot_document(item, buf_dir, source_root, effective_root, prelude_chunks)
+  if item.is_tombstone == true then
+    return "#box(width: 1pt, height: 1pt)[]\n", nil
+  end
+
+  prelude_chunks = prelude_chunks or state.runtime_preludes
+
+  local do_rewrite = buf_dir ~= nil and source_root ~= nil and effective_root ~= nil
+  local pr = do_rewrite and require("typst-concealer.path-rewrite") or nil
+  local function maybe_rewrite(text)
+    if pr == nil then
+      return text
+    end
+    return pr.rewrite_paths(text, {
+      bufnr = item.bufnr,
+      buf_dir = buf_dir,
+      source_root = source_root,
+      effective_root = effective_root,
+    })
+  end
+
+  local parts = {}
+  local cur_line = 1
+  local cur_col = 1
+  local function append(chunk)
+    parts[#parts + 1] = chunk
+    cur_line, cur_col = advance_pos(chunk, cur_line, cur_col)
+  end
+
+  for i = 1, item.prelude_count or 0 do
+    append(maybe_rewrite(prelude_chunks[i] or ""))
+  end
+
+  local source_rows = item.range[3] - item.range[1] + 1
+  local wrap_prefix, wrap_suffix = M.build_wrapper(item, source_rows)
+  if wrap_prefix ~= "" then
+    append(wrap_prefix)
+  end
+
+  local item_text = maybe_rewrite(normalize_item_str(item))
+  local gen_start = cur_line
+  local gen_start_col = cur_col
+  local gen_end_line, gen_end_col_next = advance_pos(item_text, gen_start, gen_start_col)
+  append(item_text)
+
+  if wrap_suffix ~= "" then
+    append(wrap_suffix)
+  else
+    append("\n")
+  end
+
+  return table.concat(parts),
+    {
+      gen_start = gen_start,
+      gen_end = gen_end_line,
+      gen_start_col = gen_start_col,
+      gen_end_col = math.max(1, gen_end_col_next - 1),
+      bufnr = item.bufnr,
+      src_start = item.range[1] + 1,
+      src_end = item.range[3] + 1,
+      src_start_col = item.range[2] + 1,
+      src_end_col = item.range[4] + 1,
+      item_idx = item.item_idx,
+      slot_id = item.slot_id,
+    }
+end
+
 --- Build multi-page Typst source for a batch render session.
 --- @param items table[]
 --- @param buf_dir string|nil   source buffer directory (for path rewriting)
@@ -315,6 +417,9 @@ function M.build_batch_document(
     cache.header_text = header_text
   end
   append_chunk(header_text)
+  if header_text ~= "" then
+    append_chunk("#pagebreak(weak: true)\n")
+  end
 
   for idx, item in ipairs(items) do
     if idx > 1 then

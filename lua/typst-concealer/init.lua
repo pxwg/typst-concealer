@@ -85,6 +85,8 @@ end
 
 --- @class typstconfig
 --- @field typst_location?        string    Path to typst binary. Defaults to "typst" (PATH).
+--- @field use_compiler_service?  boolean   Route full overlay renders through typst-concealer-service. Default false.
+--- @field service_binary?        string    Path to typst-concealer-service. Defaults to "typst-concealer-service".
 --- @field do_diagnostics?        boolean   Provide diagnostics on compile error.
 --- @field color?                 string    Render colour (only when styling_type = "colorscheme").
 --- @field enabled_by_default?    boolean   Conceal newly opened buffers by default.
@@ -172,7 +174,12 @@ local function maybe_stop_hidden_full_watch(bufnr)
   if buf_has_visible_window(bufnr) then
     return
   end
-  require("typst-concealer.session").stop_watch_session(bufnr, "full")
+  local session = require("typst-concealer.session")
+  if M.config.use_compiler_service then
+    session.stop_compiler_service(bufnr)
+  else
+    session.stop_watch_session(bufnr, "full")
+  end
 end
 
 local function maybe_resume_visible_full_watch(bufnr)
@@ -187,7 +194,10 @@ local function maybe_resume_visible_full_watch(bufnr)
   end
 
   local session = require("typst-concealer.session")
-  if session.has_watch_session(bufnr, "full") then
+  if M.config.use_compiler_service and session.has_compiler_service(bufnr) then
+    return
+  end
+  if not M.config.use_compiler_service and session.has_watch_session(bufnr, "full") then
     return
   end
   require("typst-concealer.machine.runtime").render_buf(bufnr)
@@ -228,6 +238,7 @@ M.disable_buf = function(bufnr)
   require("typst-concealer.state").clear_hover_timer(bufnr)
   local session = require("typst-concealer.session")
   session.stop_watch_session(bufnr, "full")
+  session.stop_compiler_service(bufnr)
   require("typst-concealer.machine.runtime").clear_live_preview(bufnr)
   require("typst-concealer.plan").hard_reset_buf(bufnr)
 end
@@ -261,6 +272,8 @@ function M.setup(cfg)
 
   M.config = {
     typst_location = default(cfg.typst_location, "typst"),
+    use_compiler_service = default(cfg.use_compiler_service, false),
+    service_binary = default(cfg.service_binary, "typst-concealer-service"),
     do_diagnostics = default(cfg.do_diagnostics, true),
     enabled_by_default = default(cfg.enabled_by_default, true),
     styling_type = default(cfg.styling_type, "colorscheme"),
@@ -352,11 +365,38 @@ function M.setup(cfg)
           pending.line_delta = pending.line_delta + line_delta
           pending.requires_full = pending.requires_full or line_delta ~= 0
         end,
+        on_bytes = function(
+          _event,
+          buf,
+          _changedtick,
+          start_row,
+          start_col,
+          _byte_offset,
+          _old_end_row,
+          _old_end_col,
+          _old_byte_len,
+          new_end_row,
+          new_end_col,
+          _new_byte_len
+        )
+          local state_mod = require("typst-concealer.state")
+          local tracked = state_mod.get_buf_state(buf)
+          local end_row = start_row + new_end_row
+          local end_col = new_end_row == 0 and (start_col + new_end_col) or new_end_col
+          tracked.binding_dirty_ranges = tracked.binding_dirty_ranges or {}
+          tracked.binding_dirty_ranges[#tracked.binding_dirty_ranges + 1] = {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+          }
+        end,
         on_detach = function(_, buf)
           local state_mod = require("typst-concealer.state")
           local tracked = state_mod.get_buf_state(buf)
           tracked.change_tracker_attached = false
           tracked.pending_change = nil
+          tracked.binding_dirty_ranges = nil
         end,
       })
       bs.change_tracker_attached = true

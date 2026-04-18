@@ -4,6 +4,7 @@
 --- same extmark/session infrastructure.
 
 local semantics_mod = require("typst-concealer.semantics")
+local cursor_visibility = require("typst-concealer.cursor-visibility")
 local state = require("typst-concealer.state")
 local M = {}
 
@@ -24,6 +25,9 @@ local cursor_in_range
 local function range_to_string(range, bufnr)
   local start_row, start_col, end_row, end_col = range[1], range[2], range[3], range[4]
   local content = vim.api.nvim_buf_get_lines(bufnr, start_row, end_row + 1, false)
+  if #content == 0 or content[1] == nil then
+    return nil
+  end
   if start_row == end_row then
     content[1] = string.sub(content[1], start_col + 1, end_col)
   else
@@ -34,37 +38,11 @@ local function range_to_string(range, bufnr)
 end
 
 local function clamp_range_to_buffer(bufnr, range)
-  if range == nil or not vim.api.nvim_buf_is_valid(bufnr) then
-    return nil
-  end
-  local line_count = vim.api.nvim_buf_line_count(bufnr)
-  if line_count <= 0 then
-    return nil
-  end
-
-  local start_row = math.max(0, math.min(range[1], line_count - 1))
-  local end_row = math.max(start_row, math.min(range[3], line_count - 1))
-  local lines = vim.api.nvim_buf_get_lines(bufnr, start_row, end_row + 1, false)
-  if #lines == 0 then
-    return nil
-  end
-
-  local start_col = math.max(0, math.min(range[2], #(lines[1] or "")))
-  local end_col
-  if start_row == end_row then
-    end_col = math.max(start_col, math.min(range[4], #(lines[#lines] or "")))
-  else
-    end_col = math.max(0, math.min(range[4], #(lines[#lines] or "")))
-  end
-
-  return { start_row, start_col, end_row, end_col }
+  return cursor_visibility.get_item_effective_range({ bufnr = bufnr, range = range })
 end
 
 local function get_item_effective_range(item)
-  if item == nil then
-    return nil
-  end
-  return clamp_range_to_buffer(item.bufnr, item.range)
+  return cursor_visibility.get_item_effective_range(item)
 end
 
 local function full_line_range(bufnr, row)
@@ -183,7 +161,14 @@ local function build_render_entries_from_units(bufnr, units)
       }
     elseif unit.node_type == "code" then
       if vim.list_contains({ "let", "set", "import", "show" }, unit.code_type) then
-        state.runtime_preludes[#state.runtime_preludes + 1] = range_to_string(unit.range, bufnr) .. "\n"
+        local prelude_text = range_to_string(unit.range, bufnr)
+        -- Bare `#show: ...` transforms the whole document. Applying it to each
+        -- isolated snippet is both expensive in template-heavy projects and
+        -- usually not the intended math/code styling. Selector show rules such
+        -- as `#show math.equation: ...` are still carried as local context.
+        if unit.code_type ~= "show" or not (prelude_text or ""):match("^%s*#%s*show%s*:") then
+          state.runtime_preludes[#state.runtime_preludes + 1] = prelude_text .. "\n"
+        end
       elseif not vim.list_contains({ "pagebreak" }, unit.call_ident or "") then
         render_entries[#render_entries + 1] = {
           range = unit.range,
@@ -299,9 +284,20 @@ local function context_hash(prelude_count)
   return hash_string(table.concat(parts, "\0"))
 end
 
+local function full_render_context_hash(main, project_scope)
+  return hash_string(table.concat({
+    "full-sidecar-inline-context-v3",
+    project_scope.context_signature or project_scope.project_scope_id or "",
+    main.config.header or "",
+    main._styling_prelude or "",
+    tostring(state._cell_px_w or ""),
+    tostring(state._cell_px_h or ""),
+    tostring(state._render_ppi or main.config.ppi or ""),
+  }, "\0"))
+end
+
 local function is_insert_like_mode(mode)
-  mode = mode or vim.api.nvim_get_mode().mode or ""
-  return mode:find("i", 1, true) ~= nil or mode:find("R", 1, true) ~= nil
+  return cursor_visibility.is_insert_like_mode(mode)
 end
 
 local function item_has_stable_render(item)
@@ -472,39 +468,11 @@ local function make_highlighted_preview_math(item, cursor_row, cursor_col, mode)
 end
 
 cursor_in_range = function(range, row, col, opts)
-  opts = opts or {}
-  local sr, sc, er, ec = range[1], range[2], range[3], range[4]
-  local include_right_edge = opts.include_right_edge == true
-
-  if row < sr or row > er then
-    return false
-  end
-
-  if sr == er then
-    if include_right_edge then
-      return col >= sc and col <= ec
-    end
-    return col >= sc and col < ec
-  end
-
-  if row == sr then
-    return col >= sc
-  end
-
-  if row == er then
-    if include_right_edge then
-      return col <= ec
-    end
-    return col < ec
-  end
-
-  return true
+  return cursor_visibility.cursor_in_range(range, row, col, opts)
 end
 
 local function cursor_engages_inline_item(range, row, col, mode)
-  return cursor_in_range(range, row, col, {
-    include_right_edge = is_insert_like_mode(mode),
-  })
+  return cursor_visibility.cursor_engages_inline_item(range, row, col, mode)
 end
 
 local function cursor_near_range(range, row, col)
@@ -661,10 +629,12 @@ function M.render_buf(bufnr)
   local parser = vim.treesitter.get_parser(bufnr, "typst")
   local tree = parser:parse()[1]:root()
   local units = collect_incremental_units(bufnr, tree, main._typst_query, prev_state.full_units, bs.pending_change)
+  local binding_dirty_ranges = bs.binding_dirty_ranges
   if units == nil then
     units = collect_full_units(bufnr, tree, main._typst_query)
   end
   bs.pending_change = nil
+  bs.binding_dirty_ranges = nil
   local sorted_entries = build_render_entries_from_units(bufnr, units)
 
   -- Build machine ScannedNodes from sorted_entries.
@@ -713,9 +683,11 @@ function M.render_buf(bufnr)
     type = "nodes_scanned",
     bufnr = bufnr,
     project_scope_id = project_scope.project_scope_id,
+    render_context_hash = full_render_context_hash(main, project_scope),
     buffer_version = vim.api.nvim_buf_get_changedtick(bufnr),
     layout_version = vim.o.columns,
     scanned_nodes = scanned_nodes,
+    binding_dirty_ranges = binding_dirty_ranges,
   })
   runtime.dispatch({
     type = "full_render_requested",
@@ -732,47 +704,8 @@ end
 --- @param bufnr integer
 --- @param bs table  per-buffer state
 --- @param extmark_id integer
-local function hide_one_extmark(bufnr, bs, extmark_id)
-  local mm = bs.multiline_marks[extmark_id]
-  if mm ~= nil then
-    if mm.is_block_carrier then
-      if mm.carrier_id then
-        vim.api.nvim_buf_del_extmark(bufnr, state.ns_id2, mm.carrier_id)
-        mm.carrier_id = nil
-      end
-      for _, sid in ipairs(mm.tail_ids or {}) do
-        vim.api.nvim_buf_del_extmark(bufnr, state.ns_id2, sid)
-      end
-      mm.tail_ids = {}
-      return true
-    end
-    -- Non-block multiline (ns_id2 overlay path)
-    local mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, extmark_id, { details = true })
-    if #mark > 0 and mark[3] and mark[3].virt_text_pos == "right_align" then
-      return nil
-    end
-    for _, sub_id in ipairs(mm) do
-      vim.api.nvim_buf_del_extmark(bufnr, state.ns_id2, sub_id)
-    end
-    return true
-  else
-    -- Single-line extmark
-    local mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, extmark_id, { details = true })
-    if #mark == 0 then
-      return nil
-    end
-    local row, col, opts = mark[1], mark[2], mark[3]
-    vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
-      id = extmark_id,
-      virt_text = { { "" } },
-      end_row = opts.end_row,
-      end_col = opts.end_col,
-      conceal = nil,
-      virt_text_pos = opts.virt_text_pos,
-      invalidate = opts.invalidate,
-    })
-    return true
-  end
+local function hide_one_extmark(bufnr, _bs, extmark_id)
+  return require("typst-concealer.extmark").unconceal_extmark(bufnr, extmark_id)
 end
 
 --- Restore a previously hidden extmark from the current rendered item state.
@@ -802,32 +735,8 @@ local function restore_one_extmark(bufnr, extmark_id)
   )
 end
 
-local function should_unconceal_item_for_row(item, row, cursor_row, cursor_col)
-  local effective_range = get_item_effective_range(item)
-  if effective_range == nil then
-    return false
-  end
-  local sem = item.semantics or {}
-  local source_kind = sem.source_kind or item.node_type
-  local display_kind = sem.display_kind
-  local sr, _, er, _ = effective_range[1], effective_range[2], effective_range[3], effective_range[4]
-
-  if sr == er and source_kind == "math" then
-    if row ~= cursor_row then
-      return false
-    end
-    local trigger_range = effective_range
-    if sem.render_whole_line and item.display_range ~= nil then
-      trigger_range = clamp_range_to_buffer(item.bufnr, item.display_range) or effective_range
-    end
-    return cursor_engages_inline_item(trigger_range, cursor_row, cursor_col)
-  end
-
-  if source_kind == "math" or source_kind == "code" then
-    return row >= sr and row <= er
-  end
-
-  return false
+local function should_unconceal_item_for_row(item, row, cursor_row, cursor_col, mode)
+  return cursor_visibility.should_unconceal_item_for_row(item, row, cursor_row, cursor_col, mode)
 end
 
 --- Hide / restore extmarks that overlap the cursor position.
@@ -901,7 +810,7 @@ function M.hide_extmarks_at_cursor(bufnr)
     local row_items = line_to_items[row]
     if row_items then
       for _, item in ipairs(row_items) do
-        if should_unconceal_item_for_row(item, row, cursor_row, cursor_col) then
+        if should_unconceal_item_for_row(item, row, cursor_row, cursor_col, mode) then
           should_hide[item.extmark_id] = item
         end
       end
@@ -1340,6 +1249,9 @@ end
 --- @param bufnr integer
 function M.clear_live_typst_preview(bufnr)
   require("typst-concealer.machine.runtime").clear_preview_request(bufnr)
+  -- In service mode the preview backend has its own active request table and
+  -- no watch tail page; this call is intentionally a no-op unless a legacy
+  -- watch session exists.
   require("typst-concealer.session").clear_preview_tail(bufnr)
   cleanup_preview_image(bufnr)
 end
@@ -1358,7 +1270,28 @@ function M.schedule_live_preview_sync(bufnr, opts)
   local preview = require("typst-concealer.machine.runtime").get_ui_buffer(bufnr).preview
   local tick = vim.api.nvim_buf_get_changedtick(bufnr)
   preview.sync_tick = tick
-  preview.sync_needs_full = preview.sync_needs_full or opts.refresh_full == true
+
+  -- When text changes in insert mode (refresh_full=true), fire the full
+  -- render on a very short debounce (1 frame ≈ 16ms) so that overlays
+  -- update almost immediately.  The heavier live-preview float keeps the
+  -- longer user-configured debounce to avoid flicker.
+  if opts.refresh_full == true then
+    if bs._full_render_timer == nil or bs._full_render_timer:is_closing() then
+      bs._full_render_timer = vim.uv.new_timer()
+    end
+    bs._full_render_timer:stop()
+    bs._full_render_timer:start(
+      16,
+      0,
+      vim.schedule_wrap(function()
+        if not vim.api.nvim_buf_is_valid(bufnr) then
+          return
+        end
+        M.render_buf(bufnr)
+        M.hide_extmarks_at_cursor(bufnr)
+      end)
+    )
+  end
 
   if bs.preview_sync_timer == nil or bs.preview_sync_timer:is_closing() then
     bs.preview_sync_timer = vim.uv.new_timer()
@@ -1371,16 +1304,16 @@ function M.schedule_live_preview_sync(bufnr, opts)
     0,
     vim.schedule_wrap(function()
       local current_preview = require("typst-concealer.machine.runtime").get_ui_buffer(bufnr).preview
-      local scheduled_tick = current_preview.sync_tick
-      local needs_full = current_preview.sync_needs_full
-      current_preview.sync_tick = nil
-      current_preview.sync_needs_full = false
 
       if not vim.api.nvim_buf_is_valid(bufnr) then
         return
       end
 
-      if needs_full or scheduled_tick ~= vim.api.nvim_buf_get_changedtick(bufnr) then
+      -- Full render already dispatched above; only re-render if a further
+      -- tick change happened between the fast timer and this slower one.
+      local scheduled_tick = current_preview.sync_tick
+      current_preview.sync_tick = nil
+      if scheduled_tick ~= nil and scheduled_tick ~= vim.api.nvim_buf_get_changedtick(bufnr) then
         M.render_buf(bufnr)
       end
       M.render_live_typst_preview(bufnr)

@@ -12,7 +12,7 @@ local M = {}
 
 --- @class EffectRequestFullRender
 --- @field kind "request_full_render"
---- @field request WatchRenderRequest
+--- @field request RenderRequest
 
 --- @class EffectCommitOverlay
 --- @field kind "commit_overlay"
@@ -23,6 +23,17 @@ local M = {}
 --- @field natural_cols integer
 --- @field natural_rows integer
 --- @field source_rows integer
+
+--- @class EffectBindOverlay
+--- @field kind "bind_overlay"
+--- @field overlay_id string
+--- @field request_id string|nil
+--- @field node_id string
+--- @field bufnr integer
+--- @field buffer_version integer
+--- @field layout_version integer
+--- @field display_range Range4
+--- @field semantics NodeSemantics
 
 --- @class EffectRetireOverlay
 --- @field kind "retire_overlay"
@@ -42,6 +53,7 @@ local M = {}
 --- | EffectEnsureOverlayPlaceholder
 --- | EffectRequestFullRender
 --- | EffectCommitOverlay
+--- | EffectBindOverlay
 --- | EffectRetireOverlay
 --- | EffectRerenderBuffer
 --- | EffectAbandonRequest

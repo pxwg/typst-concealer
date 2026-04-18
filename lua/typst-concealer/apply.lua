@@ -4,6 +4,7 @@
 
 local state = require("typst-concealer.state")
 local resources = require("typst-concealer.machine.resources")
+local cursor_visibility = require("typst-concealer.cursor-visibility")
 local M = {}
 
 --- @class PlannedItem
@@ -330,6 +331,13 @@ local function item_blocked_by_error_diagnostics(bufnr, item)
   return false
 end
 
+local function concealing_for_cursor(item)
+  if cursor_visibility.should_preserve_source_at_cursor(item.bufnr, item) then
+    return false
+  end
+  return nil
+end
+
 --- Allocate image_ids and extmarks for a batch of PlannedItems,
 --- reusing resources from previous render pass where possible.
 --- @param bufnr integer
@@ -357,7 +365,14 @@ function M.commit_plan(bufnr, planned_items)
       ext_id = prev_item.extmark_id
     else
       image_id = new_image_id(bufnr)
-      ext_id = extmark_mod.place_render_extmark(bufnr, image_id, planned.display_range, nil, nil, planned.semantics)
+      ext_id = extmark_mod.place_render_extmark(
+        bufnr,
+        image_id,
+        planned.display_range,
+        nil,
+        concealing_for_cursor(planned),
+        planned.semantics
+      )
     end
 
     local item = {
@@ -593,7 +608,14 @@ function M.accept_page_update(update)
     for _, fi in ipairs(bstate.full_items) do
       if fi.image_id == image_id then
         if fi.needs_swap then
-          extmark_mod.swap_extmark_to_range(bufnr, image_id, extmark_id, fi.display_range or fi.range, fi.semantics)
+          extmark_mod.swap_extmark_to_range(
+            bufnr,
+            image_id,
+            extmark_id,
+            fi.display_range or fi.range,
+            fi.semantics,
+            concealing_for_cursor(fi)
+          )
           fi.needs_swap = false
         end
         break
