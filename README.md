@@ -106,7 +106,7 @@ require("typst-concealer").setup({
 
 `get_root(bufnr, path, cwd, kind)` should return the absolute directory that concealer passes to Typst as `--root`. When omitted or when it returns `nil`, concealer falls back to the current working directory, then to the nearest directory containing `typst.toml`, and then to the current buffer directory.
 
-`compiler_args` is still passed through to Typst, but `--root` inside `compiler_args` is ignored because concealer computes the watch root from `get_root` or the fallback root base itself.
+`compiler_args` is still passed through to Typst, but `--root` inside `compiler_args` is ignored because concealer computes the render root from `get_root` or the fallback root base itself.
 
 Two other project hooks are available:
 
@@ -124,11 +124,41 @@ require("typst-concealer").setup({
 })
 ```
 
-- `get_inputs` appends extra `--input key=value` pairs to `typst watch`.
+- `get_inputs` appends extra `--input key=value` pairs to `typst watch` or the compiler service.
 - `get_preamble_file` injects a project-level `.typ` file at the top of the generated batch document.
 
+### Compiler Service
+
+Full overlay rendering and live preview can use the bundled Rust service instead
+of the legacy `typst watch` backend. Build it once, then enable it in setup:
+
+```sh
+cargo build --release --manifest-path service/Cargo.toml
+```
+
+```lua
+require("typst-concealer").setup({
+  use_compiler_service = true,
+  service_binary = "/absolute/path/to/typst-concealer-service",
+})
+```
+
+The service reads JSON-lines requests on stdin and returns JSON-lines responses
+with `request_id` and per-page PNG paths. This keeps full overlay results tied
+to the request that produced them. Full overlay and preview use separate service
+processes so cursor preview work cannot block full overlay updates.
+
+When `do_diagnostics = true`, service diagnostics that point inside generated
+wrapper/header space jump to a readable generated input file under
+`<root-base>/.typst-concealer/service-request-<request_id>.typ`. Diagnostics
+inside the original snippet still jump back to the source buffer, and diagnostics
+from external files keep the external path.
+
+If `use_compiler_service = false`, full overlays and preview fall back to the
+legacy `typst watch` path. Keep `typst` available when using that backend.
+
 ## Known issues
-- A temporary watch workspace is created under `<root-base>/.typst-concealer/` and used for `typst watch`, where `<root-base>` is the directory returned by `get_root` or the fallback root. The plugin removes active session files when disabled, but the directory may remain after crashes and is safe to delete.
+- A temporary render workspace is created under `<root-base>/.typst-concealer/`, where `<root-base>` is the directory returned by `get_root` or the fallback root. The plugin removes active session files when disabled, but the directory may remain after crashes and is safe to delete.
 - Breaks sometimes, pls report if any errors happen
 - Sometimes the message sent to the kitty image protocol gets displayed on the screen as colourful garbage text. It's difficult to reproduce, and I have no idea what to do about this.
 
