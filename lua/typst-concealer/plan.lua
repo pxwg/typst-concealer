@@ -485,7 +485,7 @@ local function make_highlighted_preview_math(item, cursor_row, cursor_col, mode)
 
   local prefix = get_text_slice(item.bufnr, item.range[1], item.range[2], span.start_row, span.start_col)
   local suffix = get_text_slice(item.bufnr, span.end_row, span.end_col, item.range[3], item.range[4])
-  local replacement = "#text(red)[$" .. span.text .. "$]"
+  local replacement = "#text(red)[$" .. span.text .. "$];"
   local rendered = prefix .. replacement .. suffix
   local key = preview_render_key(item, source_text, cursor_row, cursor_col, span)
   return rendered, key, source_text
