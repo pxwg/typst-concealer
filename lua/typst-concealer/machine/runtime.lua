@@ -520,14 +520,8 @@ local function run_bind_overlay(effect)
       concealing
     )
   else
-    extmark_id = resources.place_overlay_extmark(
-      buf.bufnr,
-      overlay.image_id,
-      node.display_range,
-      nil,
-      concealing,
-      node.semantics
-    )
+    extmark_id =
+      resources.place_overlay_extmark(buf.bufnr, overlay.image_id, node.display_range, nil, concealing, node.semantics)
   end
 
   local item = M.build_compat_item(machine_state, node, overlay)

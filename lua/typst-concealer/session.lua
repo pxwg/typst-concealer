@@ -1483,7 +1483,9 @@ local function build_full_service_spec(request, project_scope, prelude_chunks, p
     generated_input_path = workspace.main_path,
     generated_context_path = workspace.context_path,
     output_dir = workspace.outputs_dir,
-    cache_key = service_cache_key(project_scope, "full", request.shape_epoch or 0),
+    -- Keep one full-render compiler per project scope. Using shape_epoch here
+    -- causes the service to retain one Compiler per structural edit.
+    cache_key = service_cache_key(project_scope, "full"),
   }
 end
 
@@ -2545,14 +2547,12 @@ end
 
 --- @param project_scope table
 --- @param kind '"full"'|'"preview"'
---- @param shape_epoch integer|nil
 --- @return string
-service_cache_key = function(project_scope, kind, shape_epoch)
+service_cache_key = function(project_scope, kind)
   return table.concat({
     kind,
     tostring(project_scope.project_scope_id or ""),
     tostring(project_scope.effective_root or ""),
-    tostring(shape_epoch or 0),
   }, ":")
 end
 
