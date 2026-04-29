@@ -158,6 +158,7 @@ local function build_render_entries_from_units(bufnr, units)
         range = unit.range,
         prelude_count = #state.runtime_preludes,
         node_type = "math",
+        ts_node = unit.node,
       }
     elseif unit.node_type == "code" then
       if vim.list_contains({ "let", "set", "import", "show" }, unit.code_type) then
@@ -174,6 +175,7 @@ local function build_render_entries_from_units(bufnr, units)
           range = unit.range,
           prelude_count = #state.runtime_preludes,
           node_type = "code",
+          ts_node = unit.node,
         }
       end
     end
@@ -320,7 +322,15 @@ local function get_text_slice(bufnr, start_row, start_col, end_row, end_col)
   if start_row > end_row or (start_row == end_row and start_col > end_col) then
     return ""
   end
-  return table.concat(vim.api.nvim_buf_get_text(bufnr, start_row, start_col, end_row, end_col, {}), "\n")
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+  if start_row >= line_count or end_row >= line_count then
+    return ""
+  end
+  local ok, result = pcall(vim.api.nvim_buf_get_text, bufnr, start_row, start_col, end_row, end_col, {})
+  if not ok then
+    return ""
+  end
+  return table.concat(result, "\n")
 end
 
 local function get_math_symbol_span_at_pos(item, row, col)
@@ -652,6 +662,7 @@ function M.render_buf(bufnr)
   local main = require("typst-concealer")
   bufnr = bufnr or vim.fn.bufnr()
   clear_diagnostics(bufnr)
+  require("typst-concealer.machine.runtime").reconcile_visible_overlay_bindings(bufnr)
 
   if main._enabled_buffers[bufnr] ~= true or not main.is_render_allowed(bufnr) then
     M.hard_reset_buf(bufnr)
@@ -699,7 +710,7 @@ function M.render_buf(bufnr)
 
     scanned_nodes[#scanned_nodes + 1] = {
       item_idx = idx,
-      stable_key = nil,
+      stable_key = entry.ts_node and tostring(entry.ts_node:id()) or nil,
       source_range = range,
       display_range = display_range,
       display_prefix = display_prefix,
@@ -1299,6 +1310,31 @@ end
 --- Coalesce insert-mode text/cursor churn into a single preview sync pipeline.
 --- @param bufnr integer
 --- @param opts table|nil { refresh_full?: boolean, immediate?: boolean }
+function M.schedule_full_render(bufnr, opts)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  opts = opts or {}
+  local bs = state.get_buf_state(bufnr)
+  if bs._full_render_timer == nil or bs._full_render_timer:is_closing() then
+    bs._full_render_timer = vim.uv.new_timer()
+  end
+
+  bs._full_render_timer:stop()
+  bs._full_render_timer:start(
+    opts.immediate == true and 0 or 16,
+    0,
+    vim.schedule_wrap(function()
+      if not vim.api.nvim_buf_is_valid(bufnr) then
+        return
+      end
+      M.render_buf(bufnr)
+      M.hide_extmarks_at_cursor(bufnr)
+    end)
+  )
+end
+
 function M.schedule_live_preview_sync(bufnr, opts)
   if not vim.api.nvim_buf_is_valid(bufnr) then
     return
@@ -1316,21 +1352,7 @@ function M.schedule_live_preview_sync(bufnr, opts)
   -- update almost immediately.  The heavier live-preview float keeps the
   -- longer user-configured debounce to avoid flicker.
   if opts.refresh_full == true then
-    if bs._full_render_timer == nil or bs._full_render_timer:is_closing() then
-      bs._full_render_timer = vim.uv.new_timer()
-    end
-    bs._full_render_timer:stop()
-    bs._full_render_timer:start(
-      16,
-      0,
-      vim.schedule_wrap(function()
-        if not vim.api.nvim_buf_is_valid(bufnr) then
-          return
-        end
-        M.render_buf(bufnr)
-        M.hide_extmarks_at_cursor(bufnr)
-      end)
-    )
+    M.schedule_full_render(bufnr)
   end
 
   if bs.preview_sync_timer == nil or bs.preview_sync_timer:is_closing() then

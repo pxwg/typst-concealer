@@ -198,6 +198,9 @@ local function with_stubbed_extmark(fn)
       calls.cleared[#calls.cleared + 1] = image_id
       state.image_ids_in_use[image_id] = nil
     end,
+    clear_image_only = function(image_id)
+      calls.cleared[#calls.cleared + 1] = image_id
+    end,
     create_image = function(path, image_id, width, height)
       calls.created[#calls.created + 1] = {
         path = path,
@@ -2053,6 +2056,130 @@ local function test_machine_reducer_does_not_rebind_stable_overlay_for_disjoint_
   assert_eq(count_effects(effects, "request_full_render"), 0, "disjoint dirty ranges should not recompile")
 end
 
+local function test_machine_reducer_rebinds_when_dirty_range_hits_old_binding_after_shift()
+  reset_modules()
+  local types = require("typst-concealer.machine.types")
+  local reducer = require("typst-concealer.machine.reducer")
+
+  local state = types.initial_state()
+  local effects
+  state = reducer.reduce(
+    state,
+    scan_event({
+      make_scanned_node({
+        source_range = { 10, 0, 12, 1 },
+        display_range = { 10, 0, 12, 1 },
+        semantics = { display_kind = "block", constraint_kind = "intrinsic", render_whole_line = false },
+      }),
+    })
+  )
+  state, effects = reducer.reduce(state, { type = "full_render_requested", bufnr = 1 })
+  local request = first_effect(effects, "request_full_render")
+  local overlay = state.overlays[request.request.jobs[1].overlay_id]
+  state = reducer.reduce(state, {
+    type = "overlay_resources_allocated",
+    overlay_id = overlay.overlay_id,
+    image_id = 31,
+    extmark_id = 41,
+    binding_buffer_version = 1,
+    binding_layout_version = 1,
+    binding_display_range = { 10, 0, 12, 1 },
+  })
+  overlay = state.overlays[overlay.overlay_id]
+  state = reducer.reduce(state, page_ready_event(overlay))
+  state = reducer.reduce(state, {
+    type = "overlay_commit_succeeded",
+    overlay_id = overlay.overlay_id,
+    node_id = overlay.owner_node_id,
+  })
+
+  state, effects = reducer.reduce(
+    state,
+    scan_event({
+      make_scanned_node({
+        source_range = { 20, 0, 22, 1 },
+        display_range = { 20, 0, 22, 1 },
+        semantics = { display_kind = "block", constraint_kind = "intrinsic", render_whole_line = false },
+      }),
+    }, {
+      buffer_version = 2,
+      binding_dirty_ranges = {
+        { 10, 0, 12, 1 },
+      },
+    })
+  )
+
+  assert_eq(count_effects(effects, "request_full_render"), 0, "pure position shifts should not require rerender")
+  local bind = first_effect(effects, "bind_overlay")
+  assert_truthy(bind ~= nil, "dirty old binding range should force a visible overlay rebind after shift")
+  assert_eq(bind.display_range[1], 20, "rebind should target the new display range")
+  assert_eq(bind.overlay_id, overlay.overlay_id, "rebind should keep the same visible overlay identity")
+end
+
+local function test_machine_reducer_rebinds_visible_overlay_after_shift_even_if_binding_was_reconciled()
+  reset_modules()
+  local types = require("typst-concealer.machine.types")
+  local reducer = require("typst-concealer.machine.reducer")
+
+  local state = types.initial_state()
+  local effects
+  state = reducer.reduce(
+    state,
+    scan_event({
+      make_scanned_node({
+        source_range = { 10, 0, 12, 1 },
+        display_range = { 10, 0, 12, 1 },
+        semantics = { display_kind = "block", constraint_kind = "intrinsic", render_whole_line = false },
+      }),
+    })
+  )
+  state, effects = reducer.reduce(state, { type = "full_render_requested", bufnr = 1 })
+  local request = first_effect(effects, "request_full_render")
+  local overlay = state.overlays[request.request.jobs[1].overlay_id]
+  state = reducer.reduce(state, {
+    type = "overlay_resources_allocated",
+    overlay_id = overlay.overlay_id,
+    image_id = 31,
+    extmark_id = 41,
+    binding_buffer_version = 1,
+    binding_layout_version = 1,
+    binding_display_range = { 10, 0, 12, 1 },
+  })
+  overlay = state.overlays[overlay.overlay_id]
+  state = reducer.reduce(state, page_ready_event(overlay))
+  state = reducer.reduce(state, {
+    type = "overlay_commit_succeeded",
+    overlay_id = overlay.overlay_id,
+    node_id = overlay.owner_node_id,
+  })
+
+  overlay = state.overlays[overlay.overlay_id]
+  overlay.binding_display_range = { 20, 0, 22, 1 }
+  overlay.binding_buffer_version = 2
+  overlay.binding_layout_version = 1
+
+  state, effects = reducer.reduce(
+    state,
+    scan_event({
+      make_scanned_node({
+        source_range = { 20, 0, 22, 1 },
+        display_range = { 20, 0, 22, 1 },
+        semantics = { display_kind = "block", constraint_kind = "intrinsic", render_whole_line = false },
+      }),
+    }, {
+      buffer_version = 2,
+    })
+  )
+
+  local bind = first_effect(effects, "bind_overlay")
+  assert_truthy(
+    bind ~= nil,
+    "a visible overlay that shifted must still rebind even if reconcile already updated binding metadata"
+  )
+  assert_eq(bind.display_range[1], 20, "rebind should target the shifted display range")
+  assert_eq(bind.overlay_id, overlay.overlay_id, "rebind should keep the same visible overlay identity")
+end
+
 local function test_machine_reducer_retires_deleted_only_formula_on_render_boundary()
   reset_modules()
   local types = require("typst-concealer.machine.types")
@@ -2427,6 +2554,70 @@ local function test_machine_reducer_identity_repeated_identical_formulas()
 
   assert_eq(state.buffers[1].node_order[1], first_id, "first repeated formula should keep identity")
   assert_eq(state.buffers[1].node_order[2], second_id, "second repeated formula should keep identity")
+end
+
+local function test_machine_reducer_identity_repeated_identical_formulas_shift_down_together()
+  reset_modules()
+  local types = require("typst-concealer.machine.types")
+  local reducer = require("typst-concealer.machine.reducer")
+
+  local state = types.initial_state()
+  state = reducer.reduce(
+    state,
+    scan_event({
+      make_scanned_node({
+        stable_key = nil,
+        item_idx = 1,
+        source_range = { 10, 0, 10, 3 },
+        display_range = { 10, 0, 10, 3 },
+        source_text = "$x$",
+        source_text_hash = "hash:x",
+      }),
+      make_scanned_node({
+        stable_key = nil,
+        item_idx = 2,
+        source_range = { 11, 0, 11, 3 },
+        display_range = { 11, 0, 11, 3 },
+        source_text = "$x$",
+        source_text_hash = "hash:x",
+      }),
+    })
+  )
+  local first_id = state.buffers[1].node_order[1]
+  local second_id = state.buffers[1].node_order[2]
+
+  state = reducer.reduce(
+    state,
+    scan_event({
+      make_scanned_node({
+        stable_key = nil,
+        item_idx = 1,
+        source_range = { 11, 0, 11, 3 },
+        display_range = { 11, 0, 11, 3 },
+        source_text = "$x$",
+        source_text_hash = "hash:x",
+      }),
+      make_scanned_node({
+        stable_key = nil,
+        item_idx = 2,
+        source_range = { 12, 0, 12, 3 },
+        display_range = { 12, 0, 12, 3 },
+        source_text = "$x$",
+        source_text_hash = "hash:x",
+      }),
+    }, { buffer_version = 2 })
+  )
+
+  assert_eq(
+    state.buffers[1].node_order[1],
+    first_id,
+    "first repeated formula should keep identity when the repeated run shifts down together"
+  )
+  assert_eq(
+    state.buffers[1].node_order[2],
+    second_id,
+    "second repeated formula should keep identity when the repeated run shifts down together"
+  )
 end
 
 local function test_machine_reducer_stable_slots_include_clean_pages_for_one_dirty_node()
@@ -3015,7 +3206,7 @@ local function test_machine_runtime_rebuilds_compat_read_model()
   assert_eq(bstate.runtime_preludes[1], "keep-prelude", "runtime rebuild should preserve runtime preludes")
 end
 
-local function test_machine_runtime_rebinds_overlay_without_reuploading_image()
+local function test_machine_runtime_rebinds_overlay_with_terminal_image_refresh()
   local state = fresh_state()
   state.machine_state.buffers[1] = {
     bufnr = 1,
@@ -3087,7 +3278,8 @@ local function test_machine_runtime_rebinds_overlay_without_reuploading_image()
       },
     })
 
-    assert_eq(#calls.created, 0, "rebind should reuse the uploaded terminal image")
+    assert_eq(#calls.cleared, 1, "rebind should clear the old terminal image placement")
+    assert_eq(#calls.created, 1, "rebind should refresh the terminal image after moving the extmark")
     assert_eq(#calls.swapped, 1, "rebind should move the existing extmark")
     assert_eq(#calls.concealed, 1, "rebind should rewrite placeholders for the existing image")
     assert_eq(
@@ -3354,6 +3546,66 @@ local function test_machine_runtime_tracks_ui_state()
   assert_eq(state.machine_state.ui.buffers[1], nil, "buffer reset should clear machine ui state")
 end
 
+local function test_machine_runtime_reconciles_visible_overlay_binding_from_extmark()
+  local state = fresh_state()
+  local runtime = require("typst-concealer.machine.runtime")
+  local bufnr = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+  })
+
+  local extmark_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, 2, 0, {
+    id = 41,
+    end_row = 3,
+    end_col = 5,
+    virt_text = { { "" } },
+    virt_text_pos = "overlay",
+    invalidate = true,
+  })
+
+  state.machine_state.buffers[bufnr] = {
+    bufnr = bufnr,
+    project_scope_id = "p",
+    buffer_version = 1,
+    layout_version = 80,
+    nodes = {
+      ["node:1"] = {
+        node_id = "node:1",
+        bufnr = bufnr,
+        project_scope_id = "p",
+        visible_overlay_id = "overlay:1",
+        display_range = { 0, 0, 1, 4 },
+      },
+    },
+    node_order = { "node:1" },
+  }
+  state.machine_state.overlays["overlay:1"] = {
+    overlay_id = "overlay:1",
+    owner_bufnr = bufnr,
+    owner_node_id = "node:1",
+    request_id = "request:1",
+    extmark_id = extmark_id,
+    binding_display_range = { 0, 0, 1, 4 },
+    binding_buffer_version = 1,
+    binding_layout_version = 80,
+  }
+
+  local repaired = runtime.reconcile_visible_overlay_bindings(bufnr)
+  local overlay = state.machine_state.overlays["overlay:1"]
+  assert_eq(repaired, 1, "reconcile should repair stale visible overlay binding metadata")
+  assert_eq(overlay.binding_display_range[1], 2, "binding start row should follow the actual extmark row")
+  assert_eq(overlay.binding_display_range[3], 3, "binding end row should follow the actual extmark end row")
+  assert_eq(overlay.binding_display_range[4], 5, "binding end col should follow the actual extmark end col")
+  assert_eq(
+    overlay.binding_buffer_version,
+    vim.api.nvim_buf_get_changedtick(bufnr),
+    "reconcile should stamp the current changedtick onto the repaired binding"
+  )
+end
+
 local function test_machine_resources_share_legacy_allocation_pool()
   local state = fresh_state()
   state.pid = 700
@@ -3520,6 +3772,10 @@ local function main()
   ok("ok machine reducer enforces request identity and delayed retire")
   test_machine_reducer_rebinds_stable_visible_overlay_on_precise_dirty_range()
   ok("ok machine reducer rebinds stable visible overlays on precise dirty ranges")
+  test_machine_reducer_rebinds_when_dirty_range_hits_old_binding_after_shift()
+  ok("ok machine reducer rebinds visible overlays when old binding range is dirtied after shift")
+  test_machine_reducer_rebinds_visible_overlay_after_shift_even_if_binding_was_reconciled()
+  ok("ok machine reducer rebinds shifted visible overlays even after binding reconcile")
   test_machine_reducer_does_not_rebind_stable_overlay_for_disjoint_dirty_range()
   ok("ok machine reducer skips disjoint display binding changes")
   test_machine_reducer_retires_deleted_only_formula_on_render_boundary()
@@ -3536,6 +3792,8 @@ local function main()
   ok("ok machine reducer identity insertion between formulas")
   test_machine_reducer_identity_repeated_identical_formulas()
   ok("ok machine reducer identity repeated identical formulas")
+  test_machine_reducer_identity_repeated_identical_formulas_shift_down_together()
+  ok("ok machine reducer identity repeated identical formulas shift down together")
   test_machine_reducer_stable_slots_include_clean_pages_for_one_dirty_node()
   ok("ok machine reducer stable slots include clean pages for one dirty node")
   test_machine_reducer_stable_slots_append_insertions_without_shifting_pages()
@@ -3552,8 +3810,8 @@ local function main()
   ok("ok machine reducer failed request cleans candidates")
   test_machine_runtime_rebuilds_compat_read_model()
   ok("ok machine runtime rebuilds compat read model")
-  test_machine_runtime_rebinds_overlay_without_reuploading_image()
-  ok("ok machine runtime rebinds overlays without image upload")
+  test_machine_runtime_rebinds_overlay_with_terminal_image_refresh()
+  ok("ok machine runtime rebinds overlays with terminal image refresh")
   test_machine_runtime_places_cursor_overlay_unconcealed()
   ok("ok machine runtime keeps cursor overlay placeholders unconcealed")
   test_extmark_conceal_preserves_source_under_cursor()
@@ -3568,6 +3826,8 @@ local function main()
   ok("ok machine runtime reset releases candidate resources")
   test_machine_runtime_tracks_ui_state()
   ok("ok machine runtime tracks ui state")
+  test_machine_runtime_reconciles_visible_overlay_binding_from_extmark()
+  ok("ok machine runtime reconciles visible overlay bindings from extmarks")
   test_machine_resources_share_legacy_allocation_pool()
   ok("ok machine resources share legacy allocation pool")
   test_commit_plan_reuses_stable_render_for_same_source()

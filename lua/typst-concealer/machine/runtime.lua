@@ -67,6 +67,46 @@ function M.invalidate_hover(bufnr)
   M.get_ui_buffer(bufnr).hover.invalidated = true
 end
 
+function M.reconcile_visible_overlay_bindings(bufnr)
+  local machine_state = ensure_machine_state()
+  local buf = machine_state.buffers[bufnr]
+  if buf == nil or not vim.api.nvim_buf_is_valid(bufnr) then
+    return 0
+  end
+
+  local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
+  local layout_version = vim.o.columns
+  local repaired = 0
+
+  for _, node_id in ipairs(buf.node_order or {}) do
+    local node = buf.nodes[node_id]
+    local overlay = node and node.visible_overlay_id and machine_state.overlays[node.visible_overlay_id] or nil
+    if overlay ~= nil and overlay.extmark_id ~= nil then
+      local ok, mark =
+        pcall(vim.api.nvim_buf_get_extmark_by_id, bufnr, state.ns_id, overlay.extmark_id, { details = true })
+      if ok and mark ~= nil and #mark > 0 then
+        local row = mark[1]
+        local col = mark[2]
+        local details = mark[3] or {}
+        local actual_range = {
+          row,
+          col,
+          details.end_row or row,
+          details.end_col or col,
+        }
+        if not ranges_equal(actual_range, overlay.binding_display_range) then
+          overlay.binding_display_range = copy_range(actual_range)
+          overlay.binding_buffer_version = changedtick
+          overlay.binding_layout_version = layout_version
+          repaired = repaired + 1
+        end
+      end
+    end
+  end
+
+  return repaired
+end
+
 function M.set_preview_render_key(bufnr, render_key)
   M.get_ui_buffer(bufnr).preview.render_key = render_key
 end
@@ -150,19 +190,6 @@ local function concealing_for_cursor(node)
   return nil
 end
 
-local function each_previous_full_item(bufnr, fn)
-  local bstate = state.buffer_render_state[bufnr]
-  if bstate == nil then
-    return
-  end
-  for _, item in ipairs(bstate.full_items or {}) do
-    fn(item)
-  end
-  for _, item in ipairs(bstate.lingering_items or {}) do
-    fn(item)
-  end
-end
-
 --- @param _machine_state MachineState
 --- @param node NodeState
 --- @param overlay OverlayState
@@ -195,59 +222,12 @@ function M.build_compat_item(_machine_state, node, overlay)
   }
 end
 
-local function index_item(line_to_items, extmark_to_item, item)
-  if item == nil or item.extmark_id == nil or item.range == nil then
-    return
-  end
-  extmark_to_item[item.extmark_id] = item
-  for row = item.range[1], item.range[3] do
-    line_to_items[row] = line_to_items[row] or {}
-    line_to_items[row][#line_to_items[row] + 1] = item
-  end
-end
-
 --- Rebuild the legacy read model consumed by hover/live-preview code.
 --- @param machine_state MachineState
 --- @param bufnr integer
 function M.rebuild_buffer_read_model(machine_state, bufnr)
   machine_state = machine_state or ensure_machine_state()
-  local buf = machine_state.buffers[bufnr]
-
-  each_previous_full_item(bufnr, function(item)
-    if item.image_id ~= nil then
-      state.item_by_image_id[item.image_id] = nil
-      if state.image_id_to_extmark[item.image_id] == item.extmark_id then
-        state.image_id_to_extmark[item.image_id] = nil
-      end
-    end
-  end)
-
-  local bstate = state.buffer_render_state[bufnr] or {}
-  state.buffer_render_state[bufnr] = bstate
-  local full_items = {}
-  local line_to_items = {}
-  local extmark_to_item = {}
-
-  if buf ~= nil then
-    for _, node_id in ipairs(buf.node_order or {}) do
-      local node = buf.nodes[node_id]
-      local overlay = node and node.visible_overlay_id and machine_state.overlays[node.visible_overlay_id] or nil
-      if overlay ~= nil and overlay.status == "visible" then
-        local item = M.build_compat_item(machine_state, node, overlay)
-        if item ~= nil then
-          full_items[#full_items + 1] = item
-          state.item_by_image_id[item.image_id] = item
-          state.image_id_to_extmark[item.image_id] = item.extmark_id
-          index_item(line_to_items, extmark_to_item, item)
-        end
-      end
-    end
-  end
-
-  bstate.full_items = full_items
-  bstate.lingering_items = {}
-  bstate.line_to_items = line_to_items
-  bstate.extmark_to_item = extmark_to_item
+  resources.rebuild_indices(machine_state, bufnr, M.build_compat_item)
 end
 
 function M.reset()
@@ -451,8 +431,7 @@ local function run_commit_overlay(effect, batch_mode)
     return nil
   end
 
-  state.item_by_image_id[item.image_id] = item
-  state.image_id_to_extmark[item.image_id] = item.extmark_id
+  resources.bind_image_id(item.image_id, item, item.extmark_id)
 
   local extmark = require("typst-concealer.extmark")
   extmark.create_image(effect.page_path, item.image_id, effect.natural_cols, effect.natural_rows)
@@ -547,8 +526,9 @@ local function run_bind_overlay(effect)
     }
   end
   item.extmark_id = extmark_id
-  state.item_by_image_id[overlay.image_id] = item
-  state.image_id_to_extmark[overlay.image_id] = extmark_id
+  resources.bind_image_id(overlay.image_id, item, extmark_id)
+  extmark.clear_image_only(overlay.image_id)
+  extmark.create_image(overlay.page_path, overlay.image_id, overlay.natural_cols, overlay.natural_rows)
   extmark.conceal_for_image_id(
     buf.bufnr,
     overlay.image_id,
@@ -700,6 +680,10 @@ end
 
 function M.render_buf(bufnr)
   require("typst-concealer.plan").render_buf(bufnr)
+end
+
+function M.schedule_full_render(bufnr, opts)
+  require("typst-concealer.plan").schedule_full_render(bufnr, opts)
 end
 
 function M.render_live_preview(bufnr)

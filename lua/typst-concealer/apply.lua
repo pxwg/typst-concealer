@@ -155,19 +155,11 @@ local function cleanup_preview_image(bufnr)
       end
     end
     if bs.preview_item ~= nil and bs.preview_item.image_id ~= nil then
-      local extmark = require("typst-concealer.extmark")
-      extmark.clear_image(bs.preview_item.image_id)
-      state.image_id_to_extmark[bs.preview_item.image_id] = nil
-      state.item_by_image_id[bs.preview_item.image_id] = nil
-      state.image_ids_in_use[bs.preview_item.image_id] = nil
+      resources.release_image_id(bs.preview_item.image_id)
     end
     bs.preview_item = nil
     if last_rendered ~= nil and last_rendered.image_id ~= nil then
-      local extmark = require("typst-concealer.extmark")
-      extmark.clear_image(last_rendered.image_id)
-      state.image_id_to_extmark[last_rendered.image_id] = nil
-      state.item_by_image_id[last_rendered.image_id] = nil
-      state.image_ids_in_use[last_rendered.image_id] = nil
+      resources.release_image_id(last_rendered.image_id)
     end
     bs.preview_last_rendered_item = nil
     bs.preview_last_render_key = nil
@@ -179,21 +171,14 @@ local function cleanup_preview_image(bufnr)
     return
   end
 
-  local extmark = require("typst-concealer.extmark")
   local target_bufnr = preview.target_bufnr or bufnr
   state.prepare_extmark_reuse(target_bufnr, preview.extmark_id)
   pcall(vim.api.nvim_buf_del_extmark, target_bufnr, state.ns_id, preview.extmark_id)
   if preview.image_id ~= nil then
-    extmark.clear_image(preview.image_id)
-    state.image_id_to_extmark[preview.image_id] = nil
-    state.item_by_image_id[preview.image_id] = nil
-    state.image_ids_in_use[preview.image_id] = nil
+    resources.release_image_id(preview.image_id)
   end
   if bs.preview_item ~= nil and bs.preview_item.image_id ~= nil and bs.preview_item.image_id ~= preview.image_id then
-    extmark.clear_image(bs.preview_item.image_id)
-    state.image_id_to_extmark[bs.preview_item.image_id] = nil
-    state.item_by_image_id[bs.preview_item.image_id] = nil
-    state.image_ids_in_use[bs.preview_item.image_id] = nil
+    resources.release_image_id(bs.preview_item.image_id)
   end
   if
     last_rendered ~= nil
@@ -201,10 +186,7 @@ local function cleanup_preview_image(bufnr)
     and last_rendered.image_id ~= preview.image_id
     and (bs.preview_item == nil or last_rendered.image_id ~= bs.preview_item.image_id)
   then
-    extmark.clear_image(last_rendered.image_id)
-    state.image_id_to_extmark[last_rendered.image_id] = nil
-    state.item_by_image_id[last_rendered.image_id] = nil
-    state.image_ids_in_use[last_rendered.image_id] = nil
+    resources.release_image_id(last_rendered.image_id)
   end
   bs.preview_image = nil
   bs.preview_item = nil
@@ -226,11 +208,7 @@ local function cleanup_preview_item_request(bufnr, item, opts)
 
   opts = opts or {}
   if item.image_id ~= nil then
-    local extmark = require("typst-concealer.extmark")
-    extmark.clear_image(item.image_id)
-    state.image_id_to_extmark[item.image_id] = nil
-    state.item_by_image_id[item.image_id] = nil
-    state.image_ids_in_use[item.image_id] = nil
+    resources.release_image_id(item.image_id)
   end
 
   if opts.keep_extmark ~= true and item.extmark_id ~= nil then
@@ -394,7 +372,7 @@ function M.commit_plan(bufnr, planned_items)
     carry_stable_render_metadata(item, prev_item)
 
     batch_items[#batch_items + 1] = item
-    state.item_by_image_id[image_id] = item
+    resources.bind_image_id(image_id, item, ext_id)
   end
 
   for _, item in ipairs(batch_items) do
@@ -464,10 +442,7 @@ function M.show_preview_item(bufnr, item, layout)
   )
 
   if prev_visible_image_id ~= nil and prev_visible_image_id ~= item.image_id then
-    extmark_mod.clear_image(prev_visible_image_id)
-    state.image_id_to_extmark[prev_visible_image_id] = nil
-    state.item_by_image_id[prev_visible_image_id] = nil
-    state.image_ids_in_use[prev_visible_image_id] = nil
+    resources.release_image_id(prev_visible_image_id)
   end
 
   bs.preview_image = {
@@ -502,12 +477,9 @@ function M.show_rendered_preview_item(bufnr, item, layout)
   )
 
   item.extmark_id = extmark_id
-  state.image_id_to_extmark[item.image_id] = extmark_id
+  resources.bind_image_id(item.image_id, nil, extmark_id)
   if prev_visible_image_id ~= nil and prev_visible_image_id ~= item.image_id then
-    extmark_mod.clear_image(prev_visible_image_id)
-    state.image_id_to_extmark[prev_visible_image_id] = nil
-    state.item_by_image_id[prev_visible_image_id] = nil
-    state.image_ids_in_use[prev_visible_image_id] = nil
+    resources.release_image_id(prev_visible_image_id)
   end
   bs.preview_image = {
     extmark_id = extmark_id,
@@ -551,8 +523,7 @@ function M.allocate_preview_item(bufnr, source_item, preview_str, source_str, re
     render_target = "preview_float",
     source_image_id = source_item.image_id,
   }
-  state.image_id_to_extmark[preview_item.image_id] = extmark_id
-  state.item_by_image_id[preview_item.image_id] = preview_item
+  resources.bind_image_id(preview_item.image_id, preview_item, extmark_id)
   local bs = state.get_buf_state(bufnr)
   bs.preview_item = preview_item
   bs.preview_render_key = render_key
@@ -640,7 +611,6 @@ end
 --- Release all resources for a buffer and reset render state.
 --- @param bufnr integer
 function M.hard_reset(bufnr)
-  local extmark_mod = require("typst-concealer.extmark")
   local bstate = state.buffer_render_state[bufnr]
   if bstate and bstate.full_items then
     for _, item in ipairs(bstate.full_items) do
@@ -662,13 +632,13 @@ function M.hard_reset(bufnr)
     end
   end
   for _, image_id in ipairs(to_remove) do
-    state.item_by_image_id[image_id] = nil
+    resources.unbind_image_id(image_id, nil)
   end
   state.runtime_preludes = {}
 
   for id, image_bufnr in pairs(state.image_ids_in_use) do
     if bufnr == image_bufnr then
-      extmark_mod.clear_image(id)
+      resources.release_image_id(id)
     end
   end
 end

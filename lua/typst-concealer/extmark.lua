@@ -57,6 +57,13 @@ function M.clear_image(image_id)
   state.image_ids_in_use[image_id] = nil
 end
 
+--- Delete an image from the terminal without touching index tables.
+--- Used by resources.lua which manages index tables centrally.
+--- @param image_id integer
+function M.clear_image_only(image_id)
+  send_kitty_escape("q=2,a=d,d=i,i=" .. image_id)
+end
+
 --- Returns the column width of the window displaying bufnr (falls back to current window).
 --- @param bufnr integer
 --- @return integer

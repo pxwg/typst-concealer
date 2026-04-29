@@ -357,6 +357,7 @@ function M.setup(cfg)
               line_delta = line_delta,
               requires_full = line_delta ~= 0,
             }
+            require("typst-concealer.machine.runtime").schedule_full_render(buf)
             return
           end
           pending.start_row = math.min(pending.start_row, firstline)
@@ -364,6 +365,7 @@ function M.setup(cfg)
           pending.new_end_row = math.max(pending.new_end_row, new_end_row)
           pending.line_delta = pending.line_delta + line_delta
           pending.requires_full = pending.requires_full or line_delta ~= 0
+          require("typst-concealer.machine.runtime").schedule_full_render(buf)
         end,
         on_bytes = function(
           _event,
@@ -455,7 +457,7 @@ function M.setup(cfg)
     callback = function(ev)
       vim.schedule(function()
         local runtime = require("typst-concealer.machine.runtime")
-        runtime.render_buf(ev.buf)
+        runtime.schedule_full_render(ev.buf, { immediate = true })
         runtime.render_live_preview(ev.buf)
       end)
     end,

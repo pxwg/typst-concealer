@@ -317,14 +317,14 @@ local function node_identity_can_range_match(node, scanned, project_scope_id, bu
   end
 
   local ordinal_delta = math.abs((node.item_idx or 0) - (scanned.item_idx or 0))
-  if ordinal_delta > 0 then
+  if ordinal_delta > 1 then
     return false
   end
 
   local overlap = row_overlap_len(node.source_range, scanned.source_range)
   local gap = row_gap_len(node.source_range, scanned.source_range)
   local display_overlap = row_ranges_overlap(node.display_range, scanned.display_range)
-  return overlap > 0 or display_overlap or (gap <= 1 and ordinal_delta == 0)
+  return overlap > 0 or display_overlap or (gap <= 1 and ordinal_delta <= 1)
 end
 
 local function node_identity_rank(node)
@@ -359,6 +359,47 @@ local function best_by_range(old_nodes, scanned, used_old, project_scope_id, buf
       then
         best = old
         best_rank = rank
+        best_overlap = overlap
+        best_gap = gap
+        best_col_delta = col_delta
+      end
+    end
+  end
+
+  return best
+end
+
+local function best_exact_identity_match(old_nodes, scanned, used_old, project_scope_id, bufnr, predicate)
+  local best = nil
+  local best_rank = -1
+  local best_ordinal_delta = math.huge
+  local best_overlap = -1
+  local best_gap = math.huge
+  local best_col_delta = math.huge
+
+  for _, old in pairs(old_nodes or {}) do
+    if not used_old[old.node_id] and predicate(old, scanned, project_scope_id, bufnr) then
+      local rank = node_identity_rank(old)
+      local ordinal_delta = math.abs((old.item_idx or 0) - (scanned.item_idx or 0))
+      local overlap = row_overlap_len(old.source_range, scanned.source_range)
+      local gap = row_gap_len(old.source_range, scanned.source_range)
+      local col_delta = col_delta_len(old.source_range, scanned.source_range)
+      if
+        rank > best_rank
+        or (rank == best_rank and ordinal_delta < best_ordinal_delta)
+        or (rank == best_rank and ordinal_delta == best_ordinal_delta and overlap > best_overlap)
+        or (rank == best_rank and ordinal_delta == best_ordinal_delta and overlap == best_overlap and gap < best_gap)
+        or (
+          rank == best_rank
+          and ordinal_delta == best_ordinal_delta
+          and overlap == best_overlap
+          and gap == best_gap
+          and col_delta < best_col_delta
+        )
+      then
+        best = old
+        best_rank = rank
+        best_ordinal_delta = ordinal_delta
         best_overlap = overlap
         best_gap = gap
         best_col_delta = col_delta
@@ -427,7 +468,7 @@ local function find_best_old_node(old_nodes, scanned, used_old, project_scope_id
     return stable
   end
 
-  local exact = best_by_range(old_nodes, scanned, used_old, project_scope_id, bufnr, node_matches_scan)
+  local exact = best_exact_identity_match(old_nodes, scanned, used_old, project_scope_id, bufnr, node_matches_scan)
   if exact ~= nil then
     return exact
   end
@@ -649,6 +690,7 @@ local function node_needs_overlay_binding_refresh(state, node, ev)
     return true
   end
   return range_list_overlaps(node.display_range, ev.binding_dirty_ranges)
+    or range_list_overlaps(overlay.binding_display_range, ev.binding_dirty_ranges)
 end
 
 local function render_stub_from_node(node, slot)
@@ -805,6 +847,7 @@ local function reduce_nodes_scanned(state, ev)
   local next_nodes = {}
   local next_order = {}
   local used_old = {}
+  local moved_visible_nodes = {}
   local reserved_strong_keys = {}
   for idx, scanned in ipairs(ev.scanned_nodes or {}) do
     scanned.item_idx = scanned.item_idx or idx
@@ -826,6 +869,7 @@ local function reduce_nodes_scanned(state, ev)
     if prev ~= nil then
       used_old[prev.node_id] = true
       local unchanged = node_render_inputs_equal(prev, scanned)
+      local display_range_changed = not ranges_equal(prev.display_range, scanned.display_range)
       node = patch_node(prev, scanned, ev.buffer_version, ev.layout_version)
       if unchanged and prev.status ~= "deleted_confirmed" then
         if node.candidate_overlay_id ~= nil then
@@ -838,6 +882,15 @@ local function reduce_nodes_scanned(state, ev)
       else
         node.candidate_overlay_id = nil
         node.status = node.visible_overlay_id ~= nil and "stale" or "pending"
+      end
+      if
+        unchanged
+        and display_range_changed
+        and node.status == "stable"
+        and node.candidate_overlay_id == nil
+        and node.visible_overlay_id ~= nil
+      then
+        moved_visible_nodes[node.node_id] = true
       end
     else
       node = new_node(new_state, ev.bufnr, ev.project_scope_id, scanned, ev.buffer_version, ev.layout_version)
@@ -865,7 +918,7 @@ local function reduce_nodes_scanned(state, ev)
 
   for _, node_id in ipairs(next_order) do
     local node = next_nodes[node_id]
-    if node_needs_overlay_binding_refresh(new_state, node, ev) then
+    if moved_visible_nodes[node.node_id] or node_needs_overlay_binding_refresh(new_state, node, ev) then
       effects[#effects + 1] = {
         kind = "bind_overlay",
         overlay_id = node.visible_overlay_id,
