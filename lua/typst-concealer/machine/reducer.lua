@@ -20,8 +20,13 @@ local function deepcopy(value, seen)
   return out
 end
 
+--- Return the state for in-place mutation.
+--- The caller (runtime.dispatch) immediately replaces state.machine_state with
+--- the return value, so the previous reference is never read again.  A full
+--- deepcopy here was the primary source of progressive slowdown: O(state_size)
+--- per dispatch × ~6 dispatches per render cycle × every keystroke.
 local function clone_state(state)
-  return deepcopy(state or types.initial_state())
+  return state or types.initial_state()
 end
 
 local function copy_range(range)
@@ -544,8 +549,7 @@ local function node_render_inputs_equal(node, scanned)
 end
 
 local function patch_node(prev, scanned, buffer_version, layout_version)
-  local node = deepcopy(prev)
-  node.slot_id = prev.slot_id
+  local node = prev
   node.stable_key = scanned.stable_key
   node.item_idx = scanned.item_idx
   node.node_type = scanned.node_type
@@ -903,13 +907,17 @@ local function reduce_nodes_scanned(state, ev)
 
   for node_id, old in pairs(old_nodes) do
     if not used_old[node_id] then
-      local node = deepcopy(old)
-      node.status = node.visible_overlay_id ~= nil and "orphaned" or "deleted_confirmed"
-      node.missing_since_buffer_version = ev.buffer_version
-      node.candidate_overlay_id = nil
-      tombstone_slot(buf, node.slot_id, true)
-      next_nodes[node_id] = node
-      next_order[#next_order + 1] = node_id
+      old.candidate_overlay_id = nil
+      old.missing_since_buffer_version = ev.buffer_version
+      tombstone_slot(buf, old.slot_id, true)
+      if old.visible_overlay_id ~= nil then
+        -- Orphaned: keep the node so its overlay can be retired gracefully.
+        old.status = "orphaned"
+        next_nodes[node_id] = old
+        next_order[#next_order + 1] = node_id
+      end
+      -- deleted_confirmed nodes (no visible overlay) are dropped entirely;
+      -- they can never be matched again and only bloat the state.
     end
   end
 

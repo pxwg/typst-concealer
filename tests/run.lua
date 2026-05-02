@@ -2427,11 +2427,7 @@ local function test_machine_reducer_identity_deletion_with_upward_shift()
     second_id,
     "remaining formula should keep its old identity after shifting up"
   )
-  assert_eq(
-    state.buffers[1].nodes[first_id].status,
-    "deleted_confirmed",
-    "deleted formula without visible overlay is confirmed"
-  )
+  assert_eq(state.buffers[1].nodes[first_id], nil, "deleted formula without visible overlay is purged from state")
 end
 
 local function test_machine_reducer_identity_insertion_between_formulas()
