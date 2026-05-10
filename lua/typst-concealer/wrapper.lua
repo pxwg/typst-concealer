@@ -212,14 +212,16 @@ function M.make_flow_block_wrap(bufnr)
 end
 
 --- Wrapper dispatch: wrapper choice comes only from semantics.constraint_kind.
---- @param item table  item with semantics field
+--- Missing semantics fall back to inline sizing for internal placeholders.
+--- @param item table
 --- @param source_rows integer
 --- @return string prefix, string suffix
 function M.build_wrapper(item, source_rows)
   if item.skip_wrapper == true then
     return "", ""
   end
-  if item.semantics.constraint_kind == "flow" then
+  local semantics = item.semantics or {}
+  if semantics.constraint_kind == "flow" then
     return M.make_flow_block_wrap(item.bufnr)
   else
     return M.make_inline_sizing_wrap(source_rows)

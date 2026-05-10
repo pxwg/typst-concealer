@@ -1792,6 +1792,32 @@ local function test_inline_wrapper_keeps_single_row_width_intrinsic()
   )
 end
 
+local function test_wrapper_defaults_missing_semantics_to_inline()
+  reset_modules()
+  local state = require("typst-concealer.state")
+  state._cell_px_w = 20
+  state._cell_px_h = 40
+  package.loaded["typst-concealer"] = {
+    config = {
+      math_baseline_pt = 10,
+    },
+  }
+
+  local wrapper = require("typst-concealer.wrapper")
+  local ok_run, prefix, suffix = pcall(wrapper.build_wrapper, {
+    bufnr = 1,
+    range = { 0, 0, 0, 0 },
+    str = "[]",
+  }, 1)
+
+  assert_truthy(ok_run, "wrapper should tolerate internal items without semantics")
+  assert_eq(prefix, "#context { let __it = [", "missing semantics should use inline wrapper prefix")
+  assert_truthy(
+    suffix:find("block(width: __d.width, height: __mh", 1, true) ~= nil,
+    "missing semantics should use inline wrapper sizing"
+  )
+end
+
 local function test_remote_urls_do_not_rewrite_against_root()
   reset_modules()
   local path_rewrite = require("typst-concealer.path-rewrite")
@@ -3758,6 +3784,8 @@ local function main()
   ok("ok wrapper cache keys include root signature")
   test_inline_wrapper_keeps_single_row_width_intrinsic()
   ok("ok inline wrapper keeps single-row width intrinsic")
+  test_wrapper_defaults_missing_semantics_to_inline()
+  ok("ok wrapper defaults missing semantics to inline")
   test_remote_urls_do_not_rewrite_against_root()
   ok("ok remote urls bypass root rewrite")
   test_named_path_args_rewrite_local_paths()
