@@ -595,6 +595,7 @@ function M.accept_page_update(update)
   end
 
   extmark_mod.create_image(page_path, image_id, natural_cols, natural_rows)
+  extmark_mod.flush_terminal_data()
   if item ~= nil and item.render_target == "preview_float" then
     if state.hooks.present_rendered_preview_item then
       state.hooks.present_rendered_preview_item(target_bufnr, item)

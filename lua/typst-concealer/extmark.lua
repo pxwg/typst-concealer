@@ -11,17 +11,27 @@ local M = {}
 local is_tmux = vim.env.TMUX ~= nil
 local vim_stdout = assert(vim.loop.new_tty(1, false))
 
+--- Pending terminal data buffer.  All kitty escape sequences are accumulated
+--- here and flushed as a single atomic write via `M.flush_terminal_data()`.
+--- This prevents interleaving with Neovim's own TUI output when many images
+--- are cleared+re-created in the same event-loop tick (bind_overlay batches).
+local pending_terminal_buf = {}
+
 local function tmux_escape(message)
   return "\x1bPtmux;" .. message:gsub("\x1b", "\x1b\x1b") .. "\x1b\\"
 end
 
 local function send_terminal_data(data)
-  if vim.api.nvim_ui_send ~= nil then
-    local ok = pcall(vim.api.nvim_ui_send, data)
-    if ok then
-      return
-    end
+  pending_terminal_buf[#pending_terminal_buf + 1] = data
+end
+
+--- Flush all pending kitty escape data to the terminal in one write.
+function M.flush_terminal_data()
+  if #pending_terminal_buf == 0 then
+    return
   end
+  local data = table.concat(pending_terminal_buf)
+  pending_terminal_buf = {}
   vim_stdout:write(data)
 end
 

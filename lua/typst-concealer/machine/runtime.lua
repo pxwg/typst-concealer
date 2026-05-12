@@ -527,8 +527,10 @@ local function run_bind_overlay(effect)
   end
   item.extmark_id = extmark_id
   resources.bind_image_id(overlay.image_id, item, extmark_id)
-  extmark.clear_image_only(overlay.image_id)
-  extmark.create_image(overlay.page_path, overlay.image_id, overlay.natural_cols, overlay.natural_rows)
+  -- The kitty image is already loaded with this image_id; Unicode placeholder
+  -- mode (U=1) matches placeholders by fg-color == image_id, so repositioning
+  -- the extmark placeholder text is sufficient.  Re-uploading here is harmful
+  -- because the backing PNG may not exist yet (typst watch is recompiling).
   extmark.conceal_for_image_id(
     buf.bufnr,
     overlay.image_id,
@@ -604,6 +606,8 @@ function M.run_effects(effects)
     end
   end
 
+  local extmark = require("typst-concealer.extmark")
+
   for _, effect in ipairs(other_effects) do
     if effect.kind == "ensure_overlay_placeholder" then
       run_ensure_overlay_placeholder(effect)
@@ -617,6 +621,7 @@ function M.run_effects(effects)
       run_abandon_request(effect)
     end
   end
+  extmark.flush_terminal_data()
 
   if #bind_effects > 0 then
     local batch_entries = {}
@@ -628,6 +633,7 @@ function M.run_effects(effects)
         affected_buffers[entry.bufnr] = true
       end
     end
+    extmark.flush_terminal_data()
     if #batch_entries > 0 then
       M.dispatch({
         type = "overlay_bindings_batch_succeeded",
@@ -651,6 +657,7 @@ function M.run_effects(effects)
         affected_buffers[entry.bufnr] = true
       end
     end
+    extmark.flush_terminal_data()
     if #batch_entries > 0 then
       M.dispatch({
         type = "overlay_commits_batch_succeeded",
