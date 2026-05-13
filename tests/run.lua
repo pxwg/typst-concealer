@@ -1049,6 +1049,36 @@ local function test_service_success_clears_active_meta()
   end)
 end
 
+function _G.test_service_error_diagnostics_clear_candidate_placeholder()
+  make_service_response_harness("error-diagnostics-placeholder", { do_diagnostics = true }, function(ctx)
+    with_stubbed_extmark(function(calls)
+      feed_service_response(ctx.full_stdout, {
+        type = "compile_result",
+        request_id = ctx.request.request_id,
+        status = "ok",
+        pages = {},
+        diagnostics = {
+          { line = 1, column = 1, severity = "error", message = "unknown variable: mathbb" },
+        },
+        rendered_pages = 0,
+      })
+      wait_until_service_request_cleared(ctx.state, ctx.bufnr)
+
+      assert_eq(ctx.state.active_service_requests[ctx.bufnr], nil, "error diagnostics should clear active meta")
+      assert_eq(
+        ctx.state.machine_state.overlays[ctx.request.jobs[1].overlay_id],
+        nil,
+        "error diagnostics should retire and GC the candidate placeholder"
+      )
+      assert_eq(#calls.created, 0, "error diagnostics should not upload a placeholder image")
+      assert_truthy(
+        ctx.state.watch_diagnostics[ctx.bufnr].full[1].text:find("unknown variable: mathbb", 1, true) ~= nil,
+        "error diagnostics should still be published"
+      )
+    end)
+  end)
+end
+
 local function test_service_one_dirty_slot_keeps_full_shape_and_commits_once()
   make_service_response_harness("one-dirty-slot", {
     jobs = {
@@ -3881,6 +3911,8 @@ local function main()
   ok("ok service validates page contract")
   test_service_success_clears_active_meta()
   ok("ok service success clears active meta")
+  _G.test_service_error_diagnostics_clear_candidate_placeholder()
+  ok("ok service error diagnostics clear candidate placeholder")
   test_service_one_dirty_slot_keeps_full_shape_and_commits_once()
   ok("ok service one dirty slot keeps full shape and commits once")
   test_service_ignores_context_leading_pages()

@@ -554,6 +554,33 @@ local function parse_typst_stderr(session, text)
   return items
 end
 
+local function diagnostics_have_errors(items)
+  for _, item in ipairs(items or {}) do
+    if item.type == "E" or item.severity == "error" or (item.severity == nil and item.type == nil) then
+      return true
+    end
+  end
+  return false
+end
+
+local function fail_active_watch_request_on_diagnostics(session, items)
+  if session.kind ~= "full" or not diagnostics_have_errors(items) then
+    return
+  end
+  local request = session.current_request
+  if request == nil or request.status ~= "active" then
+    return
+  end
+
+  request.status = "failed"
+  require("typst-concealer.machine.runtime").dispatch({
+    type = "render_request_failed",
+    bufnr = session.bufnr,
+    request_id = request.request_id,
+    reason = "typst watch diagnostics",
+  })
+end
+
 --- Update quickfix from accumulated stderr chunks.
 --- @param bufnr integer
 --- @param kind  'full' | 'preview'
@@ -570,6 +597,7 @@ local function update_quickfix_from_stderr(session)
   end
   state.watch_diagnostics[session.bufnr] = state.watch_diagnostics[session.bufnr] or {}
   state.watch_diagnostics[session.bufnr][session.kind] = items
+  fail_active_watch_request_on_diagnostics(session, items)
   rebuild_quickfix(session.bufnr)
 end
 
@@ -1898,6 +1926,12 @@ on_service_response = function(bufnr, service_kind, resp)
   end
 
   handle_compile_diagnostics(bufnr, meta, resp.diagnostics)
+  if diagnostics_have_errors(resp.diagnostics) then
+    cleanup_request_artifacts(resp)
+    fail_full_service_request(bufnr, meta, "compile diagnostics")
+    finish_service_response(bufnr, service_kind, resp.request_id)
+    return
+  end
 
   local ok_pages, pages_or_err = validate_service_pages(meta, resp)
   if not ok_pages then
