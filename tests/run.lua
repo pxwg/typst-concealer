@@ -3480,6 +3480,78 @@ local function test_extmark_conceal_preserves_source_under_cursor()
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
+local function test_cursor_visibility_preserves_insert_math_after_stale_range()
+  fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+    },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "A $ sin$" })
+  vim.api.nvim_win_set_cursor(0, { 1, 6 })
+
+  local cursor_visibility = require("typst-concealer.cursor-visibility")
+  local item = {
+    bufnr = bufnr,
+    range = { 0, 2, 0, 5 },
+    display_range = { 0, 0, 0, 5 },
+    node_type = "math",
+    semantics = {
+      source_kind = "math",
+      display_kind = "block",
+      constraint_kind = "intrinsic",
+      render_whole_line = true,
+    },
+  }
+
+  assert_eq(
+    cursor_visibility.should_preserve_source_at_cursor(bufnr, item, "i"),
+    true,
+    "insert cursor inside the current math span should keep stale overlays unconcealed"
+  )
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_cursor_visibility_does_not_expand_to_adjacent_formula()
+  fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+    },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "$ a$ and $ b$" })
+  vim.api.nvim_win_set_cursor(0, { 1, 11 })
+
+  local cursor_visibility = require("typst-concealer.cursor-visibility")
+  local item = {
+    bufnr = bufnr,
+    range = { 0, 0, 0, 4 },
+    display_range = { 0, 0, 0, 4 },
+    node_type = "math",
+    semantics = {
+      source_kind = "math",
+      display_kind = "block",
+      constraint_kind = "intrinsic",
+      render_whole_line = true,
+    },
+  }
+
+  assert_eq(
+    cursor_visibility.should_preserve_source_at_cursor(bufnr, item, "i"),
+    false,
+    "insert cursor in another formula should not unconceal a disjoint stale overlay"
+  )
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
 local function test_machine_runtime_builds_watch_render_job()
   local state = fresh_state()
   local reducer = require("typst-concealer.machine.reducer")
@@ -3891,6 +3963,10 @@ local function main()
   ok("ok machine runtime keeps cursor overlay placeholders unconcealed")
   test_extmark_conceal_preserves_source_under_cursor()
   ok("ok extmark conceal keeps cursor source visible")
+  test_cursor_visibility_preserves_insert_math_after_stale_range()
+  ok("ok cursor visibility keeps edited insert math source visible")
+  test_cursor_visibility_does_not_expand_to_adjacent_formula()
+  ok("ok cursor visibility does not expand across adjacent formulas")
   test_machine_runtime_builds_watch_render_job()
   ok("ok machine runtime builds watch render job")
   test_machine_runtime_resets_buffer_snapshot()

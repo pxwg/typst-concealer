@@ -69,6 +69,49 @@ function M.cursor_engages_inline_item(range, row, col, mode)
   })
 end
 
+local function byte_is_escaped(line, byte_idx)
+  local slash_count = 0
+  local i = byte_idx - 1
+  while i >= 1 and line:sub(i, i) == "\\" do
+    slash_count = slash_count + 1
+    i = i - 1
+  end
+  return slash_count % 2 == 1
+end
+
+local function current_dollar_math_span(bufnr, row, anchor_col, cursor_col)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return nil
+  end
+  local line = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1]
+  if type(line) ~= "string" then
+    return nil
+  end
+
+  local delimiters = {}
+  local byte_idx = 1
+  while true do
+    byte_idx = line:find("$", byte_idx, true)
+    if byte_idx == nil then
+      break
+    end
+    if not byte_is_escaped(line, byte_idx) then
+      delimiters[#delimiters + 1] = byte_idx - 1
+    end
+    byte_idx = byte_idx + 1
+  end
+
+  for idx = 1, #delimiters - 1, 2 do
+    local start_col = delimiters[idx]
+    local end_col = delimiters[idx + 1] + 1
+    if anchor_col >= start_col and anchor_col < end_col and cursor_col >= start_col and cursor_col <= end_col then
+      return { row, start_col, row, end_col }
+    end
+  end
+
+  return nil
+end
+
 function M.get_item_effective_range(item)
   if item == nil then
     return nil
@@ -89,6 +132,12 @@ function M.should_unconceal_item_for_row(item, row, cursor_row, cursor_col, mode
   if sr == er and source_kind == "math" then
     if row ~= cursor_row then
       return false
+    end
+    if M.is_insert_like_mode(mode) then
+      local current_span = current_dollar_math_span(item.bufnr, cursor_row, effective_range[2], cursor_col)
+      if current_span ~= nil and M.cursor_engages_inline_item(current_span, cursor_row, cursor_col, mode) then
+        return true
+      end
     end
     local trigger_range = effective_range
     if sem.render_whole_line and item.display_range ~= nil then
