@@ -693,6 +693,9 @@ local function node_needs_overlay_binding_refresh(state, node, ev)
   if overlay.binding_display_range == nil or overlay.binding_layout_version ~= ev.layout_version then
     return true
   end
+  if not ranges_equal(overlay.binding_display_range, node.display_range) then
+    return true
+  end
   return range_list_overlaps(node.display_range, ev.binding_dirty_ranges)
     or range_list_overlaps(overlay.binding_display_range, ev.binding_dirty_ranges)
 end

@@ -238,6 +238,7 @@ local function with_stubbed_extmark(fn)
       }
       return id
     end,
+    flush_terminal_data = function() end,
   }
 
   local ok_run, result = pcall(fn, calls)
@@ -2082,6 +2083,54 @@ local function test_machine_reducer_does_not_rebind_stable_overlay_for_disjoint_
   assert_eq(count_effects(effects, "request_full_render"), 0, "disjoint dirty ranges should not recompile")
 end
 
+local function test_machine_reducer_rebinds_when_reconciled_binding_disagrees_with_scan()
+  reset_modules()
+  local types = require("typst-concealer.machine.types")
+  local reducer = require("typst-concealer.machine.reducer")
+
+  local state = types.initial_state()
+  local effects
+  state = reducer.reduce(state, scan_event({ make_scanned_node() }))
+  state, effects = reducer.reduce(state, { type = "full_render_requested", bufnr = 1 })
+  local request = first_effect(effects, "request_full_render")
+  local overlay = state.overlays[request.request.jobs[1].overlay_id]
+  state = reducer.reduce(state, {
+    type = "overlay_resources_allocated",
+    overlay_id = overlay.overlay_id,
+    image_id = 31,
+    extmark_id = 41,
+    binding_buffer_version = 1,
+    binding_layout_version = 1,
+    binding_display_range = { 0, 0, 0, 3 },
+  })
+  overlay = state.overlays[overlay.overlay_id]
+  state = reducer.reduce(state, page_ready_event(overlay))
+  state = reducer.reduce(state, {
+    type = "overlay_commit_succeeded",
+    overlay_id = overlay.overlay_id,
+    node_id = overlay.owner_node_id,
+  })
+
+  overlay = state.overlays[overlay.overlay_id]
+  overlay.binding_display_range = { 0, 99, 0, 0 }
+  overlay.binding_buffer_version = 2
+  overlay.binding_layout_version = 1
+
+  state, effects = reducer.reduce(
+    state,
+    scan_event({ make_scanned_node() }, {
+      buffer_version = 2,
+    })
+  )
+
+  assert_eq(count_effects(effects, "request_full_render"), 0, "stale display binding should not recompile")
+  local bind = first_effect(effects, "bind_overlay")
+  assert_truthy(bind ~= nil, "reconciled binding mismatch should force a visible overlay rebind")
+  assert_eq(bind.display_range[2], 0, "rebind should restore the scanned start column")
+  assert_eq(bind.display_range[4], 3, "rebind should restore the scanned end column")
+  assert_eq(bind.overlay_id, overlay.overlay_id, "rebind should target the visible overlay identity")
+end
+
 local function test_machine_reducer_rebinds_when_dirty_range_hits_old_binding_after_shift()
   reset_modules()
   local types = require("typst-concealer.machine.types")
@@ -3228,7 +3277,7 @@ local function test_machine_runtime_rebuilds_compat_read_model()
   assert_eq(bstate.runtime_preludes[1], "keep-prelude", "runtime rebuild should preserve runtime preludes")
 end
 
-local function test_machine_runtime_rebinds_overlay_with_terminal_image_refresh()
+local function test_machine_runtime_rebinds_overlay_without_terminal_image_refresh()
   local state = fresh_state()
   state.machine_state.buffers[1] = {
     bufnr = 1,
@@ -3300,8 +3349,8 @@ local function test_machine_runtime_rebinds_overlay_with_terminal_image_refresh(
       },
     })
 
-    assert_eq(#calls.cleared, 1, "rebind should clear the old terminal image placement")
-    assert_eq(#calls.created, 1, "rebind should refresh the terminal image after moving the extmark")
+    assert_eq(#calls.cleared, 0, "rebind should keep the existing terminal image")
+    assert_eq(#calls.created, 0, "rebind should not re-upload the terminal image")
     assert_eq(#calls.swapped, 1, "rebind should move the existing extmark")
     assert_eq(#calls.concealed, 1, "rebind should rewrite placeholders for the existing image")
     assert_eq(
@@ -3800,6 +3849,8 @@ local function main()
   ok("ok machine reducer rebinds visible overlays when old binding range is dirtied after shift")
   test_machine_reducer_rebinds_visible_overlay_after_shift_even_if_binding_was_reconciled()
   ok("ok machine reducer rebinds shifted visible overlays even after binding reconcile")
+  test_machine_reducer_rebinds_when_reconciled_binding_disagrees_with_scan()
+  ok("ok machine reducer rebinds visible overlays when reconciled binding disagrees with scan")
   test_machine_reducer_does_not_rebind_stable_overlay_for_disjoint_dirty_range()
   ok("ok machine reducer skips disjoint display binding changes")
   test_machine_reducer_retires_deleted_only_formula_on_render_boundary()
@@ -3834,8 +3885,8 @@ local function main()
   ok("ok machine reducer failed request cleans candidates")
   test_machine_runtime_rebuilds_compat_read_model()
   ok("ok machine runtime rebuilds compat read model")
-  test_machine_runtime_rebinds_overlay_with_terminal_image_refresh()
-  ok("ok machine runtime rebinds overlays with terminal image refresh")
+  test_machine_runtime_rebinds_overlay_without_terminal_image_refresh()
+  ok("ok machine runtime rebinds overlays without terminal image refresh")
   test_machine_runtime_places_cursor_overlay_unconcealed()
   ok("ok machine runtime keeps cursor overlay placeholders unconcealed")
   test_extmark_conceal_preserves_source_under_cursor()
