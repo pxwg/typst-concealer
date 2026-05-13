@@ -188,6 +188,87 @@ local function units_overlap_rows(unit, start_row, end_row)
   return range_overlaps_rows(unit.range, start_row, end_row)
 end
 
+local function buffer_source_kind(bufnr)
+  local ok, main = pcall(require, "typst-concealer")
+  if ok and type(main.source_kind_for_bufnr) == "function" then
+    return main.source_kind_for_bufnr(bufnr)
+  end
+
+  local ft = vim.bo[bufnr].filetype
+  local name = vim.api.nvim_buf_get_name(bufnr) or ""
+  if ft == "typst" or name:match("%.typ$") then
+    return "typst"
+  end
+  return nil
+end
+
+local function get_buffer_parser(bufnr, lang)
+  local ok, parser, err = pcall(vim.treesitter.get_parser, bufnr, lang)
+  if ok and parser ~= nil then
+    return parser, nil
+  end
+  if ok then
+    return nil, err or "parser unavailable"
+  end
+  return nil, tostring(parser)
+end
+
+local max_parser_retries = 20
+local parser_retry_base_delay_ms = 25
+local parser_retry_max_delay_ms = 250
+
+local function notify_parser_unavailable(bufnr, lang, bs, reason)
+  vim.schedule(function()
+    if not vim.api.nvim_buf_is_valid(bufnr) or not vim.api.nvim_buf_is_loaded(bufnr) then
+      return
+    end
+    local ok_main, main = pcall(require, "typst-concealer")
+    if not ok_main or main._enabled_buffers[bufnr] ~= true then
+      return
+    end
+
+    local parser, latest_reason = get_buffer_parser(bufnr, lang)
+    if parser ~= nil then
+      if bs.parser_retry_counts then
+        bs.parser_retry_counts[lang] = nil
+      end
+      require("typst-concealer.machine.runtime").render_buf(bufnr)
+      return
+    end
+
+    if bs.parser_retry_counts then
+      bs.parser_retry_counts[lang] = nil
+    end
+    vim.notify(
+      ("[typst-concealer] %s tree-sitter parser unavailable: %s"):format(lang, tostring(latest_reason or reason)),
+      vim.log.levels.WARN
+    )
+  end)
+end
+
+local function schedule_parser_retry(bufnr, lang, bs, reason)
+  bs.parser_retry_counts = bs.parser_retry_counts or {}
+  local retries = bs.parser_retry_counts[lang] or 0
+  if retries >= max_parser_retries then
+    notify_parser_unavailable(bufnr, lang, bs, reason)
+    return
+  end
+
+  bs.parser_retry_counts[lang] = retries + 1
+  local delay = math.min(parser_retry_max_delay_ms, parser_retry_base_delay_ms * (retries + 1))
+  vim.defer_fn(function()
+    local ok_main, main = pcall(require, "typst-concealer")
+    if
+      ok_main
+      and vim.api.nvim_buf_is_valid(bufnr)
+      and vim.api.nvim_buf_is_loaded(bufnr)
+      and main._enabled_buffers[bufnr] == true
+    then
+      require("typst-concealer.machine.runtime").render_buf(bufnr)
+    end
+  end, delay)
+end
+
 local function expand_rows_to_cover_units(units, start_row, end_row)
   local expanded_start = start_row
   local expanded_end = end_row
@@ -647,6 +728,7 @@ end
 --- @param bufnr integer
 function M.hard_reset_buf(bufnr)
   state.clear_hover_timer(bufnr)
+  state.clear_visible_refresh_timer(bufnr)
   state.clear_preview_timer(bufnr)
   require("typst-concealer.apply").hard_reset(bufnr)
   require("typst-concealer.machine.runtime").reset_buffer(bufnr)
@@ -661,6 +743,9 @@ end
 function M.render_buf(bufnr)
   local main = require("typst-concealer")
   bufnr = bufnr or vim.fn.bufnr()
+  if not vim.api.nvim_buf_is_valid(bufnr) or not vim.api.nvim_buf_is_loaded(bufnr) then
+    return
+  end
   clear_diagnostics(bufnr)
   require("typst-concealer.machine.runtime").reconcile_visible_overlay_bindings(bufnr)
 
@@ -676,17 +761,33 @@ function M.render_buf(bufnr)
 
   local bs = state.get_buf_state(bufnr)
   local prev_state = state.buffer_render_state[bufnr] or {}
+  local source_kind = buffer_source_kind(bufnr)
+  if source_kind ~= "typst" then
+    M.hard_reset_buf(bufnr)
+    return
+  end
 
-  local parser = vim.treesitter.get_parser(bufnr, "typst")
-  local tree = parser:parse()[1]:root()
-  local units = collect_incremental_units(bufnr, tree, main._typst_query, prev_state.full_units, bs.pending_change)
+  local units
+  local sorted_entries = {}
   local binding_dirty_ranges = bs.binding_dirty_ranges
+
+  local parser, parser_err = get_buffer_parser(bufnr, "typst")
+  if parser == nil then
+    schedule_parser_retry(bufnr, "typst", bs, parser_err)
+    return
+  end
+  if bs.parser_retry_counts then
+    bs.parser_retry_counts.typst = nil
+  end
+  local tree = parser:parse()[1]:root()
+  units = collect_incremental_units(bufnr, tree, main._typst_query, prev_state.full_units, bs.pending_change)
   if units == nil then
     units = collect_full_units(bufnr, tree, main._typst_query)
   end
+  sorted_entries = build_render_entries_from_units(bufnr, units)
+
   bs.pending_change = nil
   bs.binding_dirty_ranges = nil
-  local sorted_entries = build_render_entries_from_units(bufnr, units)
 
   -- Build machine ScannedNodes from sorted_entries.
   local scanned_nodes = {}
@@ -777,7 +878,8 @@ local function restore_one_extmark(bufnr, extmark_id)
     return
   end
   bs.currently_hidden_extmark_ids[extmark_id] = nil
-  require("typst-concealer.extmark").conceal_for_image_id(
+  local extmark = require("typst-concealer.extmark")
+  extmark.conceal_for_image_id(
     bufnr,
     item.image_id,
     item.natural_cols,

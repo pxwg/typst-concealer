@@ -42,10 +42,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .clone()
                     .unwrap_or_else(|| "default".to_string());
                 use_clock = use_clock.saturating_add(1);
-                let compiler = compilers.entry(cache_key.clone()).or_insert_with(|| CachedCompiler {
-                    compiler: Compiler::new(),
-                    last_used: use_clock,
-                });
+                let compiler =
+                    compilers
+                        .entry(cache_key.clone())
+                        .or_insert_with(|| CachedCompiler {
+                            compiler: Compiler::new(),
+                            last_used: use_clock,
+                        });
                 compiler.last_used = use_clock;
                 let resp = compiler.compiler.compile(req);
                 evict_stale_compilers(&mut compilers, &cache_key);

@@ -1453,6 +1453,10 @@ local function make_full_sidecar_prepare(service, writes)
   end
 end
 
+local function request_allows_partial_error_diagnostics(_request)
+  return false
+end
+
 --- @param request RenderRequest
 --- @param project_scope table
 --- @param prelude_chunks string[]
@@ -1926,7 +1930,7 @@ on_service_response = function(bufnr, service_kind, resp)
   end
 
   handle_compile_diagnostics(bufnr, meta, resp.diagnostics)
-  if diagnostics_have_errors(resp.diagnostics) then
+  if diagnostics_have_errors(resp.diagnostics) and not request_allows_partial_error_diagnostics(meta) then
     cleanup_request_artifacts(resp)
     fail_full_service_request(bufnr, meta, "compile diagnostics")
     finish_service_response(bufnr, service_kind, resp.request_id)
@@ -2454,6 +2458,9 @@ local function close_pipe(pipe)
   end
 end
 
+local mark_service_payload_failed
+local mark_inflight_service_request_failed
+
 --- Start or reuse the Rust compiler service for bufnr.
 --- @param bufnr integer
 --- @param kind '"full"'|'"preview"'|nil
@@ -2707,7 +2714,7 @@ end
 --- @param bufnr integer
 --- @param payload table|nil
 --- @param reason string
-local function mark_service_payload_failed(bufnr, payload, reason)
+mark_service_payload_failed = function(bufnr, payload, reason)
   if payload == nil then
     return
   end
@@ -2731,7 +2738,7 @@ end
 --- @param bufnr integer
 --- @param request_id string|nil
 --- @param reason string
-local function mark_inflight_service_request_failed(bufnr, request_id, reason)
+mark_inflight_service_request_failed = function(bufnr, request_id, reason)
   if request_id == nil then
     return
   end
@@ -3040,10 +3047,7 @@ function M.render_request_via_service(bufnr, request)
     fail_full_service_request(bufnr, early_meta, "compiler service unavailable")
     return
   end
-  -- Start the preview backend with the same buffer/project lifetime so the
-  -- first cursor preview does not pay process startup while full rendering is
-  -- busy. It compiles only preview requests, so it cannot block full updates.
-  local preview_service = M.ensure_compiler_service(bufnr, "preview")
+  local preview_service = nil
 
   local project_scope = require("typst-concealer.project-scope").resolve(bufnr, "full")
   local main = require("typst-concealer")
@@ -3051,6 +3055,10 @@ function M.render_request_via_service(bufnr, request)
   local prelude_chunks = snapshot_full_context_preludes(bufnr)
   local preamble_include_line = resolve_preamble_include_line(bufnr, project_scope.effective_root, "full")
   local spec = build_full_service_spec(request, project_scope, prelude_chunks, preamble_include_line, config)
+  -- Start the preview backend with the same buffer/project lifetime so the
+  -- first cursor preview does not pay process startup while full rendering is
+  -- busy. It compiles only preview requests, so it cannot block full updates.
+  preview_service = M.ensure_compiler_service(bufnr, "preview")
   service.cache_dir = spec.output_dir
   state.service_cache_dirs = state.service_cache_dirs or {}
   state.service_cache_dirs[bufnr] = spec.output_dir
@@ -3067,6 +3075,7 @@ function M.render_request_via_service(bufnr, request)
   current_request.effective_root = project_scope.effective_root
   current_request.generated_input_path = spec.generated_input_path
   current_request.generated_context_path = spec.generated_context_path
+  current_request.service_engine = "typst"
 
   local old = state.active_service_requests and state.active_service_requests[bufnr]
   if old ~= nil then
@@ -3181,13 +3190,18 @@ function M.render_preview_tail_via_service(bufnr, item)
     return
   end
 
+  local prepare = nil
+  if spec.sidecar_path ~= nil then
+    prepare = make_preview_sidecar_prepare(service, spec.sidecar_path, spec.sidecar_text)
+  end
+
   local sent = send_or_queue_service_payload(bufnr, service, {
     kind = "preview",
     request_id = request_id,
     message = msg,
     meta = preview_meta,
     preview_context_hash = spec.context_hash,
-    prepare = make_preview_sidecar_prepare(service, spec.sidecar_path, spec.sidecar_text),
+    prepare = prepare,
     on_prepare_failed = function()
       local active = state.active_preview_service_requests and state.active_preview_service_requests[bufnr]
       if active ~= nil and active.request_id == request_id then

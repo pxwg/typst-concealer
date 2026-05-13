@@ -126,6 +126,7 @@ local function with_stubbed_uv(fn, opts)
       args = vim.deepcopy(opts.args),
       stdio = opts.stdio,
       handle = handle,
+      on_exit = _on_exit,
     }
     return handle
   end
@@ -164,6 +165,7 @@ local function with_stubbed_extmark(fn)
     concealed = {},
     unconcealed = {},
     virtual = {},
+    flushed = 0,
   }
 
   package.loaded["typst-concealer.extmark"] = {
@@ -238,7 +240,9 @@ local function with_stubbed_extmark(fn)
       }
       return id
     end,
-    flush_terminal_data = function() end,
+    flush_terminal_data = function()
+      calls.flushed = calls.flushed + 1
+    end,
   }
 
   local ok_run, result = pcall(fn, calls)
@@ -247,6 +251,157 @@ local function with_stubbed_extmark(fn)
     error(result)
   end
   return result
+end
+
+local function test_extmark_flushes_kitty_graphics_to_stdout()
+  reset_modules()
+  local original_new_tty = vim.loop.new_tty
+  local original_ui_send = vim.api.nvim_ui_send
+  local stdout_writes = {}
+  local ui_writes = {}
+
+  vim.loop.new_tty = function()
+    return {
+      write = function(_, data)
+        stdout_writes[#stdout_writes + 1] = data
+      end,
+    }
+  end
+  vim.api.nvim_ui_send = function(data)
+    ui_writes[#ui_writes + 1] = data
+  end
+
+  local ok_run, err = pcall(function()
+    local extmark = require("typst-concealer.extmark")
+    extmark.create_image("/tmp/kitty-placeholder.png", 42, 3, 2)
+    extmark.flush_terminal_data()
+  end)
+
+  package.loaded["typst-concealer.extmark"] = nil
+  vim.loop.new_tty = original_new_tty
+  vim.api.nvim_ui_send = original_ui_send
+
+  if not ok_run then
+    error(err)
+  end
+  assert_eq(#ui_writes, 0, "kitty graphics payload should not use nvim_ui_send")
+  assert_eq(#stdout_writes, 1, "kitty graphics payload should flush to stdout")
+  assert_truthy(
+    stdout_writes[1]:find("\27_G", 1, true) ~= nil,
+    "kitty graphics payload should contain an escape sequence"
+  )
+end
+
+local function test_render_buf_suppresses_stale_parser_warning()
+  fresh_state()
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_name(bufnr, "parser-delay.typ")
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "$x$" })
+  vim.bo[bufnr].filetype = "typst"
+
+  local render_calls = 0
+  package.loaded["typst-concealer"] = {
+    _enabled_buffers = { [bufnr] = true },
+    is_render_allowed = function()
+      return true
+    end,
+    config = {
+      conceal_in_normal = false,
+    },
+  }
+  package.loaded["typst-concealer.machine.runtime"] = {
+    reconcile_visible_overlay_bindings = function()
+      return 0
+    end,
+    render_buf = function()
+      render_calls = render_calls + 1
+    end,
+  }
+
+  local original_get_parser = vim.treesitter.get_parser
+  local original_defer_fn = vim.defer_fn
+  local original_schedule = vim.schedule
+  local original_notify = vim.notify
+  local parser_ready = false
+  local scheduled = {}
+  local notifications = {}
+
+  vim.treesitter.get_parser = function(_, lang)
+    if lang == "typst" and parser_ready then
+      return {
+        parse = function()
+          return {}
+        end,
+      }
+    end
+    return nil, "parser delayed"
+  end
+  vim.defer_fn = function() end
+  vim.schedule = function(cb)
+    scheduled[#scheduled + 1] = cb
+  end
+  vim.notify = function(message, level)
+    notifications[#notifications + 1] = { message = message, level = level }
+  end
+
+  local ok_run, err = pcall(function()
+    local plan = require("typst-concealer.plan")
+    for _ = 1, 21 do
+      plan.render_buf(bufnr)
+    end
+    parser_ready = true
+    for _, cb in ipairs(scheduled) do
+      cb()
+    end
+    assert_eq(#notifications, 0, "parser retry should not warn after the parser becomes available")
+    assert_eq(render_calls, 1, "parser retry should kick a render once the parser becomes available")
+  end)
+
+  vim.treesitter.get_parser = original_get_parser
+  vim.defer_fn = original_defer_fn
+  vim.schedule = original_schedule
+  vim.notify = original_notify
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+
+  if not ok_run then
+    error(err)
+  end
+end
+
+local function test_supports_only_typst_buffers()
+  reset_modules()
+  local concealer = require("typst-concealer")
+
+  local typst_bufnr = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(typst_bufnr, "only-typst.typ")
+  vim.bo[typst_bufnr].filetype = "typst"
+  assert_eq(concealer.source_kind_for_bufnr(typst_bufnr), "typst", "typst buffers should use typst source rules")
+  assert_eq(concealer.is_supported_bufnr(typst_bufnr), true, "typst buffers should be supported")
+
+  local markdown_bufnr = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(markdown_bufnr, "not-owned.md")
+  vim.bo[markdown_bufnr].filetype = "markdown"
+  assert_eq(concealer.source_kind_for_bufnr(markdown_bufnr), nil, "markdown buffers should not be owned")
+  assert_eq(concealer.is_supported_bufnr(markdown_bufnr), false, "markdown buffers should not be supported")
+
+  local alma_bufnr = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(alma_bufnr, "alma://thread/test")
+  vim.bo[alma_bufnr].buftype = "nofile"
+  vim.bo[alma_bufnr].filetype = "alma"
+  assert_eq(concealer.source_kind_for_bufnr(alma_bufnr), nil, "alma buffers should not use markdown rules")
+  assert_eq(concealer.is_supported_bufnr(alma_bufnr), false, "alma buffers should not be supported")
+
+  vim.api.nvim_buf_delete(typst_bufnr, { force = true })
+  vim.api.nvim_buf_delete(markdown_bufnr, { force = true })
+  vim.api.nvim_buf_delete(alma_bufnr, { force = true })
+end
+
+_G.__typst_concealer_regression_tests = function()
+  test_extmark_flushes_kitty_graphics_to_stdout()
+  ok("ok extmark flushes kitty graphics through stdout")
+  test_render_buf_suppresses_stale_parser_warning()
+  ok("ok render_buf suppresses stale parser warnings")
 end
 
 local function make_render_item(fields)
@@ -939,7 +1094,7 @@ local function make_service_response_harness(name, opts, fn)
       session = session_mod,
       spawned = spawned,
       full_stdout = spawned[1].stdio[2],
-      preview_stdout = spawned[2].stdio[2],
+      preview_stdout = spawned[2] and spawned[2].stdio[2] or nil,
     })
     session_mod.stop_compiler_service(bufnr)
   end, opts.uv_opts)
@@ -1255,6 +1410,22 @@ local function test_service_write_failure_cleans_active_request()
       ctx.state.machine_state.overlays[ctx.request.jobs[1].overlay_id],
       nil,
       "stdin write failure should GC candidate overlay"
+    )
+  end)
+end
+
+local function test_service_exit_cleans_active_request()
+  make_service_response_harness("service-exit", {}, function(ctx)
+    assert_truthy(ctx.spawned[1].on_exit ~= nil, "stubbed service should expose exit callback")
+    ctx.spawned[1].on_exit(1, 0)
+    vim.wait(100, function()
+      return ctx.state.active_service_requests[ctx.bufnr] == nil
+    end)
+    assert_eq(ctx.state.active_service_requests[ctx.bufnr], nil, "service exit should clear active meta")
+    assert_eq(
+      ctx.state.machine_state.overlays[ctx.request.jobs[1].overlay_id],
+      nil,
+      "service exit should GC candidate overlay"
     )
   end)
 end
@@ -3510,6 +3681,109 @@ local function test_extmark_conceal_preserves_source_under_cursor()
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
+local function test_extmark_collapses_wrapping_single_line_block_source()
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+      block_padding_cols = 0,
+    },
+  }
+
+  vim.o.columns = 40
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  local line = "$$\\frac{1}{2}\\Delta |\\nabla f|^2 = |\\nabla^2 f|^2 + \\operatorname{Ric}(\\nabla f,\\nabla f).$$"
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { line, "after" })
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+
+  local extmark = require("typst-concealer.extmark")
+  local image_id = 1302
+  local range = { 0, 0, 0, #line }
+  local semantics = { display_kind = "block", constraint_kind = "intrinsic", source_kind = "math" }
+  local extmark_id = extmark.place_render_extmark(bufnr, image_id, range, nil, true, semantics)
+  local item = {
+    bufnr = bufnr,
+    image_id = image_id,
+    extmark_id = extmark_id,
+    range = range,
+    display_range = range,
+    node_type = "math",
+    semantics = semantics,
+  }
+  state.image_id_to_extmark[image_id] = extmark_id
+  state.item_by_image_id[image_id] = item
+
+  extmark.conceal_for_image_id(bufnr, image_id, 30, 2, 1)
+
+  local bs = state.get_buf_state(bufnr)
+  local mm = bs.multiline_marks[extmark_id]
+  assert_truthy(mm ~= nil and mm.is_block_carrier == true, "single-line block math should use block carrier")
+  local carrier = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, mm.carrier_id, { details = true })
+  assert_eq(carrier[3].virt_text, nil, "single-line block math should not place image rows on source text")
+  assert_eq(#(carrier[3].virt_lines or {}), 2, "single-line block math should render all rows as virtual lines")
+  assert_eq(carrier[3].virt_lines_above, true, "single-line block math should render above the collapsed source line")
+  assert_eq(#(mm.tail_ids or {}), 1, "single-line block math should collapse the wrapped source line")
+  local line_conceal = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, mm.tail_ids[1], { details = true })
+  assert_eq(line_conceal[3].conceal_lines, "", "single-line block source should be hidden with conceal_lines")
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_extmark_scales_wide_block_images_to_window_width()
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+      block_padding_cols = 0,
+    },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  local line = "$$\\Delta |\\nabla f|^2 = |\\nabla^2 f|^2 + Ric(\\nabla f,\\nabla f).$$"
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { line, "after" })
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+
+  local extmark = require("typst-concealer.extmark")
+  local image_id = 1304
+  local range = { 0, 0, 0, #line }
+  local semantics = { display_kind = "block", constraint_kind = "intrinsic", source_kind = "math" }
+  local extmark_id = extmark.place_render_extmark(bufnr, image_id, range, nil, true, semantics)
+  local item = {
+    bufnr = bufnr,
+    image_id = image_id,
+    extmark_id = extmark_id,
+    range = range,
+    display_range = range,
+    node_type = "math",
+    semantics = semantics,
+  }
+  state.image_id_to_extmark[image_id] = extmark_id
+  state.item_by_image_id[image_id] = item
+
+  local win_cols = vim.api.nvim_win_get_width(0)
+  local natural_cols = win_cols + 30
+  local natural_rows = 4
+  local expected_rows = math.max(1, math.ceil(natural_rows * win_cols / natural_cols))
+
+  extmark.create_image("/tmp/typst-concealer-wide-block.png", image_id, natural_cols, natural_rows)
+  extmark.conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, 1)
+
+  assert_eq(item.display_cols, win_cols, "wide block image should be placed at window width")
+  assert_eq(item.display_rows, expected_rows, "wide block image rows should be scaled with width")
+
+  local bs = state.get_buf_state(bufnr)
+  local mm = bs.multiline_marks[extmark_id]
+  local carrier = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, mm.carrier_id, { details = true })
+  local first_line = carrier[3].virt_lines and carrier[3].virt_lines[1] or {}
+  local image_chunk = first_line[#first_line] and first_line[#first_line][1] or ""
+  assert_eq(vim.fn.strdisplaywidth(image_chunk), win_cols, "wide block placeholder row should not exceed window width")
+
+  extmark.flush_terminal_data()
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
 local function test_cursor_visibility_preserves_insert_math_after_stale_range()
   fresh_state()
   package.loaded["typst-concealer"] = {
@@ -3779,6 +4053,191 @@ local function test_machine_runtime_reconciles_visible_overlay_binding_from_extm
   )
 end
 
+local function test_machine_runtime_refreshes_visible_overlays_without_render_request()
+  local state = fresh_state()
+  local runtime = require("typst-concealer.machine.runtime")
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_name(bufnr, "visible-refresh.typ")
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "$x$", "plain", "$y$" })
+  package.loaded["typst-concealer"] = {
+    _enabled_buffers = { [bufnr] = true },
+    is_render_allowed = function()
+      return true
+    end,
+    config = {
+      conceal_in_normal = false,
+    },
+  }
+
+  state.machine_state.buffers[bufnr] = {
+    bufnr = bufnr,
+    project_scope_id = "p",
+    buffer_version = 1,
+    layout_version = 80,
+    nodes = {
+      ["node:visible"] = {
+        node_id = "node:visible",
+        bufnr = bufnr,
+        project_scope_id = "p",
+        item_idx = 1,
+        node_type = "math",
+        source_range = { 0, 0, 0, 3 },
+        display_range = { 0, 0, 0, 3 },
+        source_text = "$x$",
+        prelude_count = 0,
+        semantics = { display_kind = "inline", constraint_kind = "intrinsic" },
+        status = "stable",
+        visible_overlay_id = "overlay:visible",
+      },
+    },
+    node_order = { "node:visible" },
+  }
+  state.machine_state.overlays["overlay:visible"] = {
+    overlay_id = "overlay:visible",
+    owner_node_id = "node:visible",
+    owner_bufnr = bufnr,
+    owner_project_scope_id = "p",
+    request_id = "request:1",
+    image_id = 1400,
+    extmark_id = 1500,
+    page_path = "/tmp/visible-refresh.png",
+    page_stamp = "stamp:1",
+    natural_cols = 2,
+    natural_rows = 1,
+    source_rows = 1,
+    status = "visible",
+    buffer_version = 1,
+    layout_version = 80,
+  }
+
+  with_stubbed_extmark(function(calls)
+    local refreshed = runtime.refresh_visible_overlays(bufnr, { margin = 0 })
+    assert_eq(refreshed, 1, "visible refresh should process visible rendered overlays")
+    assert_eq(#calls.swapped, 1, "visible refresh should rebind the visible extmark")
+    assert_eq(#calls.created, 1, "newly visible overlay should be re-uploaded once")
+    assert_eq(calls.flushed, 1, "visible refresh should flush uploaded image data")
+    assert_eq(#calls.concealed, 1, "visible refresh should rewrite image placeholders")
+
+    refreshed = runtime.refresh_visible_overlays(bufnr, { margin = 0 })
+    assert_eq(refreshed, 1, "visible refresh should remain lightweight on repeated calls")
+    assert_eq(#calls.created, 1, "unchanged visible overlay should not re-upload every cursor move")
+    assert_eq(calls.flushed, 1, "visible refresh should not flush when nothing was uploaded")
+    assert_eq(#calls.concealed, 2, "unchanged visible overlay should still rewrite placeholders")
+  end)
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_machine_runtime_scroll_refresh_reuploads_blocks_only()
+  local state = fresh_state()
+  local runtime = require("typst-concealer.machine.runtime")
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_name(bufnr, "block-scroll-refresh.typ")
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "$ x $", "$y$" })
+  package.loaded["typst-concealer"] = {
+    _enabled_buffers = { [bufnr] = true },
+    is_render_allowed = function()
+      return true
+    end,
+    config = {
+      conceal_in_normal = false,
+    },
+  }
+
+  state.machine_state.buffers[bufnr] = {
+    bufnr = bufnr,
+    project_scope_id = "p",
+    buffer_version = 1,
+    layout_version = 80,
+    nodes = {
+      ["node:block"] = {
+        node_id = "node:block",
+        bufnr = bufnr,
+        project_scope_id = "p",
+        item_idx = 1,
+        node_type = "math",
+        source_range = { 0, 0, 0, 5 },
+        display_range = { 0, 0, 0, 5 },
+        source_text = "$ x $",
+        prelude_count = 0,
+        semantics = { display_kind = "block", constraint_kind = "intrinsic" },
+        status = "stable",
+        visible_overlay_id = "overlay:block",
+      },
+      ["node:inline"] = {
+        node_id = "node:inline",
+        bufnr = bufnr,
+        project_scope_id = "p",
+        item_idx = 2,
+        node_type = "math",
+        source_range = { 1, 0, 1, 3 },
+        display_range = { 1, 0, 1, 3 },
+        source_text = "$y$",
+        prelude_count = 0,
+        semantics = { display_kind = "inline", constraint_kind = "intrinsic" },
+        status = "stable",
+        visible_overlay_id = "overlay:inline",
+      },
+    },
+    node_order = { "node:block", "node:inline" },
+  }
+  state.machine_state.overlays["overlay:block"] = {
+    overlay_id = "overlay:block",
+    owner_node_id = "node:block",
+    owner_bufnr = bufnr,
+    owner_project_scope_id = "p",
+    request_id = "request:1",
+    image_id = 1600,
+    extmark_id = 1700,
+    page_path = "/tmp/block-scroll-refresh.png",
+    page_stamp = "stamp:block",
+    natural_cols = 2,
+    natural_rows = 1,
+    source_rows = 1,
+    status = "visible",
+    buffer_version = 1,
+    layout_version = 80,
+  }
+  state.machine_state.overlays["overlay:inline"] = {
+    overlay_id = "overlay:inline",
+    owner_node_id = "node:inline",
+    owner_bufnr = bufnr,
+    owner_project_scope_id = "p",
+    request_id = "request:1",
+    image_id = 1601,
+    extmark_id = 1701,
+    page_path = "/tmp/inline-scroll-refresh.png",
+    page_stamp = "stamp:inline",
+    natural_cols = 1,
+    natural_rows = 1,
+    source_rows = 1,
+    status = "visible",
+    buffer_version = 1,
+    layout_version = 80,
+  }
+
+  with_stubbed_extmark(function(calls)
+    runtime.refresh_visible_overlays(bufnr, { margin = 0 })
+    assert_eq(#calls.created, 2, "first visible refresh uploads both visible images")
+    assert_eq(calls.flushed, 1, "initial visible refresh should flush uploaded images")
+
+    runtime.refresh_visible_overlays(bufnr, { margin = 0, force_reupload_blocks = true })
+    assert_eq(#calls.created, 3, "scroll refresh should reupload the block image")
+    assert_eq(calls.flushed, 2, "scroll refresh should flush reuploaded block images")
+    assert_eq(calls.created[3].image_id, 1600, "scroll refresh should not reupload unchanged inline images")
+
+    runtime.refresh_visible_overlays(bufnr, { margin = 0, skip_blocks = true })
+    assert_eq(#calls.created, 3, "cursor refresh should not reupload skipped block images")
+    assert_eq(calls.flushed, 2, "cursor refresh should not flush when no images were uploaded")
+    assert_eq(#calls.swapped, 5, "cursor refresh should only rebind the inline image")
+    assert_eq(calls.swapped[5].image_id, 1601, "cursor refresh should skip block extmark rebuilds")
+  end)
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
 local function test_machine_resources_share_legacy_allocation_pool()
   local state = fresh_state()
   state.pid = 700
@@ -3898,127 +4357,179 @@ local function test_commit_plan_cleans_removed_items_immediately()
   end)
 end
 
+local tests = {
+  { test_supports_only_typst_buffers, "ok only typst buffers are supported" },
+  { test_root_prefers_cwd_fallback, "ok root fallback uses cwd" },
+  { test_get_root_overrides_fallback, "ok get_root overrides root base" },
+  { test_session_render_request_tracks_current_request, "ok session tracks machine render requests" },
+  { test_session_render_request_via_service_writes_json, "ok session writes compiler service requests" },
+  { test_service_validates_page_contract, "ok service validates page contract" },
+  { test_service_success_clears_active_meta, "ok service success clears active meta" },
+  {
+    _G.test_service_error_diagnostics_clear_candidate_placeholder,
+    "ok service error diagnostics clear candidate placeholder",
+  },
+  {
+    test_service_one_dirty_slot_keeps_full_shape_and_commits_once,
+    "ok service one dirty slot keeps full shape and commits once",
+  },
+  { test_service_ignores_context_leading_pages, "ok service ignores context leading pages" },
+  { test_service_stale_response_cleans_candidates, "ok service stale responses clean candidates" },
+  { test_service_write_failure_cleans_active_request, "ok service write failure cleans active request" },
+  { test_service_exit_cleans_active_request, "ok service exit cleans active request" },
+  { test_service_spawn_failure_cleans_candidate, "ok service spawn failure cleans candidate" },
+  { test_service_diagnostics_mapping, "ok service diagnostics mapping" },
+  { test_preview_service_routing_and_stale_cleanup, "ok preview service routing and stale cleanup" },
+  { test_preview_service_uses_last_page_after_context, "ok preview service uses last page after context" },
+  {
+    test_live_preview_keeps_old_highlight_until_replacement_commits,
+    "ok live preview keeps old highlight until replacement commits",
+  },
+  { test_service_artifact_cleanup_preserves_live_paths, "ok service artifact cleanup preserves live paths" },
+  { test_wrapper_cache_tracks_root_signature, "ok wrapper cache keys include root signature" },
+  { test_inline_wrapper_keeps_single_row_width_intrinsic, "ok inline wrapper keeps single-row width intrinsic" },
+  { test_wrapper_defaults_missing_semantics_to_inline, "ok wrapper defaults missing semantics to inline" },
+  { test_remote_urls_do_not_rewrite_against_root, "ok remote urls bypass root rewrite" },
+  { test_named_path_args_rewrite_local_paths, "ok named path args rewrite local paths" },
+  { test_named_path_args_preserve_remote_urls, "ok named path args preserve remote urls" },
+  {
+    test_machine_reducer_enforces_request_identity_and_delayed_retire,
+    "ok machine reducer enforces request identity and delayed retire",
+  },
+  {
+    test_machine_reducer_rebinds_stable_visible_overlay_on_precise_dirty_range,
+    "ok machine reducer rebinds stable visible overlays on precise dirty ranges",
+  },
+  {
+    test_machine_reducer_rebinds_when_dirty_range_hits_old_binding_after_shift,
+    "ok machine reducer rebinds visible overlays when old binding range is dirtied after shift",
+  },
+  {
+    test_machine_reducer_rebinds_visible_overlay_after_shift_even_if_binding_was_reconciled,
+    "ok machine reducer rebinds shifted visible overlays even after binding reconcile",
+  },
+  {
+    test_machine_reducer_rebinds_when_reconciled_binding_disagrees_with_scan,
+    "ok machine reducer rebinds visible overlays when reconciled binding disagrees with scan",
+  },
+  {
+    test_machine_reducer_does_not_rebind_stable_overlay_for_disjoint_dirty_range,
+    "ok machine reducer skips disjoint display binding changes",
+  },
+  {
+    test_machine_reducer_retires_deleted_only_formula_on_render_boundary,
+    "ok machine reducer retires deleted only formula on render boundary",
+  },
+  {
+    test_machine_reducer_keeps_overlapping_orphan_until_replacement_commit,
+    "ok machine reducer keeps overlapping orphan until replacement commit",
+  },
+  {
+    test_machine_reducer_reuses_range_identity_without_stable_key,
+    "ok machine reducer reuses range identity without stable key",
+  },
+  { test_machine_reducer_identity_adjacent_formula_edit, "ok machine reducer identity adjacent formula edit" },
+  {
+    test_machine_reducer_identity_deletion_with_upward_shift,
+    "ok machine reducer identity deletion with upward shift",
+  },
+  {
+    test_machine_reducer_identity_insertion_between_formulas,
+    "ok machine reducer identity insertion between formulas",
+  },
+  {
+    test_machine_reducer_identity_repeated_identical_formulas,
+    "ok machine reducer identity repeated identical formulas",
+  },
+  {
+    test_machine_reducer_identity_repeated_identical_formulas_shift_down_together,
+    "ok machine reducer identity repeated identical formulas shift down together",
+  },
+  {
+    test_machine_reducer_stable_slots_include_clean_pages_for_one_dirty_node,
+    "ok machine reducer stable slots include clean pages for one dirty node",
+  },
+  {
+    test_machine_reducer_stable_slots_append_insertions_without_shifting_pages,
+    "ok machine reducer stable slots append insertions without shifting pages",
+  },
+  {
+    test_machine_reducer_stable_slots_tombstone_deletions_without_shifting_pages,
+    "ok machine reducer stable slots tombstone deletions without shifting pages",
+  },
+  {
+    test_machine_reducer_retires_overlapping_orphans_after_commit,
+    "ok machine reducer retires overlapping orphans after commit",
+  },
+  {
+    test_machine_reducer_cleans_orphans_covered_by_visible_nodes,
+    "ok machine reducer cleans orphans covered by visible nodes",
+  },
+  { test_machine_reducer_abandons_idle_request_candidates, "ok machine reducer abandons idle request candidates" },
+  {
+    test_machine_reducer_failed_request_cleans_candidates_and_active_id,
+    "ok machine reducer failed request cleans candidates",
+  },
+  { test_machine_runtime_rebuilds_compat_read_model, "ok machine runtime rebuilds compat read model" },
+  {
+    test_machine_runtime_rebinds_overlay_without_terminal_image_refresh,
+    "ok machine runtime rebinds overlays without terminal image refresh",
+  },
+  {
+    test_machine_runtime_places_cursor_overlay_unconcealed,
+    "ok machine runtime keeps cursor overlay placeholders unconcealed",
+  },
+  { _G.__typst_concealer_regression_tests },
+  { test_extmark_conceal_preserves_source_under_cursor, "ok extmark conceal keeps cursor source visible" },
+  {
+    test_extmark_collapses_wrapping_single_line_block_source,
+    "ok extmark collapses wrapping single-line block source",
+  },
+  {
+    test_extmark_scales_wide_block_images_to_window_width,
+    "ok extmark scales wide block images to window width",
+  },
+  {
+    test_cursor_visibility_preserves_insert_math_after_stale_range,
+    "ok cursor visibility keeps edited insert math source visible",
+  },
+  {
+    test_cursor_visibility_does_not_expand_to_adjacent_formula,
+    "ok cursor visibility does not expand across adjacent formulas",
+  },
+  { test_machine_runtime_builds_watch_render_job, "ok machine runtime builds watch render job" },
+  { test_machine_runtime_resets_buffer_snapshot, "ok machine runtime resets buffer snapshot" },
+  { test_machine_runtime_retire_removes_overlay_entry, "ok machine runtime retire removes overlay entry" },
+  {
+    test_machine_runtime_reset_buffer_releases_candidate_resources,
+    "ok machine runtime reset releases candidate resources",
+  },
+  { test_machine_runtime_tracks_ui_state, "ok machine runtime tracks ui state" },
+  {
+    test_machine_runtime_reconciles_visible_overlay_binding_from_extmark,
+    "ok machine runtime reconciles visible overlay bindings from extmarks",
+  },
+  {
+    test_machine_runtime_refreshes_visible_overlays_without_render_request,
+    "ok machine runtime refreshes visible overlays without render requests",
+  },
+  {
+    test_machine_runtime_scroll_refresh_reuploads_blocks_only,
+    "ok machine runtime scroll refresh reuploads blocks only",
+  },
+  { test_machine_resources_share_legacy_allocation_pool, "ok machine resources share legacy allocation pool" },
+  { test_commit_plan_reuses_stable_render_for_same_source, "ok commit_plan reuses same-source stable renders" },
+  { test_commit_plan_does_not_reuse_render_for_changed_source, "ok commit_plan rejects changed-source stale renders" },
+  { test_commit_plan_cleans_removed_items_immediately, "ok commit_plan cleans removed items immediately" },
+}
+
 local function main()
-  test_root_prefers_cwd_fallback()
-  ok("ok root fallback uses cwd")
-  test_get_root_overrides_fallback()
-  ok("ok get_root overrides root base")
-  test_session_render_request_tracks_current_request()
-  ok("ok session tracks machine render requests")
-  test_session_render_request_via_service_writes_json()
-  ok("ok session writes compiler service requests")
-  test_service_validates_page_contract()
-  ok("ok service validates page contract")
-  test_service_success_clears_active_meta()
-  ok("ok service success clears active meta")
-  _G.test_service_error_diagnostics_clear_candidate_placeholder()
-  ok("ok service error diagnostics clear candidate placeholder")
-  test_service_one_dirty_slot_keeps_full_shape_and_commits_once()
-  ok("ok service one dirty slot keeps full shape and commits once")
-  test_service_ignores_context_leading_pages()
-  ok("ok service ignores context leading pages")
-  test_service_stale_response_cleans_candidates()
-  ok("ok service stale responses clean candidates")
-  test_service_write_failure_cleans_active_request()
-  ok("ok service write failure cleans active request")
-  test_service_spawn_failure_cleans_candidate()
-  ok("ok service spawn failure cleans candidate")
-  test_service_diagnostics_mapping()
-  ok("ok service diagnostics mapping")
-  test_preview_service_routing_and_stale_cleanup()
-  ok("ok preview service routing and stale cleanup")
-  test_preview_service_uses_last_page_after_context()
-  ok("ok preview service uses last page after context")
-  test_live_preview_keeps_old_highlight_until_replacement_commits()
-  ok("ok live preview keeps old highlight until replacement commits")
-  test_service_artifact_cleanup_preserves_live_paths()
-  ok("ok service artifact cleanup preserves live paths")
-  test_wrapper_cache_tracks_root_signature()
-  ok("ok wrapper cache keys include root signature")
-  test_inline_wrapper_keeps_single_row_width_intrinsic()
-  ok("ok inline wrapper keeps single-row width intrinsic")
-  test_wrapper_defaults_missing_semantics_to_inline()
-  ok("ok wrapper defaults missing semantics to inline")
-  test_remote_urls_do_not_rewrite_against_root()
-  ok("ok remote urls bypass root rewrite")
-  test_named_path_args_rewrite_local_paths()
-  ok("ok named path args rewrite local paths")
-  test_named_path_args_preserve_remote_urls()
-  ok("ok named path args preserve remote urls")
-  test_machine_reducer_enforces_request_identity_and_delayed_retire()
-  ok("ok machine reducer enforces request identity and delayed retire")
-  test_machine_reducer_rebinds_stable_visible_overlay_on_precise_dirty_range()
-  ok("ok machine reducer rebinds stable visible overlays on precise dirty ranges")
-  test_machine_reducer_rebinds_when_dirty_range_hits_old_binding_after_shift()
-  ok("ok machine reducer rebinds visible overlays when old binding range is dirtied after shift")
-  test_machine_reducer_rebinds_visible_overlay_after_shift_even_if_binding_was_reconciled()
-  ok("ok machine reducer rebinds shifted visible overlays even after binding reconcile")
-  test_machine_reducer_rebinds_when_reconciled_binding_disagrees_with_scan()
-  ok("ok machine reducer rebinds visible overlays when reconciled binding disagrees with scan")
-  test_machine_reducer_does_not_rebind_stable_overlay_for_disjoint_dirty_range()
-  ok("ok machine reducer skips disjoint display binding changes")
-  test_machine_reducer_retires_deleted_only_formula_on_render_boundary()
-  ok("ok machine reducer retires deleted only formula on render boundary")
-  test_machine_reducer_keeps_overlapping_orphan_until_replacement_commit()
-  ok("ok machine reducer keeps overlapping orphan until replacement commit")
-  test_machine_reducer_reuses_range_identity_without_stable_key()
-  ok("ok machine reducer reuses range identity without stable key")
-  test_machine_reducer_identity_adjacent_formula_edit()
-  ok("ok machine reducer identity adjacent formula edit")
-  test_machine_reducer_identity_deletion_with_upward_shift()
-  ok("ok machine reducer identity deletion with upward shift")
-  test_machine_reducer_identity_insertion_between_formulas()
-  ok("ok machine reducer identity insertion between formulas")
-  test_machine_reducer_identity_repeated_identical_formulas()
-  ok("ok machine reducer identity repeated identical formulas")
-  test_machine_reducer_identity_repeated_identical_formulas_shift_down_together()
-  ok("ok machine reducer identity repeated identical formulas shift down together")
-  test_machine_reducer_stable_slots_include_clean_pages_for_one_dirty_node()
-  ok("ok machine reducer stable slots include clean pages for one dirty node")
-  test_machine_reducer_stable_slots_append_insertions_without_shifting_pages()
-  ok("ok machine reducer stable slots append insertions without shifting pages")
-  test_machine_reducer_stable_slots_tombstone_deletions_without_shifting_pages()
-  ok("ok machine reducer stable slots tombstone deletions without shifting pages")
-  test_machine_reducer_retires_overlapping_orphans_after_commit()
-  ok("ok machine reducer retires overlapping orphans after commit")
-  test_machine_reducer_cleans_orphans_covered_by_visible_nodes()
-  ok("ok machine reducer cleans orphans covered by visible nodes")
-  test_machine_reducer_abandons_idle_request_candidates()
-  ok("ok machine reducer abandons idle request candidates")
-  test_machine_reducer_failed_request_cleans_candidates_and_active_id()
-  ok("ok machine reducer failed request cleans candidates")
-  test_machine_runtime_rebuilds_compat_read_model()
-  ok("ok machine runtime rebuilds compat read model")
-  test_machine_runtime_rebinds_overlay_without_terminal_image_refresh()
-  ok("ok machine runtime rebinds overlays without terminal image refresh")
-  test_machine_runtime_places_cursor_overlay_unconcealed()
-  ok("ok machine runtime keeps cursor overlay placeholders unconcealed")
-  test_extmark_conceal_preserves_source_under_cursor()
-  ok("ok extmark conceal keeps cursor source visible")
-  test_cursor_visibility_preserves_insert_math_after_stale_range()
-  ok("ok cursor visibility keeps edited insert math source visible")
-  test_cursor_visibility_does_not_expand_to_adjacent_formula()
-  ok("ok cursor visibility does not expand across adjacent formulas")
-  test_machine_runtime_builds_watch_render_job()
-  ok("ok machine runtime builds watch render job")
-  test_machine_runtime_resets_buffer_snapshot()
-  ok("ok machine runtime resets buffer snapshot")
-  test_machine_runtime_retire_removes_overlay_entry()
-  ok("ok machine runtime retire removes overlay entry")
-  test_machine_runtime_reset_buffer_releases_candidate_resources()
-  ok("ok machine runtime reset releases candidate resources")
-  test_machine_runtime_tracks_ui_state()
-  ok("ok machine runtime tracks ui state")
-  test_machine_runtime_reconciles_visible_overlay_binding_from_extmark()
-  ok("ok machine runtime reconciles visible overlay bindings from extmarks")
-  test_machine_resources_share_legacy_allocation_pool()
-  ok("ok machine resources share legacy allocation pool")
-  test_commit_plan_reuses_stable_render_for_same_source()
-  ok("ok commit_plan reuses same-source stable renders")
-  test_commit_plan_does_not_reuse_render_for_changed_source()
-  ok("ok commit_plan rejects changed-source stale renders")
-  test_commit_plan_cleans_removed_items_immediately()
-  ok("ok commit_plan cleans removed items immediately")
+  for _, test in ipairs(tests) do
+    test[1]()
+    if test[2] then
+      ok(test[2])
+    end
+  end
   vim.cmd("qa!")
 end
 

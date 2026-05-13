@@ -23,6 +23,9 @@ local function ranges_equal(a, b)
   return a[1] == b[1] and a[2] == b[2] and a[3] == b[3] and a[4] == b[4]
 end
 
+local concealing_for_cursor
+local dispatch_without_effects
+
 local function ensure_machine_state()
   if state.machine_state == nil then
     state.machine_state = types.initial_state()
@@ -107,6 +110,207 @@ function M.reconcile_visible_overlay_bindings(bufnr)
   return repaired
 end
 
+local function get_window_visible_ranges(bufnr, margin)
+  local ranges = {}
+  for _, winid in ipairs(vim.fn.win_findbuf(bufnr)) do
+    if vim.api.nvim_win_is_valid(winid) then
+      local ok, range = pcall(vim.api.nvim_win_call, winid, function()
+        return {
+          top = math.max(0, vim.fn.line("w0") - 1 - margin),
+          bottom = math.max(0, vim.fn.line("w$") - 1 + margin),
+        }
+      end)
+      if ok and range ~= nil then
+        ranges[#ranges + 1] = range
+      end
+    end
+  end
+  return ranges
+end
+
+local function overlay_screen_range(node, overlay)
+  if node == nil or node.display_range == nil then
+    return nil
+  end
+  local top = node.display_range[1]
+  local bottom = node.display_range[3]
+  if overlay ~= nil and overlay.natural_rows ~= nil then
+    bottom = math.max(bottom, top + math.max(1, overlay.natural_rows) - 1)
+  end
+  return { top = top, bottom = bottom }
+end
+
+local function row_ranges_intersect(a, b)
+  return a ~= nil and b ~= nil and a.top <= b.bottom and b.top <= a.bottom
+end
+
+local function overlay_intersects_any_window(node, overlay, ranges)
+  local overlay_range = overlay_screen_range(node, overlay)
+  for _, range in ipairs(ranges) do
+    if row_ranges_intersect(overlay_range, range) then
+      return true
+    end
+  end
+  return false
+end
+
+--- Re-present already-rendered overlays in visible windows without compiling.
+--- This repairs placeholder/extmark drift caused by scroll redraws while avoiding
+--- the expensive full render path.
+--- @param bufnr integer
+--- @param opts table|nil { margin?: integer, force_reupload?: boolean, force_reupload_blocks?: boolean, skip_blocks?: boolean }
+--- @return integer refreshed
+function M.refresh_visible_overlays(bufnr, opts)
+  opts = opts or {}
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return 0
+  end
+
+  local ok_main, main = pcall(require, "typst-concealer")
+  if not ok_main or main._enabled_buffers[bufnr] ~= true or not main.is_render_allowed(bufnr) then
+    return 0
+  end
+
+  M.reconcile_visible_overlay_bindings(bufnr)
+
+  local machine_state = ensure_machine_state()
+  local buf = machine_state.buffers[bufnr]
+  if buf == nil then
+    return 0
+  end
+
+  local ranges = get_window_visible_ranges(bufnr, opts.margin or 2)
+  if #ranges == 0 then
+    return 0
+  end
+
+  local bs = state.get_buf_state(bufnr)
+  local previous_visible = bs.visible_refresh_visible_overlays or {}
+  local next_visible = {}
+  local refreshed = 0
+  local uploaded = false
+  local extmark = require("typst-concealer.extmark")
+
+  for _, node_id in ipairs(buf.node_order or {}) do
+    local node = buf.nodes[node_id]
+    local overlay = node and node.visible_overlay_id and machine_state.overlays[node.visible_overlay_id] or nil
+    if
+      overlay ~= nil
+      and overlay.status == "visible"
+      and overlay.image_id ~= nil
+      and overlay.page_path ~= nil
+      and overlay.natural_cols ~= nil
+      and overlay.natural_rows ~= nil
+      and overlay_intersects_any_window(node, overlay, ranges)
+    then
+      local is_block = node.semantics ~= nil and node.semantics.display_kind == "block"
+      if opts.skip_blocks == true and is_block then
+        local visible_key = table.concat({
+          tostring(overlay.page_stamp or ""),
+          tostring(overlay.page_path or ""),
+          tostring(overlay.image_id or ""),
+          tostring(overlay.extmark_id or ""),
+        }, "\0")
+        next_visible[overlay.overlay_id] = visible_key
+      else
+        local extmark_id = overlay.extmark_id
+        local concealing = concealing_for_cursor(node)
+        if extmark_id ~= nil then
+          extmark.swap_extmark_to_range(
+            bufnr,
+            overlay.image_id,
+            extmark_id,
+            node.display_range,
+            node.semantics,
+            concealing
+          )
+        else
+          extmark_id = resources.place_overlay_extmark(
+            bufnr,
+            overlay.image_id,
+            node.display_range,
+            nil,
+            concealing,
+            node.semantics
+          )
+        end
+
+        if extmark_id ~= overlay.extmark_id then
+          dispatch_without_effects({
+            type = "overlay_resources_allocated",
+            overlay_id = overlay.overlay_id,
+            image_id = overlay.image_id,
+            extmark_id = extmark_id,
+            binding_buffer_version = overlay.buffer_version,
+            binding_layout_version = overlay.layout_version,
+            binding_display_range = copy_range(node.display_range),
+          })
+          machine_state = ensure_machine_state()
+          overlay = machine_state.overlays[overlay.overlay_id]
+        end
+
+        local item = M.build_compat_item(machine_state, node, overlay)
+        if item ~= nil then
+          item.extmark_id = extmark_id
+          resources.bind_image_id(overlay.image_id, item, extmark_id)
+        end
+
+        local visible_key = table.concat({
+          tostring(overlay.page_stamp or ""),
+          tostring(overlay.page_path or ""),
+          tostring(overlay.image_id or ""),
+          tostring(extmark_id or ""),
+        }, "\0")
+        if
+          opts.force_reupload == true
+          or (opts.force_reupload_blocks == true and is_block)
+          or previous_visible[overlay.overlay_id] ~= visible_key
+        then
+          extmark.create_image(overlay.page_path, overlay.image_id, overlay.natural_cols, overlay.natural_rows)
+          uploaded = true
+        end
+        extmark.conceal_for_image_id(
+          bufnr,
+          overlay.image_id,
+          overlay.natural_cols,
+          overlay.natural_rows,
+          overlay.source_rows or 1
+        )
+        next_visible[overlay.overlay_id] = visible_key
+        refreshed = refreshed + 1
+      end
+    end
+  end
+
+  if uploaded then
+    extmark.flush_terminal_data()
+  end
+  bs.visible_refresh_visible_overlays = next_visible
+  M.rebuild_buffer_read_model(machine_state, bufnr)
+  return refreshed
+end
+
+function M.schedule_visible_overlay_refresh(bufnr, opts)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  opts = opts or {}
+  local bs = state.get_buf_state(bufnr)
+  if bs.visible_refresh_timer == nil or bs.visible_refresh_timer:is_closing() then
+    bs.visible_refresh_timer = vim.uv.new_timer()
+  end
+
+  bs.visible_refresh_timer:stop()
+  bs.visible_refresh_timer:start(
+    opts.immediate == true and 0 or (opts.delay_ms or 16),
+    0,
+    vim.schedule_wrap(function()
+      M.refresh_visible_overlays(bufnr, opts)
+    end)
+  )
+end
+
 function M.set_preview_render_key(bufnr, render_key)
   M.get_ui_buffer(bufnr).preview.render_key = render_key
 end
@@ -183,7 +387,7 @@ local function cursor_item_from_node(node)
   }
 end
 
-local function concealing_for_cursor(node)
+concealing_for_cursor = function(node)
   if cursor_visibility.should_preserve_source_at_cursor(node.bufnr, cursor_item_from_node(node)) then
     return false
   end
@@ -276,7 +480,7 @@ function M.get_state()
   return ensure_machine_state()
 end
 
-local function dispatch_without_effects(event)
+dispatch_without_effects = function(event)
   local new_state = reducer.reduce(ensure_machine_state(), event)
   state.machine_state = new_state
   return new_state

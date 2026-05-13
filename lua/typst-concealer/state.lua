@@ -138,6 +138,7 @@ function M.get_buf_state(bufnr)
         invalidated = false,
         throttle_timer = nil,
       },
+      visible_refresh_timer = nil,
       pending_change = nil,
       change_tracker_attached = false,
     }
@@ -204,6 +205,23 @@ function M.clear_hover_timer(bufnr)
   bs.hover.throttle_timer = nil
 end
 
+--- Stop and release the per-buffer visible-overlay refresh timer if it exists.
+--- @param bufnr integer
+function M.clear_visible_refresh_timer(bufnr)
+  local bs = M.buffers[bufnr]
+  if bs == nil then
+    return
+  end
+  local timer = bs.visible_refresh_timer
+  if timer ~= nil then
+    if not timer:is_closing() then
+      timer:stop()
+      timer:close()
+    end
+    bs.visible_refresh_timer = nil
+  end
+end
+
 --- Stop and release the per-buffer preview sync timer if it exists.
 --- @param bufnr integer
 function M.clear_preview_timer(bufnr)
@@ -230,6 +248,8 @@ function M.clear_preview_timer(bufnr)
     end
     bs._full_render_timer = nil
   end
+
+  M.clear_visible_refresh_timer(bufnr)
 end
 
 --- Release sub-extmarks (ns_id2) attached to extmark_id before reuse or deletion.

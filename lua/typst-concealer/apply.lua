@@ -517,6 +517,7 @@ function M.allocate_preview_item(bufnr, source_item, preview_str, source_str, re
     range = vim.deepcopy(source_item.range),
     str = preview_str,
     source_str = source_str,
+    source_text = source_str,
     prelude_count = source_item.prelude_count,
     node_type = "math",
     semantics = source_item.semantics,

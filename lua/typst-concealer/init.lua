@@ -131,6 +131,36 @@ local function normalize_path(path)
   return vim.fs.normalize(path)
 end
 
+local function source_kind_from_path(path)
+  path = path or ""
+  if path:match("%.typ$") then
+    return "typst"
+  end
+  return nil
+end
+
+function M.source_kind_for_bufnr(bufnr)
+  bufnr = bufnr or vim.fn.bufnr()
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return nil
+  end
+
+  local ft = vim.bo[bufnr].filetype
+  if ft == "typst" then
+    return "typst"
+  end
+
+  return source_kind_from_path(vim.api.nvim_buf_get_name(bufnr))
+end
+
+function M.is_supported_bufnr(bufnr)
+  bufnr = bufnr or vim.fn.bufnr()
+  if not vim.api.nvim_buf_is_valid(bufnr) or not vim.api.nvim_buf_is_loaded(bufnr) then
+    return false
+  end
+  return M.source_kind_for_bufnr(bufnr) ~= nil
+end
+
 local function matches_path_rule(rule, path, bufnr)
   if type(rule) == "string" then
     return path:match(rule) ~= nil
@@ -164,18 +194,14 @@ local function buf_has_visible_window(bufnr)
 end
 
 local function maybe_stop_hidden_full_watch(bufnr)
-  if
-    not vim.api.nvim_buf_is_valid(bufnr)
-    or vim.api.nvim_buf_get_name(bufnr):match(".*%.typ$") == nil
-    or M._enabled_buffers[bufnr] ~= true
-  then
+  if not vim.api.nvim_buf_is_valid(bufnr) or not M.is_supported_bufnr(bufnr) or M._enabled_buffers[bufnr] ~= true then
     return
   end
   if buf_has_visible_window(bufnr) then
     return
   end
   local session = require("typst-concealer.session")
-  if M.config.use_compiler_service then
+  if M.config.use_compiler_service or session.has_compiler_service(bufnr) then
     session.stop_compiler_service(bufnr)
   else
     session.stop_watch_session(bufnr, "full")
@@ -185,7 +211,7 @@ end
 local function maybe_resume_visible_full_watch(bufnr)
   if
     not vim.api.nvim_buf_is_valid(bufnr)
-    or vim.api.nvim_buf_get_name(bufnr):match(".*%.typ$") == nil
+    or not M.is_supported_bufnr(bufnr)
     or M._enabled_buffers[bufnr] ~= true
     or not M.is_render_allowed(bufnr)
     or not buf_has_visible_window(bufnr)

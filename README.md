@@ -21,7 +21,7 @@ Lazy.nvim:
 return {
   "pxwg/typst-concealer",
   opts = {},
-  ft = "typst",
+  ft = { "typst" },
 }
 ```
 
@@ -154,8 +154,8 @@ wrapper/header space jump to a readable generated input file under
 inside the original snippet still jump back to the source buffer, and diagnostics
 from external files keep the external path.
 
-If `use_compiler_service = false`, full overlays and preview fall back to the
-legacy `typst watch` path. Keep `typst` available when using that backend.
+If `use_compiler_service = false`, Typst full overlays and preview fall back to
+the legacy `typst watch` path.
 
 ## Known issues
 - A temporary render workspace is created under `<root-base>/.typst-concealer/`, where `<root-base>` is the directory returned by `get_root` or the fallback root. The plugin removes active session files when disabled, but the directory may remain after crashes and is safe to delete.

@@ -10,6 +10,7 @@ local M = {}
 
 local is_tmux = vim.env.TMUX ~= nil
 local vim_stdout = assert(vim.loop.new_tty(1, false))
+local display_size_for_image
 
 --- Pending terminal data buffer.  All kitty escape sequences are accumulated
 --- here and flushed as a single atomic write via `M.flush_terminal_data()`.
@@ -53,6 +54,13 @@ end
 --- @param width   integer  in terminal cells
 --- @param height  integer  in terminal cells
 function M.create_image(path, image_id, width, height)
+  local item = state.get_item_by_image_id(image_id)
+  width, height = display_size_for_image(item, width, height)
+  if item ~= nil then
+    item.display_cols = width
+    item.display_rows = height
+  end
+
   path = vim.base64.encode(path)
   send_terminal_data(
     encode_kitty_escape("q=2,f=100,t=t,i=" .. image_id .. ";" .. path)
@@ -82,6 +90,38 @@ local function get_win_cols(bufnr)
   return vim.api.nvim_win_get_width(winid ~= -1 and winid or 0)
 end
 
+local function item_display_bufnr(item)
+  if item == nil then
+    return nil
+  end
+  if item.render_target == "float" then
+    return item.target_bufnr or item.bufnr
+  end
+  return item.bufnr
+end
+
+display_size_for_image = function(item, natural_cols, natural_rows)
+  local display_cols = math.max(1, tonumber(natural_cols) or 1)
+  local display_rows = math.max(1, tonumber(natural_rows) or 1)
+  local semantics = item and item.semantics or nil
+  if item == nil or item.render_target == "float" or semantics == nil or semantics.display_kind ~= "block" then
+    return display_cols, display_rows
+  end
+
+  local bufnr = item_display_bufnr(item)
+  if bufnr == nil or not vim.api.nvim_buf_is_valid(bufnr) then
+    return display_cols, display_rows
+  end
+
+  local win_cols = get_win_cols(bufnr)
+  if win_cols <= 0 or display_cols <= win_cols then
+    return display_cols, display_rows
+  end
+
+  local scaled_rows = math.max(1, math.ceil(display_rows * win_cols / display_cols))
+  return win_cols, scaled_rows
+end
+
 --- Returns leading spaces needed to centre an image of natural_cols width.
 --- @param natural_cols integer
 --- @param bufnr        integer
@@ -93,6 +133,8 @@ local function center_padding(natural_cols, bufnr)
   end
   return math.floor((win_width - natural_cols) / 2)
 end
+
+local place_image_extmark
 
 --- Clamp a range to the current buffer contents so extmark updates survive edits.
 --- @param bufnr integer
@@ -172,7 +214,7 @@ end
 --- @param concealing boolean|nil
 --- @param is_block  boolean|nil
 --- @return integer  new extmark_id
-local function place_image_extmark(bufnr, image_id, range, extmark_id, concealing, is_block)
+place_image_extmark = function(bufnr, image_id, range, extmark_id, concealing, is_block)
   local normalized = normalize_range(bufnr, range)
   if normalized == nil then
     return extmark_id
@@ -383,11 +425,32 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
 
     local lines_buf = vim.api.nvim_buf_get_lines(bufnr, row, opts.end_row + 1, false)
     local display_lines = normalize_virt_text_lines(virt_text_data)
+    local source_rows = opts.end_row - row + 1
+
+    if source_rows == 1 then
+      -- A single long source line can still occupy multiple wrapped screen
+      -- rows after character conceal. Collapse the source line completely and
+      -- render the whole block as consecutive virtual lines, matching the
+      -- original Typst block strategy that avoids breaking the kitty grid.
+      mm.carrier_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, row, 0, {
+        virt_lines = display_lines,
+        virt_lines_above = true,
+        virt_lines_overflow = "trunc",
+      })
+      local tid = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, row, 0, {
+        conceal_lines = "",
+        end_row = row,
+      })
+      table.insert(mm.tail_ids, tid)
+      return
+    end
+
     local carrier_vl = {}
     for i = 2, #display_lines do
       carrier_vl[#carrier_vl + 1] = display_lines[i]
     end
 
+    -- Tail conceal: fully hide source rows start_row+1 .. end_row (0 screen lines each)
     mm.carrier_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, row, 0, {
       virt_text = display_lines[1] or { { "", "" } },
       virt_text_pos = "overlay",
@@ -397,8 +460,6 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
       virt_lines = carrier_vl,
     })
 
-    -- Tail conceal: fully hide source rows start_row+1 .. end_row (0 screen lines each)
-    local source_rows = opts.end_row - row + 1
     for i = 2, source_rows do
       local tid = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, row + i - 1, 0, {
         conceal_lines = "",
@@ -486,6 +547,11 @@ local function conceal_extmark_with_image(
     return
   end
   local multiline_extmark_ids = bs.multiline_marks[extmark_id]
+  local display_cols, display_rows = display_size_for_image(item, natural_cols, natural_rows)
+  if item ~= nil then
+    item.display_cols = display_cols
+    item.display_rows = display_rows
+  end
 
   local hl_group = "typst-concealer-image-id-" .. tostring(render_image_id)
   vim.api.nvim_set_hl(0, hl_group, { fg = string.format("#%06X", render_image_id) })
@@ -501,7 +567,7 @@ local function conceal_extmark_with_image(
       pad = config.block_padding_cols or 0
     elseif item.semantics.display_kind == "block" then
       -- Math display (single- or multi-line): centre in the buffer's own window
-      pad = center_padding(natural_cols, bufnr)
+      pad = center_padding(display_cols, bufnr)
     end
   end
 
@@ -509,7 +575,7 @@ local function conceal_extmark_with_image(
 
   local function make_row_list(i)
     local line = ""
-    for j = 0, natural_cols - 1 do
+    for j = 0, display_cols - 1 do
       line = line .. kitty_codes.placeholder .. kitty_codes.diacritics[i] .. kitty_codes.diacritics[j + 1]
     end
     if pad_str then
@@ -530,7 +596,7 @@ local function conceal_extmark_with_image(
     if type(prefix) == "string" and prefix ~= "" then
       lines[#lines + 1] = { { prefix, "" } }
     end
-    for i = 1, natural_rows do
+    for i = 1, display_rows do
       if i >= #kitty_codes.diacritics then
         lines[#lines + 1] = { { too_tall_msg, hl_group } }
       else
@@ -551,11 +617,11 @@ local function conceal_extmark_with_image(
   else
     -- Non-block multiline: existing centering logic
     local lines = {}
-    if natural_rows < source_rows then
-      local above_blank = math.floor((source_rows - natural_rows) / 2)
+    if display_rows < source_rows then
+      local above_blank = math.floor((source_rows - display_rows) / 2)
       for i = 1, source_rows do
         local image_row = i - above_blank
-        if image_row < 1 or image_row > natural_rows then
+        if image_row < 1 or image_row > display_rows then
           lines[i] = { { "", hl_group } }
         elseif image_row >= #kitty_codes.diacritics then
           lines[i] = { { too_tall_msg, hl_group } }
