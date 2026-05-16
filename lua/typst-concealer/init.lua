@@ -97,6 +97,7 @@ end
 --- @field compiler_args?         string[]  Extra typst CLI arguments.
 --- @field header?                string    Custom Typst code prepended to every rendered document.
 --- @field mitex_package?         string    Typst package spec used for Markdown LaTeX math. Default "@preview/mitex:0.2.7".
+--- @field markdown_filetypes?    string[]  Filetypes treated as Markdown math sources. Default { "markdown" }.
 --- @field block_padding_cols?    integer   Terminal columns reserved as outer padding for code blocks.
 --- @field block_preview_margin_pt? number  Extra Typst-side inner margin for code block previews.
 --- @field live_preview_enabled?  boolean   Enable inline live preview around the active math node. Default true.
@@ -142,6 +143,22 @@ local function source_kind_from_path(path)
   return nil
 end
 
+local function markdown_filetypes()
+  if M.config == nil or M.config.markdown_filetypes == nil then
+    return { "markdown" }
+  end
+  return M.config.markdown_filetypes
+end
+
+local function filetype_in(list, ft)
+  for _, candidate in ipairs(list or {}) do
+    if candidate == ft then
+      return true
+    end
+  end
+  return false
+end
+
 function M.source_kind_for_bufnr(bufnr)
   bufnr = bufnr or vim.fn.bufnr()
   if not vim.api.nvim_buf_is_valid(bufnr) then
@@ -151,7 +168,7 @@ function M.source_kind_for_bufnr(bufnr)
   local ft = vim.bo[bufnr].filetype
   if ft == "typst" then
     return "typst"
-  elseif ft == "markdown" then
+  elseif filetype_in(markdown_filetypes(), ft) then
     return "markdown"
   end
 
@@ -232,6 +249,74 @@ local function maybe_resume_visible_full_watch(bufnr)
     return
   end
   require("typst-concealer.machine.runtime").render_buf(bufnr)
+end
+
+local function attach_buffer_local_autocmds(bufnr)
+  if not vim.api.nvim_buf_is_valid(bufnr) or not M.is_supported_bufnr(bufnr) then
+    return
+  end
+  if source_kind_from_path(vim.api.nvim_buf_get_name(bufnr)) ~= nil then
+    return
+  end
+
+  local bs = require("typst-concealer.state").get_buf_state(bufnr)
+  if bs.buffer_local_autocmds_attached then
+    return
+  end
+  bs.buffer_local_autocmds_attached = true
+
+  vim.api.nvim_create_autocmd("CursorMoved", {
+    group = augroup,
+    buffer = bufnr,
+    desc = "unconceal on line hover",
+    callback = function(ev)
+      require("typst-concealer.machine.runtime").sync_cursor_ui(ev.buf)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("CursorMovedI", {
+    group = augroup,
+    buffer = bufnr,
+    desc = "keep float preview synced while moving in insert mode",
+    callback = function(ev)
+      require("typst-concealer.machine.runtime").schedule_live_preview_sync(ev.buf, { immediate = true })
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("TextChangedI", {
+    group = augroup,
+    buffer = bufnr,
+    desc = "render live preview float when insert-mode text changes",
+    callback = function(ev)
+      require("typst-concealer.machine.runtime").schedule_live_preview_sync(ev.buf, { refresh_full = true })
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("BufEnter", {
+    group = augroup,
+    buffer = bufnr,
+    desc = "sync float preview when entering a supported buffer",
+    callback = function(ev)
+      vim.schedule(function()
+        maybe_resume_visible_full_watch(ev.buf)
+        local runtime = require("typst-concealer.machine.runtime")
+        runtime.render_live_preview(ev.buf)
+        runtime.sync_hover(ev.buf)
+      end)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd({ "BufLeave", "BufWinLeave", "BufHidden", "BufDelete" }, {
+    group = augroup,
+    buffer = bufnr,
+    desc = "clear live preview when leaving a supported buffer",
+    callback = function(ev)
+      require("typst-concealer.machine.runtime").clear_live_preview(ev.buf)
+      vim.schedule(function()
+        maybe_stop_hidden_full_watch(ev.buf)
+      end)
+    end,
+  })
 end
 
 function M.is_render_allowed(bufnr)
@@ -315,6 +400,7 @@ function M.setup(cfg)
     compiler_args = default(cfg.compiler_args, {}),
     header = default(cfg.header, ""),
     mitex_package = default(cfg.mitex_package, "@preview/mitex:0.2.7"),
+    markdown_filetypes = default(cfg.markdown_filetypes, { "markdown" }),
     block_padding_cols = default(cfg.block_padding_cols, 15),
     block_preview_margin_pt = default(cfg.block_preview_margin_pt, 6),
     live_preview_enabled = default(cfg.live_preview_enabled, true),
@@ -336,6 +422,15 @@ function M.setup(cfg)
 
   if M.config.get_root ~= nil and type(M.config.get_root) ~= "function" then
     error("typst get_root must be a function when provided")
+  end
+
+  if type(M.config.markdown_filetypes) ~= "table" then
+    error("typst markdown_filetypes must be a list of filetype strings")
+  end
+  for _, ft in ipairs(M.config.markdown_filetypes) do
+    if type(ft) ~= "string" then
+      error("typst markdown_filetypes must be a list of filetype strings")
+    end
   end
 
   setup_prelude()
@@ -371,6 +466,7 @@ function M.setup(cfg)
   local function init_buf(bufnr)
     vim.opt_local.conceallevel = 2
     vim.opt_local.concealcursor = "nci"
+    attach_buffer_local_autocmds(bufnr)
     local bs = require("typst-concealer.state").get_buf_state(bufnr)
     if not bs.change_tracker_attached then
       vim.api.nvim_buf_attach(bufnr, false, {
@@ -573,9 +669,12 @@ function M.setup(cfg)
   end
 
   vim.api.nvim_create_autocmd("FileType", {
-    pattern = "typst",
+    pattern = vim.list_extend({ "typst" }, vim.deepcopy(M.config.markdown_filetypes)),
     callback = function(ev)
       init_buf(ev.buf)
+      if M._enabled_buffers[ev.buf] == true and M.is_render_allowed(ev.buf) then
+        require("typst-concealer.machine.runtime").render_buf(ev.buf)
+      end
     end,
   })
 

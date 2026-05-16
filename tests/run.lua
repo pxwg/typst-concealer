@@ -373,6 +373,9 @@ end
 local function test_supports_typst_and_markdown_buffers()
   reset_modules()
   local concealer = require("typst-concealer")
+  concealer.config = {
+    markdown_filetypes = { "markdown" },
+  }
 
   local typst_bufnr = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_name(typst_bufnr, "only-typst.typ")
@@ -400,6 +403,27 @@ local function test_supports_typst_and_markdown_buffers()
   vim.api.nvim_buf_delete(typst_bufnr, { force = true })
   vim.api.nvim_buf_delete(markdown_bufnr, { force = true })
   vim.api.nvim_buf_delete(alma_bufnr, { force = true })
+end
+
+local function test_custom_markdown_filetypes_are_supported()
+  reset_modules()
+  local concealer = require("typst-concealer")
+  concealer.config = {
+    markdown_filetypes = { "markdown", "copilot-chat" },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(bufnr, "copilot-chat")
+  vim.bo[bufnr].buftype = "nofile"
+  vim.bo[bufnr].filetype = "copilot-chat"
+  assert_eq(
+    concealer.source_kind_for_bufnr(bufnr),
+    "markdown",
+    "custom markdown filetypes should use markdown source rules"
+  )
+  assert_eq(concealer.is_supported_bufnr(bufnr), true, "custom markdown filetypes should be supported")
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
 local function test_markdown_adapter_collects_inline_and_block_math()
@@ -4490,6 +4514,7 @@ end
 
 local tests = {
   { test_supports_typst_and_markdown_buffers, "ok typst and markdown buffers are supported" },
+  { test_custom_markdown_filetypes_are_supported, "ok custom markdown filetypes are supported" },
   { test_markdown_adapter_collects_inline_and_block_math, "ok markdown adapter collects math" },
   { test_render_buf_scans_markdown_math_nodes, "ok render_buf scans markdown math nodes" },
   { test_root_prefers_cwd_fallback, "ok root fallback uses cwd" },

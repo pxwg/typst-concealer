@@ -21,7 +21,7 @@ Lazy.nvim:
 return {
   "pxwg/typst-concealer",
   opts = {},
-  ft = { "typst" },
+  ft = { "typst", "markdown" },
 }
 ```
 
@@ -54,6 +54,19 @@ The `styling_type` option is probably the most important one. It has three modes
 - "none": Do nothing, and completely rely on the user provided `#set`s. This is best for documents that never intend to be actually rendered as pdf/html, but just in neovim, otherwise the output of either neovim or the pdf is going to look rather strange.
 
 These styles are applied *after* all other rules are applied.
+
+Markdown LaTeX math is enabled for `markdown` buffers by default. To treat
+plugin-owned Markdown-like buffers as Markdown math sources, add their filetypes
+to `markdown_filetypes`:
+
+```lua
+require("typst-concealer").setup({
+  markdown_filetypes = { "markdown", "copilot-chat" },
+})
+```
+
+If you lazy-load by filetype, include those filetypes in your plugin manager
+configuration too.
 
 For multi-file projects, `render_paths` can be used to bypass expensive files by path pattern. The table shape is intentionally simple Neovim config:
 
