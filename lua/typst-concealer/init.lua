@@ -96,6 +96,7 @@ end
 --- @field conceal_in_normal      boolean   Keep concealing when the cursor is on a line in normal mode.
 --- @field compiler_args?         string[]  Extra typst CLI arguments.
 --- @field header?                string    Custom Typst code prepended to every rendered document.
+--- @field mitex_package?         string    Typst package spec used for Markdown LaTeX math. Default "@preview/mitex:0.2.7".
 --- @field block_padding_cols?    integer   Terminal columns reserved as outer padding for code blocks.
 --- @field block_preview_margin_pt? number  Extra Typst-side inner margin for code block previews.
 --- @field live_preview_enabled?  boolean   Enable inline live preview around the active math node. Default true.
@@ -135,6 +136,8 @@ local function source_kind_from_path(path)
   path = path or ""
   if path:match("%.typ$") then
     return "typst"
+  elseif path:match("%.md$") or path:match("%.markdown$") then
+    return "markdown"
   end
   return nil
 end
@@ -148,6 +151,8 @@ function M.source_kind_for_bufnr(bufnr)
   local ft = vim.bo[bufnr].filetype
   if ft == "typst" then
     return "typst"
+  elseif ft == "markdown" then
+    return "markdown"
   end
 
   return source_kind_from_path(vim.api.nvim_buf_get_name(bufnr))
@@ -309,6 +314,7 @@ function M.setup(cfg)
     conceal_in_normal = default(cfg.conceal_in_normal, false),
     compiler_args = default(cfg.compiler_args, {}),
     header = default(cfg.header, ""),
+    mitex_package = default(cfg.mitex_package, "@preview/mitex:0.2.7"),
     block_padding_cols = default(cfg.block_padding_cols, 15),
     block_preview_margin_pt = default(cfg.block_preview_margin_pt, 6),
     live_preview_enabled = default(cfg.live_preview_enabled, true),
@@ -438,7 +444,7 @@ function M.setup(cfg)
 
   if vim.v.vim_did_enter then
     local bufnr = vim.fn.bufnr()
-    if vim.api.nvim_buf_get_name(bufnr):match(".*%.typ$") then
+    if M.is_supported_bufnr(bufnr) then
       init_buf(bufnr)
     end
   end
@@ -446,7 +452,7 @@ function M.setup(cfg)
   -- ── Autocmds ──────────────────────────────────────────────────────────────
 
   vim.api.nvim_create_autocmd("BufReadPost", {
-    pattern = "*.typ",
+    pattern = { "*.typ", "*.md", "*.markdown" },
     group = augroup,
     desc = "render file on enter",
     callback = function(ev)
@@ -457,7 +463,7 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd({ "BufNew", "VimEnter" }, {
-    pattern = "*.typ",
+    pattern = { "*.typ", "*.md", "*.markdown" },
     group = augroup,
     desc = "enable file on creation if the option is set",
     callback = function(ev)
@@ -466,7 +472,7 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd("BufWritePost", {
-    pattern = "*.typ",
+    pattern = { "*.typ", "*.md", "*.markdown" },
     group = augroup,
     desc = "render file on write",
     callback = function(ev)
@@ -477,7 +483,7 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd("TextChanged", {
-    pattern = "*.typ",
+    pattern = { "*.typ", "*.md", "*.markdown" },
     group = augroup,
     desc = "re-render on normal-mode text changes so block anchors stay correct",
     callback = function(ev)
@@ -490,7 +496,7 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd("CursorMoved", {
-    pattern = "*.typ",
+    pattern = { "*.typ", "*.md", "*.markdown" },
     group = augroup,
     desc = "unconceal on line hover",
     callback = function(ev)
@@ -503,7 +509,7 @@ function M.setup(cfg)
     pattern = "v:*",
     desc = "unconceal when exiting visual mode (no CursorMoved event fires)",
     callback = function(ev)
-      if vim.api.nvim_buf_get_name(ev.buf):match(".*%.typ$") then
+      if M.is_supported_bufnr(ev.buf) then
         require("typst-concealer.machine.runtime").sync_hover(ev.buf)
       end
     end,
@@ -511,7 +517,7 @@ function M.setup(cfg)
 
   vim.api.nvim_create_autocmd("CursorMovedI", {
     group = augroup,
-    pattern = "*.typ",
+    pattern = { "*.typ", "*.md", "*.markdown" },
     desc = "keep float preview synced while moving in insert mode",
     callback = function(ev)
       require("typst-concealer.machine.runtime").schedule_live_preview_sync(ev.buf, { immediate = true })

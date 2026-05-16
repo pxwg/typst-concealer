@@ -521,6 +521,7 @@ function M.allocate_preview_item(bufnr, source_item, preview_str, source_str, re
     prelude_count = source_item.prelude_count,
     node_type = "math",
     semantics = source_item.semantics,
+    requires_mitex = source_item.requires_mitex,
     render_target = "preview_float",
     source_image_id = source_item.image_id,
   }

@@ -69,6 +69,15 @@ local function normalize_item_str(item)
   return ""
 end
 
+local function mitex_import_line()
+  local config = require("typst-concealer").config or {}
+  local package = config.mitex_package or "@preview/mitex:0.2.7"
+  if package == "" then
+    return ""
+  end
+  return '#import "' .. package .. '": mitex, mi\n'
+end
+
 local function build_header_text(config, main, maybe_rewrite, preamble_include_line)
   local parts = {}
   if config.header and config.header ~= "" then
@@ -254,6 +263,9 @@ function M.build_item_fragment(item, buf_dir, source_root, effective_root, prelu
   end
 
   local parts = {}
+  if item.requires_mitex == true then
+    parts[#parts + 1] = mitex_import_line()
+  end
   for i = 1, item.prelude_count or 0 do
     parts[#parts + 1] = maybe_rewrite(prelude_chunks[i] or "")
   end
@@ -309,6 +321,10 @@ function M.build_slot_document(item, buf_dir, source_root, effective_root, prelu
   local function append(chunk)
     parts[#parts + 1] = chunk
     cur_line, cur_col = advance_pos(chunk, cur_line, cur_col)
+  end
+
+  if item.requires_mitex == true then
+    append(mitex_import_line())
   end
 
   for i = 1, item.prelude_count or 0 do
@@ -431,10 +447,12 @@ function M.build_batch_document(
     local source_rows = item.range[3] - item.range[1] + 1
     local wrap_prefix, wrap_suffix = M.build_wrapper(item, source_rows)
     local suffix_text = wrap_suffix ~= "" and wrap_suffix or "\n"
+    local item_import = item.requires_mitex == true and mitex_import_line() or ""
     local item_key = table.concat({
       rewrite_signature,
       tostring(prelude_chunks),
       tostring(item.prelude_count or 0),
+      item_import,
       wrap_prefix,
       suffix_text,
       normalize_item_str(item),
@@ -442,6 +460,9 @@ function M.build_batch_document(
     local item_cache = cache.item_fragments[item_key]
     if item_cache == nil then
       local prefix_parts = {}
+      if item_import ~= "" then
+        prefix_parts[#prefix_parts + 1] = item_import
+      end
       for i = 1, item.prelude_count do
         prefix_parts[#prefix_parts + 1] = maybe_rewrite(prelude_chunks[i] or "")
       end

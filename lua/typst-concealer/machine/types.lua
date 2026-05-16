@@ -71,7 +71,9 @@ local M = {}
 --- @field display_prefix string|nil
 --- @field display_suffix string|nil
 --- @field source_text string
+--- @field source_str string|nil
 --- @field source_text_hash string
+--- @field requires_mitex boolean|nil
 --- @field context_hash string
 --- @field prelude_count integer
 --- @field semantics NodeSemantics
@@ -88,7 +90,9 @@ local M = {}
 --- @field page_index integer
 --- @field node_id string|nil
 --- @field source_text string
+--- @field source_str string|nil
 --- @field source_text_hash string|nil
+--- @field requires_mitex boolean|nil
 --- @field source_range Range4|nil
 --- @field source_rows integer
 --- @field context_hash string|nil

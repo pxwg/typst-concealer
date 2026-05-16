@@ -198,6 +198,8 @@ local function buffer_source_kind(bufnr)
   local name = vim.api.nvim_buf_get_name(bufnr) or ""
   if ft == "typst" or name:match("%.typ$") then
     return "typst"
+  elseif ft == "markdown" or name:match("%.md$") or name:match("%.markdown$") then
+    return "markdown"
   end
   return nil
 end
@@ -558,6 +560,14 @@ local function make_highlighted_preview_math(item, cursor_row, cursor_col, mode)
     return nil, nil, nil
   end
 
+  if item.requires_mitex == true or (item.semantics and item.semantics.markdown_math == true) then
+    local source_text = item.source_str or range_to_string(item.range, item.bufnr)
+    if type(item.str) ~= "string" or type(source_text) ~= "string" or item.str == "" or source_text == "" then
+      return nil, nil, nil
+    end
+    return item.str, preview_render_key(item, source_text, cursor_row, cursor_col, nil), source_text
+  end
+
   local source_text = range_to_string(item.range, item.bufnr)
   if source_text == nil or source_text == "" then
     return nil, nil, nil
@@ -762,7 +772,7 @@ function M.render_buf(bufnr)
   local bs = state.get_buf_state(bufnr)
   local prev_state = state.buffer_render_state[bufnr] or {}
   local source_kind = buffer_source_kind(bufnr)
-  if source_kind ~= "typst" then
+  if source_kind ~= "typst" and source_kind ~= "markdown" then
     M.hard_reset_buf(bufnr)
     return
   end
@@ -771,20 +781,25 @@ function M.render_buf(bufnr)
   local sorted_entries = {}
   local binding_dirty_ranges = bs.binding_dirty_ranges
 
-  local parser, parser_err = get_buffer_parser(bufnr, "typst")
-  if parser == nil then
-    schedule_parser_retry(bufnr, "typst", bs, parser_err)
-    return
+  if source_kind == "typst" then
+    local parser, parser_err = get_buffer_parser(bufnr, "typst")
+    if parser == nil then
+      schedule_parser_retry(bufnr, "typst", bs, parser_err)
+      return
+    end
+    if bs.parser_retry_counts then
+      bs.parser_retry_counts.typst = nil
+    end
+    local tree = parser:parse()[1]:root()
+    units = collect_incremental_units(bufnr, tree, main._typst_query, prev_state.full_units, bs.pending_change)
+    if units == nil then
+      units = collect_full_units(bufnr, tree, main._typst_query)
+    end
+    sorted_entries = build_render_entries_from_units(bufnr, units)
+  else
+    units = require("typst-concealer.source-adapters.markdown").collect(bufnr)
+    sorted_entries = units
   end
-  if bs.parser_retry_counts then
-    bs.parser_retry_counts.typst = nil
-  end
-  local tree = parser:parse()[1]:root()
-  units = collect_incremental_units(bufnr, tree, main._typst_query, prev_state.full_units, bs.pending_change)
-  if units == nil then
-    units = collect_full_units(bufnr, tree, main._typst_query)
-  end
-  sorted_entries = build_render_entries_from_units(bufnr, units)
 
   bs.pending_change = nil
   bs.binding_dirty_ranges = nil
@@ -793,13 +808,14 @@ function M.render_buf(bufnr)
   local scanned_nodes = {}
   for idx, entry in ipairs(sorted_entries) do
     local range, prelude_count, node_type = entry.range, entry.prelude_count, entry.node_type
-    local sem = semantics_mod.classify(range, bufnr, node_type)
-    local str = range_to_string(range, bufnr)
-    local display_range = range
+    local sem = entry.semantics or semantics_mod.classify(range, bufnr, node_type)
+    local source_str = entry.source_text or range_to_string(range, bufnr)
+    local str = entry.render_text or source_str
+    local display_range = entry.display_range or range
     local display_prefix = nil
     local display_suffix = nil
 
-    if node_type == "math" and sem.display_kind == "block" and range[1] == range[3] then
+    if entry.display_range == nil and node_type == "math" and sem.display_kind == "block" and range[1] == range[3] then
       display_range = full_line_range(bufnr, range[1])
 
       if sem.render_whole_line then
@@ -817,11 +833,13 @@ function M.render_buf(bufnr)
       display_prefix = display_prefix,
       display_suffix = display_suffix,
       source_text = str,
+      source_str = source_str,
       source_text_hash = hash_string(str),
       context_hash = context_hash(prelude_count),
       prelude_count = prelude_count,
       node_type = node_type,
       semantics = sem,
+      requires_mitex = entry.requires_mitex == true,
     }
   end
 

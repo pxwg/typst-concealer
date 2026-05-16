@@ -183,7 +183,9 @@ local function allocate_slot(buf, node)
     page_index = #(buf.slot_order or {}) + 1,
     node_id = node.node_id,
     source_text = node.source_text,
+    source_str = node.source_str,
     source_text_hash = node.source_text_hash,
+    requires_mitex = node.requires_mitex,
     source_range = copy_range(node.source_range),
     source_rows = source_rows_from_range(node.source_range),
     context_hash = node.context_hash,
@@ -226,7 +228,9 @@ local function sync_slot_from_node(buf, node, force_dirty)
   local changed = not slot_inputs_equal(slot, node)
   slot.node_id = node.node_id
   slot.source_text = node.source_text
+  slot.source_str = node.source_str
   slot.source_text_hash = node.source_text_hash
+  slot.requires_mitex = node.requires_mitex
   slot.source_range = copy_range(node.source_range)
   slot.source_rows = source_rows_from_range(node.source_range)
   slot.context_hash = node.context_hash
@@ -558,7 +562,9 @@ local function patch_node(prev, scanned, buffer_version, layout_version)
   node.display_prefix = scanned.display_prefix
   node.display_suffix = scanned.display_suffix
   node.source_text = scanned.source_text
+  node.source_str = scanned.source_str
   node.source_text_hash = scanned.source_text_hash
+  node.requires_mitex = scanned.requires_mitex
   node.context_hash = scanned.context_hash
   node.prelude_count = scanned.prelude_count or 0
   node.semantics = deepcopy(scanned.semantics)
@@ -581,7 +587,9 @@ local function new_node(state, bufnr, project_scope_id, scanned, buffer_version,
     display_prefix = scanned.display_prefix,
     display_suffix = scanned.display_suffix,
     source_text = scanned.source_text,
+    source_str = scanned.source_str,
     source_text_hash = scanned.source_text_hash,
+    requires_mitex = scanned.requires_mitex,
     context_hash = scanned.context_hash,
     prelude_count = scanned.prelude_count or 0,
     semantics = deepcopy(scanned.semantics),
@@ -642,7 +650,9 @@ local function render_job_from_node(node, overlay)
     display_prefix = node.display_prefix,
     display_suffix = node.display_suffix,
     source_text = node.source_text,
+    source_str = node.source_str,
     str = node.source_text,
+    requires_mitex = node.requires_mitex,
     prelude_count = node.prelude_count,
     semantics = deepcopy(node.semantics),
     image_id = overlay.image_id,
@@ -714,7 +724,9 @@ local function render_stub_from_node(node, slot)
     display_prefix = node.display_prefix,
     display_suffix = node.display_suffix,
     source_text = node.source_text,
+    source_str = node.source_str,
     str = node.source_text,
+    requires_mitex = node.requires_mitex,
     prelude_count = node.prelude_count,
     semantics = deepcopy(node.semantics),
     is_stub = true,
@@ -736,7 +748,9 @@ local function render_tombstone_stub(slot)
     range = copy_range(slot.source_range) or { 0, 0, 0, 0 },
     display_range = nil,
     source_text = slot.source_text or "[]",
+    source_str = slot.source_str,
     str = slot.source_text or "[]",
+    requires_mitex = slot.requires_mitex,
     prelude_count = 0,
     semantics = nil,
     is_stub = true,
@@ -807,7 +821,9 @@ local function mark_slot_committed(buf, node, overlay)
   end
   slot.node_id = node.node_id
   slot.source_text = node.source_text
+  slot.source_str = node.source_str
   slot.source_text_hash = node.source_text_hash
+  slot.requires_mitex = node.requires_mitex
   slot.source_range = copy_range(node.source_range)
   slot.source_rows = source_rows_from_range(node.source_range)
   slot.context_hash = node.context_hash

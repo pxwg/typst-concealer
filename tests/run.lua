@@ -55,6 +55,7 @@ local function reset_modules()
   package.loaded["typst-concealer.machine.runtime"] = nil
   package.loaded["typst-concealer.wrapper"] = nil
   package.loaded["typst-concealer.path-rewrite"] = nil
+  package.loaded["typst-concealer.source-adapters.markdown"] = nil
 end
 
 local function with_stubbed_uv(fn, opts)
@@ -369,7 +370,7 @@ local function test_render_buf_suppresses_stale_parser_warning()
   end
 end
 
-local function test_supports_only_typst_buffers()
+local function test_supports_typst_and_markdown_buffers()
   reset_modules()
   local concealer = require("typst-concealer")
 
@@ -380,10 +381,14 @@ local function test_supports_only_typst_buffers()
   assert_eq(concealer.is_supported_bufnr(typst_bufnr), true, "typst buffers should be supported")
 
   local markdown_bufnr = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_name(markdown_bufnr, "not-owned.md")
+  vim.api.nvim_buf_set_name(markdown_bufnr, "owned.md")
   vim.bo[markdown_bufnr].filetype = "markdown"
-  assert_eq(concealer.source_kind_for_bufnr(markdown_bufnr), nil, "markdown buffers should not be owned")
-  assert_eq(concealer.is_supported_bufnr(markdown_bufnr), false, "markdown buffers should not be supported")
+  assert_eq(
+    concealer.source_kind_for_bufnr(markdown_bufnr),
+    "markdown",
+    "markdown buffers should use markdown source rules"
+  )
+  assert_eq(concealer.is_supported_bufnr(markdown_bufnr), true, "markdown buffers should be supported")
 
   local alma_bufnr = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_name(alma_bufnr, "alma://thread/test")
@@ -395,6 +400,97 @@ local function test_supports_only_typst_buffers()
   vim.api.nvim_buf_delete(typst_bufnr, { force = true })
   vim.api.nvim_buf_delete(markdown_bufnr, { force = true })
   vim.api.nvim_buf_delete(alma_bufnr, { force = true })
+end
+
+local function test_markdown_adapter_collects_inline_and_block_math()
+  reset_modules()
+  local bufnr = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
+    "Inline $x + y$ text.",
+    "",
+    "$$",
+    "\\frac{1}{2}",
+    "$$",
+    "```",
+    "$ignored$",
+    "```",
+  })
+
+  local entries = require("typst-concealer.source-adapters.markdown").collect(bufnr)
+  assert_eq(#entries, 2, "markdown adapter should collect inline and block math outside fences")
+  assert_truthy(vim.deep_equal(entries[1].range, { 0, 7, 0, 14 }), "inline math range should include dollar delimiters")
+  assert_eq(entries[1].source_text, "$x + y$", "inline source text should preserve markdown delimiters")
+  assert_eq(entries[1].render_text, '#mi("x + y")', "inline math should render through MiTeX mi")
+  assert_eq(entries[1].semantics.display_kind, "inline", "inline math should keep inline display semantics")
+  assert_truthy(vim.deep_equal(entries[2].range, { 2, 0, 4, 2 }), "block math range should include display delimiters")
+  assert_eq(entries[2].source_text, "$$\n\\frac{1}{2}\n$$", "block source text should preserve markdown delimiters")
+  assert_eq(entries[2].render_text, '#mitex("\\\\frac{1}{2}")', "block math should render through MiTeX mitex")
+  assert_eq(entries[2].semantics.display_kind, "block", "block math should use block display semantics")
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_render_buf_scans_markdown_math_nodes()
+  reset_modules()
+  local state = require("typst-concealer.state")
+  state.machine_state = require("typst-concealer.machine.types").initial_state()
+
+  local bufnr = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(bufnr, "render-markdown.md")
+  vim.bo[bufnr].filetype = "markdown"
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
+    "Inline $x + y$.",
+    "$$",
+    "z^2",
+    "$$",
+  })
+
+  local dispatched = {}
+  package.loaded["typst-concealer"] = {
+    _enabled_buffers = { [bufnr] = true },
+    config = {
+      do_diagnostics = false,
+      live_preview_enabled = false,
+      header = "",
+      ppi = 300,
+    },
+    _styling_prelude = "",
+    is_render_allowed = function()
+      return true
+    end,
+    source_kind_for_bufnr = function()
+      return "markdown"
+    end,
+  }
+  package.loaded["typst-concealer.machine.runtime"] = {
+    reconcile_visible_overlay_bindings = function()
+      return 0
+    end,
+    dispatch = function(event)
+      dispatched[#dispatched + 1] = event
+    end,
+    invalidate_hover = function() end,
+    get_ui_buffer = function()
+      return {
+        hover = {},
+        preview = {},
+      }
+    end,
+  }
+
+  require("typst-concealer.plan").render_buf(bufnr)
+  local scanned = dispatched[1]
+  assert_eq(scanned.type, "nodes_scanned", "markdown render should dispatch scanned nodes")
+  assert_eq(#scanned.scanned_nodes, 2, "markdown render should scan inline and block math")
+  assert_eq(scanned.scanned_nodes[1].source_text, '#mi("x + y")', "inline node should carry MiTeX render text")
+  assert_eq(scanned.scanned_nodes[1].source_str, "$x + y$", "inline node should keep original markdown source")
+  assert_eq(scanned.scanned_nodes[1].semantics.display_kind, "inline", "inline node should keep inline semantics")
+  assert_eq(scanned.scanned_nodes[1].requires_mitex, true, "inline node should request MiTeX import")
+  assert_eq(scanned.scanned_nodes[2].source_text, '#mitex("z^2")', "block node should carry MiTeX render text")
+  assert_eq(scanned.scanned_nodes[2].semantics.display_kind, "block", "block node should keep block semantics")
+
+  vim.wait(10)
+  vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
 _G.__typst_concealer_regression_tests = function()
@@ -2018,6 +2114,41 @@ local function test_wrapper_defaults_missing_semantics_to_inline()
     suffix:find("block(width: __d.width, height: __mh", 1, true) ~= nil,
     "missing semantics should use inline wrapper sizing"
   )
+end
+
+local function test_wrapper_imports_mitex_for_markdown_items()
+  reset_modules()
+  package.loaded["typst-concealer"] = {
+    config = {
+      header = "",
+      mitex_package = "@preview/mitex:0.2.7",
+      math_baseline_pt = 11,
+      block_padding_cols = 15,
+      block_preview_margin_pt = 6,
+      ppi = 300,
+    },
+    _styling_prelude = "",
+  }
+
+  local wrapper = require("typst-concealer.wrapper")
+  local doc = wrapper.build_batch_document({
+    {
+      bufnr = 1,
+      item_idx = 1,
+      range = { 0, 7, 0, 14 },
+      str = '#mi("x + y")',
+      prelude_count = 0,
+      node_type = "math",
+      semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "math" },
+      requires_mitex = true,
+    },
+  }, nil, nil, nil, "full", {}, nil, false, {})
+
+  assert_truthy(
+    doc:find('#import "@preview/mitex:0.2.7": mitex, mi', 1, true) ~= nil,
+    "markdown MiTeX items should import MiTeX"
+  )
+  assert_truthy(doc:find('#mi("x + y")', 1, true) ~= nil, "markdown inline render text should be included")
 end
 
 local function test_remote_urls_do_not_rewrite_against_root()
@@ -4358,7 +4489,9 @@ local function test_commit_plan_cleans_removed_items_immediately()
 end
 
 local tests = {
-  { test_supports_only_typst_buffers, "ok only typst buffers are supported" },
+  { test_supports_typst_and_markdown_buffers, "ok typst and markdown buffers are supported" },
+  { test_markdown_adapter_collects_inline_and_block_math, "ok markdown adapter collects math" },
+  { test_render_buf_scans_markdown_math_nodes, "ok render_buf scans markdown math nodes" },
   { test_root_prefers_cwd_fallback, "ok root fallback uses cwd" },
   { test_get_root_overrides_fallback, "ok get_root overrides root base" },
   { test_session_render_request_tracks_current_request, "ok session tracks machine render requests" },
@@ -4389,6 +4522,7 @@ local tests = {
   { test_wrapper_cache_tracks_root_signature, "ok wrapper cache keys include root signature" },
   { test_inline_wrapper_keeps_single_row_width_intrinsic, "ok inline wrapper keeps single-row width intrinsic" },
   { test_wrapper_defaults_missing_semantics_to_inline, "ok wrapper defaults missing semantics to inline" },
+  { test_wrapper_imports_mitex_for_markdown_items, "ok wrapper imports MiTeX for markdown items" },
   { test_remote_urls_do_not_rewrite_against_root, "ok remote urls bypass root rewrite" },
   { test_named_path_args_rewrite_local_paths, "ok named path args rewrite local paths" },
   { test_named_path_args_preserve_remote_urls, "ok named path args preserve remote urls" },
