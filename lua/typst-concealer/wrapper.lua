@@ -369,7 +369,7 @@ end
 --- @param items table[]
 --- @param buf_dir string|nil   source buffer directory (for path rewriting)
 --- @param source_root string|nil  source/project root used for `/...` semantics
---- @param effective_root string|nil  actual Typst `--root` used by the watch session
+--- @param effective_root string|nil  actual Typst root used by the compiler service
 --- @param kind "full"|nil  session kind forwarded to get_preamble_file
 --- @param prelude_chunks string[]|nil  snapshot of runtime preludes aligned with item.prelude_count
 --- @param preamble_include_line string|nil

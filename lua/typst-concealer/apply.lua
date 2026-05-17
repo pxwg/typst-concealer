@@ -324,7 +324,7 @@ local function item_blocked_by_error_diagnostics(bufnr, item)
   if item == nil then
     return false
   end
-  local bucket = state.watch_diagnostics[bufnr]
+  local bucket = state.render_diagnostics[bufnr]
   local diagnostics_items = bucket and bucket.full or nil
   if diagnostics_items == nil or #diagnostics_items == 0 then
     return false

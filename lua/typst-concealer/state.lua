@@ -17,44 +17,6 @@ M.image_id_to_extmark = {}
 --- Maps image_id -> bufnr (tracks which images are currently allocated)
 M.image_ids_in_use = {}
 
---- @class typst_watch_session
---- @field kind 'full'
---- @field bufnr integer
---- @field project_scope_id string|nil
---- @field handle uv_process_t|nil
---- @field stdout uv_pipe_t|nil
---- @field stderr uv_pipe_t|nil
---- @field input_path string
---- @field output_prefix string
---- @field output_template string
---- @field poll_timer uv_timer_t|nil
---- @field items table[]
---- @field base_items table[]
---- @field preview_tail_item table|nil
---- @field preview_sidecar_item table|nil
---- @field preview_sidecar_path string
---- @field preview_sidecar_root_relative_path string
---- @field preamble_include_line string
---- @field preview_active boolean
---- @field prelude_chunks string[]
---- @field page_state table
---- @field render_start_index integer
---- @field poll_interval_ms integer|nil
---- @field last_page_count integer
---- @field last_input_text string|nil
---- @field last_input_write_count integer
---- @field last_preview_sidecar_text string|nil
---- @field wrapper_cache table|nil
---- @field current_request RenderRequestMeta|nil
---- @field stderr_chunks string[]
---- @field dead boolean|nil
---- @field buf_dir string
---- @field source_root string
---- @field effective_root string
-
---- @type { [integer]: { full?: typst_watch_session } }
-M.watch_sessions = {}
-
 --- @class typst_compiler_service
 --- @field handle uv_process_t|nil
 --- @field stdin uv_pipe_t|nil
@@ -98,9 +60,9 @@ M.service_cache_dirs = {}
 --- @type { [integer]: string|nil }
 M.service_workspace_dirs = {}
 
---- Aggregated render diagnostics per buffer/session kind for quickfix injection.
+--- Aggregated render diagnostics per buffer for quickfix injection.
 --- @type { [integer]: { full?: table[] } }
-M.watch_diagnostics = {}
+M.render_diagnostics = {}
 
 --- @type { [integer]: { full_items?: table[], lingering_items?: table[], full_units?: table[], line_to_items?: table, extmark_to_item?: table, runtime_preludes?: string[] } }
 M.buffer_render_state = {}

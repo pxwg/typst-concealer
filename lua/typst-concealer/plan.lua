@@ -762,8 +762,7 @@ function M.render_buf(bufnr)
 
   if main._enabled_buffers[bufnr] ~= true or not main.is_render_allowed(bufnr) then
     M.hard_reset_buf(bufnr)
-    local session = require("typst-concealer.session")
-    session.stop_watch_session(bufnr, "full")
+    require("typst-concealer.session").stop_compiler_service(bufnr)
     return
   end
 
@@ -793,7 +792,7 @@ function M.render_buf(bufnr)
     scanned_nodes = scan.scanned_nodes,
     binding_dirty_ranges = scan.binding_dirty_ranges,
   }
-  if main.config.use_compiler_service and main.config.use_formula_service ~= false then
+  if main.config.use_formula_service ~= false then
     require("typst-concealer.formula.manager").update_from_scan(scan_event)
   else
     runtime.dispatch(scan_event)
@@ -854,7 +853,7 @@ end
 --- @param bufnr integer
 function M.hide_extmarks_at_cursor(bufnr)
   local main = require("typst-concealer")
-  if main.config.use_compiler_service == true and main.config.use_formula_service ~= false then
+  if main.config.use_formula_service ~= false then
     require("typst-concealer.formula.manager").sync_cursor_conceal(bufnr)
     return
   end
@@ -1512,10 +1511,6 @@ end
 --- @param bufnr integer
 function M.clear_live_typst_preview(bufnr)
   require("typst-concealer.machine.runtime").clear_preview_request(bufnr)
-  -- In service mode the preview backend has its own active request table and
-  -- no watch tail page; this call is intentionally a no-op unless a legacy
-  -- watch session exists.
-  require("typst-concealer.session").clear_preview_tail(bufnr)
   cleanup_preview_image(bufnr)
 end
 

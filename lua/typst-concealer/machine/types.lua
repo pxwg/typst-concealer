@@ -270,8 +270,6 @@ local M = {}
 --- @field layout_version integer
 --- @field project_scope_id string
 --- @field jobs RenderJob[]
---- @field page_to_overlay table<integer, string>|nil watch adapter only
---- @field overlay_to_page table<string, integer>|nil watch adapter only
 --- @field page_to_slot table<integer, string>|nil
 --- @field slot_to_node table<string, string>|nil
 --- @field slot_to_overlay table<string, string>|nil
@@ -288,11 +286,6 @@ local M = {}
 --- @field generated_node_paths table<string, string>|nil
 --- @field generated_context_path string|nil
 --- @field generated_input_path string|nil
-
---- Compatibility aliases for legacy watch-session annotations.
---- @alias WatchRequestStatus RenderRequestStatus
---- @alias WatchRenderRequest RenderRequest
---- @alias CurrentWatchRequest RenderRequestMeta
 
 --- @return MachineState
 function M.initial_state()

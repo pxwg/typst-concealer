@@ -150,8 +150,7 @@ end
 local function fresh_state()
   reset_modules()
   local state = require("typst-concealer.state")
-  state.watch_sessions = {}
-  state.watch_diagnostics = {}
+  state.render_diagnostics = {}
   state.buffer_render_state = {}
   state.path_rewrite_cache = {}
   state.runtime_preludes = {}
@@ -479,6 +478,7 @@ local function test_render_buf_scans_markdown_math_nodes()
     config = {
       do_diagnostics = false,
       live_preview_enabled = false,
+      use_formula_service = false,
       header = "",
       ppi = 300,
     },
@@ -708,43 +708,30 @@ local function test_root_prefers_cwd_fallback()
   local bufnr = vim.api.nvim_create_buf(true, false)
   vim.api.nvim_buf_set_name(bufnr, main_path)
 
-  local state = fresh_state()
-  local session = with_stubbed_uv(function(spawned)
-    package.loaded["typst-concealer"] = {
-      config = {
-        typst_location = "typst",
-        ppi = 300,
-        compiler_args = {},
-        get_root = nil,
-        get_inputs = nil,
-        get_preamble_file = nil,
-        do_diagnostics = false,
-        header = "",
-      },
-      _styling_prelude = "",
-    }
-    local session_mod = require("typst-concealer.session")
-    local s = session_mod.ensure_watch_session(bufnr)
-    assert_eq(#spawned, 1, "expected exactly one typst watch spawn")
-    local root_arg = spawned[1].args[5]
-    assert_eq(root_arg, "--root=" .. cwd_root, "ensure_watch_session should pass cwd as --root fallback")
-    return s
-  end)
+  fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      ppi = 300,
+      compiler_args = {},
+      get_root = nil,
+      get_inputs = nil,
+      get_preamble_file = nil,
+      do_diagnostics = false,
+      header = "",
+    },
+    _styling_prelude = "",
+  }
 
-  assert_eq(session.source_root, cwd_root, "session.source_root should match cwd fallback root base")
-  assert_eq(session.effective_root, cwd_root, "session.effective_root should match root base")
-  assert_startswith(
-    session.input_path,
-    cwd_root .. "/.typst-concealer/",
-    "input path should live under root base cache dir"
-  )
+  local scope = require("typst-concealer.project-scope").resolve(bufnr, "full")
+  assert_eq(scope.source_root, cwd_root, "project scope should match cwd fallback root base")
+  assert_eq(scope.effective_root, cwd_root, "effective root should match root base")
 
   local path_rewrite = require("typst-concealer.path-rewrite")
   local rewritten = path_rewrite.rewrite_paths('#import "' .. template_path .. '": foo', {
     bufnr = bufnr,
     buf_dir = project,
-    source_root = session.source_root,
-    effective_root = session.effective_root,
+    source_root = scope.source_root,
+    effective_root = scope.effective_root,
   })
   assert_eq(
     rewritten,
@@ -752,9 +739,7 @@ local function test_root_prefers_cwd_fallback()
     "absolute import should rewrite relative to cwd root base"
   )
 
-  require("typst-concealer.session").stop_watch_session(bufnr, "full")
   vim.api.nvim_buf_delete(bufnr, { force = true })
-  state.watch_sessions = {}
 end
 
 local function test_get_root_overrides_fallback()
@@ -769,34 +754,30 @@ local function test_get_root_overrides_fallback()
   local bufnr = vim.api.nvim_create_buf(true, false)
   vim.api.nvim_buf_set_name(bufnr, vim.fs.joinpath(project, "main.typ"))
 
-  with_stubbed_uv(function(spawned)
-    package.loaded["typst-concealer"] = {
-      config = {
-        typst_location = "typst",
-        ppi = 300,
-        compiler_args = {},
-        get_root = function()
-          return alt_root
-        end,
-        get_inputs = nil,
-        get_preamble_file = nil,
-        do_diagnostics = false,
-        header = "",
-      },
-      _styling_prelude = "",
-    }
-    local session_mod = require("typst-concealer.session")
-    local session = session_mod.ensure_watch_session(bufnr)
-    assert_eq(spawned[1].args[5], "--root=" .. alt_root, "get_root should override cwd/project fallback")
-    assert_startswith(session.input_path, alt_root .. "/.typst-concealer/", "cache dir should use explicit root base")
-    session_mod.stop_watch_session(bufnr, "full")
-  end)
+  fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      ppi = 300,
+      compiler_args = {},
+      get_root = function()
+        return alt_root
+      end,
+      get_inputs = nil,
+      get_preamble_file = nil,
+      do_diagnostics = false,
+      header = "",
+    },
+    _styling_prelude = "",
+  }
+  local scope = require("typst-concealer.project-scope").resolve(bufnr, "full")
+  assert_eq(scope.source_root, alt_root, "get_root should override cwd/project fallback")
+  assert_eq(scope.effective_root, alt_root, "effective root should use get_root")
 
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
-local function test_session_render_request_tracks_current_request()
-  local root = make_temp_tree("watch-request")
+local function test_session_render_request_tracks_active_service_request()
+  local root = make_temp_tree("service-request-meta")
   local main_path = vim.fs.joinpath(root, "main.typ")
   write_file(main_path, "$x$")
   main_path = real_path(main_path)
@@ -809,7 +790,8 @@ local function test_session_render_request_tracks_current_request()
   with_stubbed_uv(function()
     package.loaded["typst-concealer"] = {
       config = {
-        typst_location = "typst",
+        service_binary = "typst-concealer-service-test",
+        use_formula_service = false,
         ppi = 300,
         compiler_args = {},
         get_root = function()
@@ -854,44 +836,25 @@ local function test_session_render_request_tracks_current_request()
       },
     }
 
-    session_mod.render_request_via_watch(bufnr, request)
-    local session = state.watch_sessions[bufnr].full
-    assert_eq(session.current_request.request_id, "request:1", "session should track current request id")
-    assert_eq(session.current_request.status, "active", "new request should be active")
-    assert_eq(session.current_request.page_to_overlay[1], "overlay:1", "page should map to overlay")
-    assert_eq(session.current_request.overlay_to_page["overlay:1"], 1, "overlay should map back to page")
-    assert_eq(session.base_items[1].overlay_id, "overlay:1", "request jobs should become watch base items")
-    assert_eq(next(session.page_state), nil, "new request should reset page state")
-    assert_truthy(session.last_input_text ~= nil, "new request should write watch input")
-    local first_input_write_count = session.last_input_write_count
+    session_mod.render_request_via_service(bufnr, request)
+    local meta = state.active_service_requests[bufnr]
+    assert_eq(meta.request_id, "request:1", "service should track current request id")
+    assert_eq(meta.status, "active", "new request should be active")
+    assert_eq(meta.page_to_slot[1], "slot:1", "page should map to a stable slot")
+    assert_eq(meta.slot_to_overlay["slot:1"], "overlay:1", "slot should map to overlay")
+    assert_eq(meta.jobs[1].overlay_id, "overlay:1", "request jobs should be retained in service metadata")
 
-    local stale_page_1 = session.output_prefix .. "-1.png"
-    local stale_page_2 = session.output_prefix .. "-2.png"
-    write_file(stale_page_1, "old-page-1")
-    write_file(stale_page_2, "old-page-2")
-    session.page_state = {
-      [1] = { rendered = "old-stamp", last_seen = "old-stamp" },
-      [2] = { rendered = "old-stamp", last_seen = "old-stamp" },
-    }
-    session.last_page_count = 2
-
-    local old_request = session.current_request
+    local old_request = meta
     local request2 = vim.deepcopy(request)
     request2.request_id = "request:2"
     request2.jobs[1].request_id = "request:2"
-    session_mod.render_request_via_watch(bufnr, request2)
+    session_mod.render_request_via_service(bufnr, request2)
     assert_eq(old_request.status, "abandoned", "replaced request should be abandoned")
-    assert_eq(session.current_request.request_id, "request:2", "session should install replacement request")
-    assert_eq(vim.uv.fs_stat(stale_page_1), nil, "replacement request should clear stale page 1")
-    assert_eq(vim.uv.fs_stat(stale_page_2), nil, "replacement request should clear stale page 2")
-    assert_eq(next(session.page_state), nil, "replacement request should reset page state before polling")
     assert_eq(
-      session.last_input_write_count,
-      first_input_write_count + 1,
-      "replacement request should force a watch input write"
+      state.active_service_requests[bufnr].request_id,
+      "request:2",
+      "service should install replacement request"
     )
-
-    session_mod.stop_watch_session(bufnr, "full")
   end)
 
   vim.api.nvim_buf_delete(bufnr, { force = true })
@@ -911,8 +874,6 @@ local function test_session_render_request_via_service_writes_json()
   with_stubbed_uv(function(spawned)
     package.loaded["typst-concealer"] = {
       config = {
-        typst_location = "typst",
-        use_compiler_service = true,
         use_formula_service = true,
         formula_worker_count = 2,
         service_binary = "typst-concealer-service-test",
@@ -1134,8 +1095,6 @@ local function make_service_response_harness(name, opts, fn)
   with_stubbed_uv(function(spawned)
     package.loaded["typst-concealer"] = {
       config = {
-        typst_location = "typst",
-        use_compiler_service = true,
         use_formula_service = opts.use_formula_service == true,
         formula_worker_count = opts.formula_worker_count or 2,
         service_binary = "typst-concealer-service-test",
@@ -1456,8 +1415,6 @@ local function test_formula_transport_batch_does_not_install_buffer_active_reque
   with_stubbed_uv(function(spawned)
     package.loaded["typst-concealer"] = {
       config = {
-        typst_location = "typst",
-        use_compiler_service = true,
         use_formula_service = true,
         formula_worker_count = 2,
         service_binary = "typst-concealer-service-test",
@@ -1682,8 +1639,6 @@ local function test_formula_transport_stale_response_reschedules_pending_node()
   with_stubbed_uv(function(spawned)
     package.loaded["typst-concealer"] = {
       config = {
-        typst_location = "typst",
-        use_compiler_service = true,
         use_formula_service = true,
         formula_worker_count = 2,
         service_binary = "typst-concealer-service-test",
@@ -1883,8 +1838,6 @@ local function test_formula_manager_self_check_reschedules_lost_candidate()
   with_stubbed_uv(function(spawned)
     package.loaded["typst-concealer"] = {
       config = {
-        typst_location = "typst",
-        use_compiler_service = true,
         use_formula_service = true,
         formula_worker_count = 2,
         service_binary = "typst-concealer-service-test",
@@ -2048,7 +2001,7 @@ local function test_formula_diagnostics_replace_per_node()
       })
       wait_until_service_request_cleared(ctx.state, ctx.bufnr)
 
-      local bucket = ctx.state.watch_diagnostics[ctx.bufnr]
+      local bucket = ctx.state.render_diagnostics[ctx.bufnr]
       assert_eq(#bucket.full, 1, "formula diagnostic should be published in the aggregate full bucket")
       assert_eq(bucket.formula_by_node[job.node_id][1], bucket.full[1], "formula diagnostic should be stored by node")
 
@@ -2110,7 +2063,7 @@ local function test_formula_diagnostics_replace_per_node()
         wait_until_formula_batch_cleared(ctx.state, ctx.bufnr, second_request_id)
       end)
 
-      bucket = ctx.state.watch_diagnostics[ctx.bufnr]
+      bucket = ctx.state.render_diagnostics[ctx.bufnr]
       assert_eq(bucket.formula_by_node[job.node_id], nil, "clean formula response should clear that node's diagnostics")
       assert_eq(#bucket.full, 0, "clean formula response should remove stale aggregate diagnostics")
 
@@ -2160,7 +2113,7 @@ function _G.test_service_error_diagnostics_clear_candidate_placeholder()
       )
       assert_eq(#calls.created, 0, "error diagnostics should not upload a placeholder image")
       assert_truthy(
-        ctx.state.watch_diagnostics[ctx.bufnr].full[1].text:find("unknown variable: mathbb", 1, true) ~= nil,
+        ctx.state.render_diagnostics[ctx.bufnr].full[1].text:find("unknown variable: mathbb", 1, true) ~= nil,
         "error diagnostics should still be published"
       )
     end)
@@ -2415,8 +2368,6 @@ local function test_service_spawn_failure_cleans_candidate()
   with_stubbed_uv(function()
     package.loaded["typst-concealer"] = {
       config = {
-        typst_location = "typst",
-        use_compiler_service = true,
         service_binary = "typst-concealer-service-test",
         ppi = 300,
         compiler_args = {},
@@ -2481,7 +2432,7 @@ local function test_service_diagnostics_mapping()
       },
     })
     wait_until_service_request_cleared(ctx.state, ctx.bufnr)
-    local item = ctx.state.watch_diagnostics[ctx.bufnr].full[1]
+    local item = ctx.state.render_diagnostics[ctx.bufnr].full[1]
     assert_eq(real_path(item.filename), real_path(ctx.main_path), "exact body diagnostic should map to source file")
     assert_eq(item.lnum, 1, "exact body diagnostic should map to source line")
     assert_truthy(item.text:find("%[service%] body failed") ~= nil, "exact diagnostic should use service prefix")
@@ -2502,7 +2453,7 @@ local function test_service_diagnostics_mapping()
         },
       })
       wait_until_service_request_cleared(ctx.state, ctx.bufnr)
-      local item = ctx.state.watch_diagnostics[ctx.bufnr].full[1]
+      local item = ctx.state.render_diagnostics[ctx.bufnr].full[1]
       assert_eq(item.filename, meta.generated_input_path, "generated diagnostic should point to generated input")
       assert_truthy(
         item.text:find("%[service/generated%] wrapper failed") ~= nil,
@@ -2536,7 +2487,7 @@ local function test_service_diagnostics_mapping()
       },
     })
     wait_until_service_request_cleared(ctx.state, ctx.bufnr)
-    local item = ctx.state.watch_diagnostics[ctx.bufnr].full[1]
+    local item = ctx.state.render_diagnostics[ctx.bufnr].full[1]
     assert_eq(item.filename, slot_path, "slot wrapper diagnostic should point to generated sidecar")
     assert_truthy(
       item.text:find("%[service/generated%] slot wrapper failed") ~= nil,
@@ -2558,7 +2509,7 @@ local function test_service_diagnostics_mapping()
       },
     })
     wait_until_service_request_cleared(ctx.state, ctx.bufnr)
-    local item = ctx.state.watch_diagnostics[ctx.bufnr].full[1]
+    local item = ctx.state.render_diagnostics[ctx.bufnr].full[1]
     assert_eq(real_path(item.filename), real_path(external), "external diagnostic should keep external file")
     assert_truthy(
       item.text:find("%[service/external%] external failed") ~= nil,
@@ -2692,7 +2643,6 @@ local function test_live_preview_keeps_old_highlight_until_replacement_commits()
     end,
     config = {
       live_preview_enabled = true,
-      use_compiler_service = false,
       ppi = 300,
       header = "",
       compiler_args = {},
@@ -2703,10 +2653,9 @@ local function test_live_preview_keeps_old_highlight_until_replacement_commits()
 
   local preview_requests = {}
   package.loaded["typst-concealer.session"] = {
-    render_preview_tail = function(_, item)
+    render_preview_tail_via_service = function(_, item)
       preview_requests[#preview_requests + 1] = item
     end,
-    clear_preview_tail = function() end,
   }
 
   local source_item = make_render_item({
@@ -3195,7 +3144,7 @@ local function test_machine_reducer_enforces_request_identity_and_delayed_retire
   state, effects = reducer.reduce(state, { type = "full_render_requested", bufnr = 1 })
   assert_eq(count_effects(effects, "ensure_overlay_placeholder"), 1, "new node should get a placeholder")
   local request = first_effect(effects, "request_full_render")
-  assert_truthy(request, "full render should request watch rendering")
+  assert_truthy(request, "full render should request service rendering")
   local overlay = state.overlays[request.request.jobs[1].overlay_id]
   assert_eq(overlay.request_id, request.request.request_id, "overlay request id should be immutable candidate identity")
   assert_eq(overlay.page_index, 1, "overlay should record request page index")
@@ -5196,7 +5145,7 @@ local function test_cursor_visibility_does_not_expand_to_adjacent_formula()
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
-local function test_machine_runtime_builds_watch_render_job()
+local function test_machine_runtime_builds_service_render_job()
   local state = fresh_state()
   local reducer = require("typst-concealer.machine.reducer")
   local runtime = require("typst-concealer.machine.runtime")
@@ -5243,9 +5192,7 @@ end
 local function test_machine_runtime_retire_removes_overlay_entry()
   local state = fresh_state()
   package.loaded["typst-concealer"] = {
-    config = {
-      use_compiler_service = true,
-    },
+    config = {},
   }
   local runtime = require("typst-concealer.machine.runtime")
   state.machine_state.buffers[1] = { bufnr = 1, nodes = {}, node_order = {} }
@@ -5265,9 +5212,7 @@ end
 local function test_machine_runtime_reset_buffer_releases_candidate_resources()
   local state = fresh_state()
   package.loaded["typst-concealer"] = {
-    config = {
-      use_compiler_service = true,
-    },
+    config = {},
   }
   local page_path = vim.fn.tempname() .. ".png"
   write_file(page_path, "png")
@@ -5338,6 +5283,7 @@ local function test_machine_runtime_cursor_sync_renders_preview()
   package.loaded["typst-concealer"] = {
     config = {
       cursor_hover_throttle_ms = 0,
+      use_formula_service = false,
     },
   }
 
@@ -5696,7 +5642,6 @@ local function test_formula_cursor_fast_boundary_switch_only_touches_previous_an
       return true
     end,
     config = {
-      use_compiler_service = true,
       use_formula_service = true,
       conceal_in_normal = false,
     },
@@ -5803,7 +5748,6 @@ local function test_formula_cursor_preview_targets_single_placement()
       return true
     end,
     config = {
-      use_compiler_service = true,
       use_formula_service = true,
       live_preview_enabled = true,
       conceal_in_normal = false,
@@ -6033,7 +5977,7 @@ local function test_machine_runtime_scroll_refresh_reuploads_blocks_only()
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
-local function test_machine_resources_share_legacy_allocation_pool()
+local function test_machine_resources_share_apply_allocation_pool()
   local state = fresh_state()
   state.pid = 700
   local resources = require("typst-concealer.machine.resources")
@@ -6042,9 +5986,9 @@ local function test_machine_resources_share_legacy_allocation_pool()
   assert_eq(state.image_ids_in_use[image_id], 1, "machine allocation should reserve the image id")
 
   local apply = require("typst-concealer.apply")
-  local legacy_image_id = apply._new_image_id(2)
-  assert_eq(legacy_image_id, 701, "legacy apply allocation should share the machine resource pool")
-  assert_eq(state.image_ids_in_use[legacy_image_id], 2, "legacy allocation should reserve through resources")
+  local apply_image_id = apply._new_image_id(2)
+  assert_eq(apply_image_id, 701, "apply allocation should share the machine resource pool")
+  assert_eq(state.image_ids_in_use[apply_image_id], 2, "apply allocation should reserve through resources")
 
   state.image_id_to_extmark[image_id] = 901
   state.item_by_image_id[image_id] = { image_id = image_id }
@@ -6160,7 +6104,7 @@ local tests = {
   { test_vim_resized_renders_on_column_change, "ok VimResized renders on column change" },
   { test_root_prefers_cwd_fallback, "ok root fallback uses cwd" },
   { test_get_root_overrides_fallback, "ok get_root overrides root base" },
-  { test_session_render_request_tracks_current_request, "ok session tracks machine render requests" },
+  { test_session_render_request_tracks_active_service_request, "ok session tracks machine render requests" },
   { test_session_render_request_via_service_writes_json, "ok session writes compiler service requests" },
   { test_service_validates_page_contract, "ok service validates page contract" },
   { test_service_success_clears_active_meta, "ok service success clears active meta" },
@@ -6340,7 +6284,7 @@ local tests = {
     test_cursor_visibility_does_not_expand_to_adjacent_formula,
     "ok cursor visibility does not expand across adjacent formulas",
   },
-  { test_machine_runtime_builds_watch_render_job, "ok machine runtime builds watch render job" },
+  { test_machine_runtime_builds_service_render_job, "ok machine runtime builds service render job" },
   { test_machine_runtime_resets_buffer_snapshot, "ok machine runtime resets buffer snapshot" },
   { test_machine_runtime_retire_removes_overlay_entry, "ok machine runtime retire removes overlay entry" },
   {
@@ -6380,7 +6324,7 @@ local tests = {
     test_machine_runtime_scroll_refresh_reuploads_blocks_only,
     "ok machine runtime scroll refresh reuploads blocks only",
   },
-  { test_machine_resources_share_legacy_allocation_pool, "ok machine resources share legacy allocation pool" },
+  { test_machine_resources_share_apply_allocation_pool, "ok machine resources share apply allocation pool" },
   { test_commit_plan_reuses_stable_render_for_same_source, "ok commit_plan reuses same-source stable renders" },
   { test_commit_plan_does_not_reuse_render_for_changed_source, "ok commit_plan rejects changed-source stale renders" },
   { test_commit_plan_cleans_removed_items_immediately, "ok commit_plan cleans removed items immediately" },

@@ -1,4 +1,4 @@
---- Benchmark: compiler service vs typst watch render latency.
+--- Benchmark: compiler service render latency.
 ---
 --- Usage (from within a Neovim instance with typst-concealer loaded):
 ---   :luafile tests/bench_service.lua
@@ -7,9 +7,7 @@
 ---   nvim --server <socket> --remote-expr 'luaeval("dofile(\"tests/bench_service.lua\")")'
 
 local state = require("typst-concealer.state")
-local session = require("typst-concealer.session")
 local runtime = require("typst-concealer.machine.runtime")
-local main = require("typst-concealer")
 
 local bufnr = vim.api.nvim_get_current_buf()
 
@@ -59,40 +57,10 @@ local function print_service_bench()
   end
 end
 
--- Print last watch benchmark data if available.
-local function print_watch_bench()
-  local b = state._last_watch_bench
-  if b == nil then
-    print("[bench] No watch benchmark data yet. Switch to watch mode and trigger a render.")
-    return
-  end
-
-  local lines = {
-    "╔══════════════════════════════════════════════════════════╗",
-    "║         typst watch benchmark                           ║",
-    "╠══════════════════════════════════════════════════════════╣",
-    string.format("║  page index:     %-38d ║", b.page_index or 0),
-    string.format("║  poll cycles:    %-38d ║", b.poll_cycles or 0),
-    "╠══════════════════════════════════════════════════════════╣",
-    string.format("║  [Watch] file→stable: %-33s ║", fmt_us(b.file_stable_us)),
-    string.format("║  [Lua]   dispatch:    %-33s ║", fmt_us(b.lua_dispatch_us)),
-    string.format("║  [E2E]   roundtrip:   %-33s ║", fmt_us(b.roundtrip_us)),
-    "╚══════════════════════════════════════════════════════════╝",
-  }
-  for _, l in ipairs(lines) do
-    print(l)
-  end
-end
-
 -- Run a quick N-iteration micro-benchmark by programmatically editing
 -- the buffer and measuring compile roundtrip each time.
 local function run_bench(n)
   n = n or 5
-
-  if not main.config.use_compiler_service then
-    print("[bench] This benchmark requires use_compiler_service = true")
-    return
-  end
 
   print(string.format("[bench] Running %d iterations on buf %d ...", n, bufnr))
 
@@ -213,7 +181,6 @@ end
 -- Export for interactive use
 _G.typst_bench = {
   service = print_service_bench,
-  watch = print_watch_bench,
   run = run_bench,
 }
 

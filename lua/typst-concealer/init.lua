@@ -110,8 +110,6 @@ end
 -- ── Public API ─────────────────────────────────────────────────────────────────
 
 --- @class typstconfig
---- @field typst_location?        string    Path to typst binary. Defaults to "typst" (PATH).
---- @field use_compiler_service?  boolean   Route full overlay renders through typst-concealer-service. Default false.
 --- @field use_formula_service?   boolean   Use formula-level compiler-service requests for full overlays. Default true.
 --- @field formula_worker_count?  integer   Worker count for formula-level service batches. Default 2.
 --- @field service_binary?        string    Path to typst-concealer-service. Defaults to "typst-concealer-service".
@@ -122,7 +120,7 @@ end
 --- @field ppi?                   integer   Fallback PPI when terminal pixel size is unavailable.
 --- @field math_baseline_pt?      number    Expected math line height in pt for 1 terminal row. Default 11.
 --- @field conceal_in_normal      boolean   Keep concealing when the cursor is on a line in normal mode.
---- @field compiler_args?         string[]  Extra typst CLI arguments.
+--- @field compiler_args?         string[]  Backward-compatible `--input` arguments consumed by the service.
 --- @field header?                string    Custom Typst code prepended to every rendered document.
 --- @field mitex_package?         string    Typst package spec used for Markdown LaTeX math. Default "@preview/mitex:0.2.7".
 --- @field markdown_filetypes?    string[]  Filetypes treated as Markdown math sources. Default { "markdown" }.
@@ -243,22 +241,17 @@ local function buf_has_visible_window(bufnr)
   return false
 end
 
-local function maybe_stop_hidden_full_watch(bufnr)
+local function maybe_stop_hidden_compiler_service(bufnr)
   if not vim.api.nvim_buf_is_valid(bufnr) or not M.is_supported_bufnr(bufnr) or M._enabled_buffers[bufnr] ~= true then
     return
   end
   if buf_has_visible_window(bufnr) then
     return
   end
-  local session = require("typst-concealer.session")
-  if M.config.use_compiler_service or session.has_compiler_service(bufnr) then
-    session.stop_compiler_service(bufnr)
-  else
-    session.stop_watch_session(bufnr, "full")
-  end
+  require("typst-concealer.session").stop_compiler_service(bufnr)
 end
 
-local function maybe_resume_visible_full_watch(bufnr)
+local function maybe_resume_visible_compiler_service(bufnr)
   if
     not vim.api.nvim_buf_is_valid(bufnr)
     or not M.is_supported_bufnr(bufnr)
@@ -270,10 +263,7 @@ local function maybe_resume_visible_full_watch(bufnr)
   end
 
   local session = require("typst-concealer.session")
-  if M.config.use_compiler_service and session.has_compiler_service(bufnr) then
-    return
-  end
-  if not M.config.use_compiler_service and session.has_watch_session(bufnr, "full") then
+  if session.has_compiler_service(bufnr) then
     return
   end
   require("typst-concealer.machine.runtime").render_buf(bufnr)
@@ -326,7 +316,7 @@ local function attach_buffer_local_autocmds(bufnr)
     desc = "sync float preview when entering a supported buffer",
     callback = function(ev)
       vim.schedule(function()
-        maybe_resume_visible_full_watch(ev.buf)
+        maybe_resume_visible_compiler_service(ev.buf)
         local runtime = require("typst-concealer.machine.runtime")
         runtime.render_live_preview(ev.buf)
         runtime.sync_hover(ev.buf)
@@ -341,7 +331,7 @@ local function attach_buffer_local_autocmds(bufnr)
     callback = function(ev)
       require("typst-concealer.machine.runtime").clear_live_preview(ev.buf)
       vim.schedule(function()
-        maybe_stop_hidden_full_watch(ev.buf)
+        maybe_stop_hidden_compiler_service(ev.buf)
       end)
     end,
   })
@@ -381,7 +371,6 @@ M.disable_buf = function(bufnr)
   M._enabled_buffers[bufnr] = nil
   require("typst-concealer.state").clear_hover_timer(bufnr)
   local session = require("typst-concealer.session")
-  session.stop_watch_session(bufnr, "full")
   session.stop_compiler_service(bufnr)
   require("typst-concealer.machine.runtime").clear_live_preview(bufnr)
   require("typst-concealer.plan").hard_reset_buf(bufnr)
@@ -415,8 +404,6 @@ function M.setup(cfg)
   M._setup_ran = true
 
   M.config = {
-    typst_location = default(cfg.typst_location, "typst"),
-    use_compiler_service = default(cfg.use_compiler_service, false),
     use_formula_service = default(cfg.use_formula_service, true),
     formula_worker_count = default(cfg.formula_worker_count, 2),
     service_binary = default(cfg.service_binary, "typst-concealer-service"),
@@ -466,14 +453,6 @@ function M.setup(cfg)
   setup_prelude()
   refresh_cell_px_size()
   last_resize_columns = vim.o.columns
-
-  if not cfg.allow_missing_typst and vim.fn.executable(M.config.typst_location) ~= 1 then
-    if M.config.typst_location == "typst" then
-      error("Typst executable not found in path, typst-concealer will not work")
-    else
-      error("Typst executable not found at '" .. M.config.typst_location .. "', typst-concealer will not work")
-    end
-  end
 
   local typst_parser_installed = pcall(vim.treesitter.get_parser, 0, "typst")
   if typst_parser_installed == false then
@@ -657,7 +636,7 @@ function M.setup(cfg)
     desc = "sync float preview when entering a typst buffer",
     callback = function(ev)
       vim.schedule(function()
-        maybe_resume_visible_full_watch(ev.buf)
+        maybe_resume_visible_compiler_service(ev.buf)
         local runtime = require("typst-concealer.machine.runtime")
         runtime.render_live_preview(ev.buf)
         runtime.sync_hover(ev.buf)
@@ -668,10 +647,10 @@ function M.setup(cfg)
   vim.api.nvim_create_autocmd("WinEnter", {
     group = augroup,
     pattern = "*.typ",
-    desc = "resume full watch when a typst buffer becomes visible",
+    desc = "resume compiler service when a typst buffer becomes visible",
     callback = function(ev)
       vim.schedule(function()
-        maybe_resume_visible_full_watch(ev.buf)
+        maybe_resume_visible_compiler_service(ev.buf)
       end)
     end,
   })
@@ -722,18 +701,18 @@ function M.setup(cfg)
     callback = function(ev)
       require("typst-concealer.machine.runtime").clear_live_preview(ev.buf)
       vim.schedule(function()
-        maybe_stop_hidden_full_watch(ev.buf)
+        maybe_stop_hidden_compiler_service(ev.buf)
       end)
     end,
   })
 
   vim.api.nvim_create_autocmd("WinClosed", {
     group = augroup,
-    desc = "stop full watch when a typst buffer is no longer visible",
+    desc = "stop compiler service when a typst buffer is no longer visible",
     callback = function()
       vim.schedule(function()
         for bufnr in pairs(M._enabled_buffers) do
-          maybe_stop_hidden_full_watch(bufnr)
+          maybe_stop_hidden_compiler_service(bufnr)
         end
       end)
     end,
@@ -742,10 +721,10 @@ function M.setup(cfg)
   vim.api.nvim_create_autocmd({ "BufWipeout", "BufUnload" }, {
     group = augroup,
     pattern = "*.typ",
-    desc = "stop typst watch sessions for dead buffers",
+    desc = "stop compiler service for dead buffers",
     callback = function(ev)
       local session = require("typst-concealer.session")
-      session.stop_watch_sessions_for_buf(ev.buf)
+      session.stop_compiler_service(ev.buf)
       require("typst-concealer.state").clear_preview_timer(ev.buf)
       require("typst-concealer.plan").hard_reset_buf(ev.buf)
     end,

@@ -119,7 +119,7 @@ require("typst-concealer").setup({
 
 `get_root(bufnr, path, cwd, kind)` should return the absolute directory that concealer passes to Typst as `--root`. When omitted or when it returns `nil`, concealer falls back to the current working directory, then to the nearest directory containing `typst.toml`, and then to the current buffer directory.
 
-`compiler_args` is still passed through to Typst, but `--root` inside `compiler_args` is ignored because concealer computes the render root from `get_root` or the fallback root base itself.
+`compiler_args` is kept only for backward-compatible `--input key=value` entries. Prefer `get_inputs` for new configuration.
 
 Two other project hooks are available:
 
@@ -137,13 +137,13 @@ require("typst-concealer").setup({
 })
 ```
 
-- `get_inputs` appends extra `--input key=value` pairs to `typst watch` or the compiler service.
+- `get_inputs` appends extra `--input key=value` pairs to compiler-service requests.
 - `get_preamble_file` injects a project-level `.typ` file at the top of the generated batch document.
 
 ### Compiler Service
 
-Full overlay rendering and live preview can use the bundled Rust service instead
-of the legacy `typst watch` backend. Build it once, then enable it in setup:
+Full overlay rendering and live preview use the bundled Rust service. Build it
+once, then point setup at the binary when it is not already on `PATH`:
 
 ```sh
 cargo build --release --manifest-path service/Cargo.toml
@@ -151,7 +151,6 @@ cargo build --release --manifest-path service/Cargo.toml
 
 ```lua
 require("typst-concealer").setup({
-  use_compiler_service = true,
   service_binary = "/absolute/path/to/typst-concealer-service",
 })
 ```
@@ -166,9 +165,6 @@ wrapper/header space jump to a readable generated input file under
 `<root-base>/.typst-concealer/service-request-<request_id>.typ`. Diagnostics
 inside the original snippet still jump back to the source buffer, and diagnostics
 from external files keep the external path.
-
-If `use_compiler_service = false`, Typst full overlays and preview fall back to
-the legacy `typst watch` path.
 
 ## Known issues
 - A temporary render workspace is created under `<root-base>/.typst-concealer/`, where `<root-base>` is the directory returned by `get_root` or the fallback root. The plugin removes active session files when disabled, but the directory may remain after crashes and is safe to delete.
@@ -191,14 +187,13 @@ this plugin would crash since it breaks the preamble injection from the plugin. 
   }
 }
 ```
-and passing the `concealed` variable to `typst` in the configuration of the plugin:
+and passing the `concealed` variable to the compiler service in the configuration of the plugin:
 ```lua
 require("typst-concealer").setup({
   -- other options...
-  compiler_args = {
-    "--input",
-    "concealed=true",
-  },
+  get_inputs = function()
+    return { "concealed=true" }
+  end,
 })
 ```
 Then the crash should be avoided, and you can still have your actual theme/conf when you render the pdf/html.

@@ -1,6 +1,6 @@
 --- Path rewriting utilities for typst-concealer.
 --- Resolve asset paths against the source/project root first, then encode them
---- for the effective Typst `--root` used by the watch session.
+--- for the effective Typst root used by the compiler service.
 local M = {}
 
 local state = require("typst-concealer.state")

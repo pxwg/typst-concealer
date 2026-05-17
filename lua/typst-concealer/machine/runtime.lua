@@ -322,7 +322,7 @@ function M.build_compat_item(_machine_state, node, overlay)
   }
 end
 
---- Rebuild the legacy read model consumed by hover/live-preview code.
+--- Rebuild the compat read model consumed by hover/live-preview code.
 --- @param machine_state MachineState
 --- @param bufnr integer
 function M.rebuild_buffer_read_model(machine_state, bufnr)
@@ -523,12 +523,7 @@ local function run_request_full_render(effect)
     return
   end
   local session = require("typst-concealer.session")
-  local config = require("typst-concealer").config
-  if config.use_compiler_service and type(session.render_request_via_service) == "function" then
-    session.render_request_via_service(request.bufnr, request)
-  elseif type(session.render_request_via_watch) == "function" then
-    session.render_request_via_watch(request.bufnr, request)
-  end
+  session.render_request_via_service(request.bufnr, request)
 end
 
 local function run_request_formula_render_batch(effect)
@@ -586,7 +581,7 @@ local function run_retire_overlay(effect)
   -- same file path.  Multiple overlays may reference the same PNG (identical
   -- pixel hash), so unconditional deletion would destroy files still needed
   -- by visible or rendering overlays.
-  if require("typst-concealer").config.use_compiler_service and page_path then
+  if page_path then
     require("typst-concealer.session")._safe_unlink_service_artifact(page_path)
   end
   manager:sync_from_machine()
@@ -597,17 +592,9 @@ local function run_rerender_buffer(effect)
 end
 
 local function run_abandon_request(effect)
-  local config = require("typst-concealer").config
-  if config.use_compiler_service then
-    local meta = state.active_service_requests and state.active_service_requests[effect.bufnr]
-    if meta ~= nil and meta.request_id == effect.old_request_id then
-      meta.status = "abandoned"
-    end
-  else
-    local session = require("typst-concealer.session")
-    if type(session.abandon_request) == "function" then
-      session.abandon_request(effect.bufnr, effect.old_request_id, effect.new_request_id)
-    end
+  local meta = state.active_service_requests and state.active_service_requests[effect.bufnr]
+  if meta ~= nil and meta.request_id == effect.old_request_id then
+    meta.status = "abandoned"
   end
 end
 
@@ -724,12 +711,7 @@ end
 
 function M.render_live_preview(bufnr)
   local ok_main, main = pcall(require, "typst-concealer")
-  if
-    ok_main
-    and main.config
-    and main.config.use_compiler_service == true
-    and main.config.use_formula_service ~= false
-  then
+  if ok_main and main.config and main.config.use_formula_service ~= false then
     require("typst-concealer.formula.manager").sync_cursor_preview(bufnr)
     return
   end
@@ -743,12 +725,7 @@ end
 
 function M.sync_hover(bufnr)
   local ok_main, main = pcall(require, "typst-concealer")
-  if
-    ok_main
-    and main.config
-    and main.config.use_compiler_service == true
-    and main.config.use_formula_service ~= false
-  then
+  if ok_main and main.config and main.config.use_formula_service ~= false then
     require("typst-concealer.formula.manager").sync_cursor_conceal(bufnr)
     return
   end
@@ -785,12 +762,7 @@ end
 function M.render_preview_tail(bufnr, item)
   M.prepare_preview_request(bufnr, item)
   local session = require("typst-concealer.session")
-  local config = require("typst-concealer").config
-  if config.use_compiler_service and type(session.render_preview_tail_via_service) == "function" then
-    session.render_preview_tail_via_service(bufnr, item)
-  else
-    session.render_preview_tail(bufnr, item)
-  end
+  session.render_preview_tail_via_service(bufnr, item)
 end
 
 return M

@@ -1,4 +1,4 @@
---- Shared project scope resolution for planner and watch sessions.
+--- Shared project scope resolution for planner and compiler-service requests.
 
 local M = {}
 

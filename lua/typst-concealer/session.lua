@@ -1,19 +1,14 @@
 --- Render backend session management for typst-concealer.
---- Manages legacy `typst watch` sessions and Rust compiler-service processes.
---- Watch pages still use file polling; service pages use explicit JSON-lines
---- request/response boundaries. Machine-owned full pages are emitted as
---- overlay_page_ready events.
+--- Manages Rust compiler-service processes and JSON-lines request/response
+--- boundaries. Machine-owned full pages are emitted as overlay_page_ready
+--- events.
 ---
 --- TypstBackend interface
----   M.render_items_via_watch(bufnr, items)          dispatch full items to the watch session
 ---   M.render_request_via_service(bufnr, request)    dispatch full overlay request to Rust service
----   M.render_preview_tail(bufnr, item)              update the preview tail page
----   M.clear_preview_tail(bufnr)                     disable the preview tail page
----   M.ensure_watch_session(bufnr)                   start/reuse the full watch session
+---   M.render_formula_batch_via_service(bufnr, req)  dispatch formula overlay batch to Rust service
+---   M.render_preview_tail_via_service(bufnr, item)  dispatch live preview request to Rust service
 ---   M.ensure_compiler_service(bufnr)                start/reuse the Rust compiler service
----   M.stop_watch_session(bufnr, kind)               kill and clean up a session
 ---   M.stop_compiler_service(bufnr)                  kill and clean up compiler service
----   M.stop_watch_sessions_for_buf(bufnr)            kill the buffer session
 
 local state = require("typst-concealer.state")
 local M = {}
@@ -32,7 +27,7 @@ end
 --- Rebuild the global quickfix list for a buffer from active render diagnostics.
 --- @param bufnr integer
 local function rebuild_quickfix(bufnr)
-  local bucket = state.watch_diagnostics[bufnr] or {}
+  local bucket = state.render_diagnostics[bufnr] or {}
   local items = {}
   for _, kind in ipairs({ "full" }) do
     for _, item in ipairs(bucket[kind] or {}) do
@@ -48,8 +43,8 @@ local function rebuild_quickfix(bufnr)
 end
 
 local function rebuild_full_diagnostics_bucket(bufnr)
-  state.watch_diagnostics[bufnr] = state.watch_diagnostics[bufnr] or {}
-  local bucket = state.watch_diagnostics[bufnr]
+  state.render_diagnostics[bufnr] = state.render_diagnostics[bufnr] or {}
+  local bucket = state.render_diagnostics[bufnr]
   local items = {}
   for _, item in ipairs(bucket.full_base or {}) do
     items[#items + 1] = item
@@ -74,13 +69,13 @@ end
 --- @param bufnr integer
 --- @param kind  'full'
 local function clear_quickfix(bufnr, kind)
-  state.watch_diagnostics[bufnr] = state.watch_diagnostics[bufnr] or {}
+  state.render_diagnostics[bufnr] = state.render_diagnostics[bufnr] or {}
   if kind == "full" then
-    state.watch_diagnostics[bufnr].full_base = {}
-    state.watch_diagnostics[bufnr].formula_by_node = {}
-    state.watch_diagnostics[bufnr].full = {}
+    state.render_diagnostics[bufnr].full_base = {}
+    state.render_diagnostics[bufnr].formula_by_node = {}
+    state.render_diagnostics[bufnr].full = {}
   else
-    state.watch_diagnostics[bufnr][kind] = {}
+    state.render_diagnostics[bufnr][kind] = {}
   end
   rebuild_quickfix(bufnr)
 end
@@ -172,42 +167,9 @@ local function normalize_root(path)
   return normalize_path(path):gsub("/$", "")
 end
 
---- Determine whether a Typst-reported path refers to this session's generated
---- temporary input file. Typst may report the path as absolute or relative.
---- @param session typst_watch_session
---- @param file string
---- @return boolean
-local function is_session_input_path(session, file)
-  if file == nil or file == "" then
-    return false
-  end
-
-  local target = normalize_path(session.input_path)
-  local candidates = {
-    file,
-    vim.fn.getcwd() .. "/" .. file,
-    vim.fn.expand("~") .. "/" .. file,
-  }
-  if session.buf_dir then
-    candidates[#candidates + 1] = session.buf_dir .. "/" .. file
-  end
-  if session.source_root then
-    candidates[#candidates + 1] = session.source_root .. "/" .. file
-  end
-  if session.effective_root then
-    candidates[#candidates + 1] = session.effective_root .. "/" .. file
-  end
-
-  for _, candidate in ipairs(candidates) do
-    if normalize_path(candidate) == target then
-      return true
-    end
-  end
-  return false
-end
-
---- Discover Typst package roots once, preferring `typst info --format=json`.
---- Falls back to common environment variables and platform defaults.
+--- Discover Typst package roots once from common environment variables and
+--- platform defaults. The Rust service owns compilation, so Lua does not shell
+--- out to a Typst CLI for discovery.
 --- @return string[]
 local function get_typst_package_roots()
   if state.typst_package_roots ~= nil then
@@ -228,20 +190,6 @@ local function get_typst_package_roots()
     roots[#roots + 1] = norm
   end
 
-  local ok_main, main = pcall(require, "typst-concealer")
-  local typst_location = (ok_main and main.config and main.config.typst_location) or "typst"
-  local ok_run, result = pcall(vim.system, { typst_location, "info", "--format=json" }, { text = true })
-  if ok_run and result then
-    local completed = result:wait(1500)
-    if completed and completed.code == 0 and completed.stdout and completed.stdout ~= "" then
-      local ok_json, info = pcall(vim.json.decode, completed.stdout)
-      if ok_json and info and info.packages then
-        add(info.packages["package-cache-path"])
-        add(info.packages["package-path"])
-      end
-    end
-  end
-
   add(vim.env.TYPST_PACKAGE_CACHE_PATH)
   add(vim.env.TYPST_PACKAGE_PATH)
   add(vim.fn.expand("~/Library/Caches/typst/packages"))
@@ -258,7 +206,7 @@ end
 ---   - absolute paths
 ---   - Typst package references like @preview/pkg:1.2.3/file.typ
 ---   - paths relative to the buffer directory / project root
---- @param session typst_watch_session
+--- @param session table
 --- @param file string
 --- @return string
 local function resolve_typst_source_path(session, file)
@@ -299,54 +247,6 @@ local function resolve_typst_source_path(session, file)
   end
 
   return file
-end
-
---- Classify a Typst stderr location as either generated-wrapper space (map back
---- into the edited source buffer) or an external/real source file that should
---- be navigated directly.
---- @param session typst_watch_session
---- @param file string
---- @param lnum integer
---- @param col integer
---- @return table
-local function resolve_report_location(session, file, lnum, col)
-  if is_session_input_path(session, file) then
-    local mapped = map_generated_pos(session.line_map, lnum, col)
-    if mapped and mapped.exact then
-      return {
-        filename = mapped.filename,
-        lnum = mapped.lnum,
-        col = mapped.col,
-        exact = true,
-        generated = false,
-        item_idx = mapped.item_idx,
-        src_start = mapped.src_start,
-        src_end = mapped.src_end,
-      }
-    end
-
-    -- The error points into generated wrapper/prelude space rather than the
-    -- original item body. Jump directly to the generated cache file so the
-    -- user can inspect the real failing Typst source.
-    return {
-      filename = mapped and mapped.filename or session.input_path,
-      lnum = mapped and mapped.lnum or lnum,
-      col = mapped and mapped.col or col,
-      exact = true,
-      generated = true,
-      item_idx = mapped and mapped.item_idx or nil,
-      src_start = mapped and mapped.src_start or nil,
-      src_end = mapped and mapped.src_end or nil,
-    }
-  end
-
-  return {
-    filename = resolve_typst_source_path(session, file),
-    lnum = lnum,
-    col = col,
-    exact = true,
-    generated = false,
-  }
 end
 
 --- @param path string
@@ -480,108 +380,6 @@ local function resolve_preamble_include_line(bufnr, effective_root, kind)
   return '#include "' .. typst_path .. '"\n'
 end
 
---- Write debugging artifacts next to the generated input so path rewrite
---- issues can be inspected from the exact Typst source that was compiled.
---- @param session typst_watch_session
---- @param doc_str string
---- Remove previously rendered page images so a new watch cycle never consumes
---- stale pages before Typst finishes writing the current generation.
---- @param prefix string
-local function clear_session_output_pages(prefix)
-  local first = 1
-  while true do
-    local page_path = prefix .. "-" .. first .. ".png"
-    if vim.uv.fs_stat(page_path) == nil then
-      break
-    end
-    safe_unlink(page_path)
-    first = first + 1
-  end
-end
-
---- @param prefix string
---- @param page_idx integer
-local function clear_session_output_page(prefix, page_idx)
-  if type(page_idx) ~= "number" or page_idx < 1 then
-    return
-  end
-  safe_unlink(prefix .. "-" .. page_idx .. ".png")
-end
-
-local function parse_typst_stderr(session, text)
-  local items = {}
-  local current_msg = nil
-  local current_type = "E"
-  local current_has_location = false
-
-  local function fallback_item(msg, typ)
-    local mapped = map_generated_pos(session.line_map, 1, 1)
-    return {
-      filename = mapped and mapped.filename or vim.api.nvim_buf_get_name(session.bufnr),
-      lnum = mapped and mapped.lnum or 1,
-      col = mapped and mapped.col or 1,
-      text = msg,
-      type = typ or "E",
-    }
-  end
-
-  local function flush_pending_message()
-    if current_msg ~= nil and current_msg ~= "" and not current_has_location then
-      items[#items + 1] = fallback_item(current_msg, current_type)
-    end
-    current_msg = nil
-    current_type = "E"
-    current_has_location = false
-  end
-
-  for line in (text .. "\n"):gmatch("(.-)\n") do
-    local trimmed = vim.trim(line)
-
-    if trimmed == "" then
-      flush_pending_message()
-    else
-      local err_msg = trimmed:match("^error:%s*(.*)$")
-      local warn_msg = trimmed:match("^warning:%s*(.*)$")
-      if err_msg and err_msg ~= "" then
-        flush_pending_message()
-        current_msg = err_msg
-        current_type = "E"
-      elseif warn_msg and warn_msg ~= "" then
-        flush_pending_message()
-        current_msg = warn_msg
-        current_type = "W"
-      end
-
-      local file, lnum, col = trimmed:match("^┌─%s+(.+):(%d+):(%d+)$")
-      if not file then
-        file, lnum, col = trimmed:match("^╭─%s+(.+):(%d+):(%d+)$")
-      end
-      if not file then
-        file, lnum, col = trimmed:match("^%s*[╭┌]─%s+(.+):(%d+):(%d+)$")
-      end
-
-      if file and lnum and col then
-        current_has_location = true
-        local gen_lnum = tonumber(lnum)
-        local gen_col = tonumber(col)
-        local resolved = resolve_report_location(session, file, gen_lnum, gen_col)
-
-        items[#items + 1] = {
-          filename = resolved.filename,
-          lnum = resolved.lnum,
-          col = resolved.col,
-          text = current_msg or "typst watch error",
-          type = current_type,
-        }
-      end
-    end
-  end
-
-  flush_pending_message()
-
-  return items
-end
-
 local function diagnostics_have_errors(items)
   for _, item in ipairs(items or {}) do
     if item.type == "E" or item.severity == "error" or (item.severity == nil and item.type == nil) then
@@ -589,44 +387,6 @@ local function diagnostics_have_errors(items)
     end
   end
   return false
-end
-
-local function fail_active_watch_request_on_diagnostics(session, items)
-  if session.kind ~= "full" or not diagnostics_have_errors(items) then
-    return
-  end
-  local request = session.current_request
-  if request == nil or request.status ~= "active" then
-    return
-  end
-
-  request.status = "failed"
-  require("typst-concealer.machine.runtime").dispatch({
-    type = "render_request_failed",
-    bufnr = session.bufnr,
-    request_id = request.request_id,
-    reason = "typst watch diagnostics",
-  })
-end
-
---- Update quickfix from accumulated stderr chunks.
---- @param bufnr integer
---- @param kind  'full' | 'preview'
---- @param input_path string
---- @param chunks string[]
-local function update_quickfix_from_stderr(session)
-  local text = session.stderr_text or ""
-  if session.stderr_line_buffer and session.stderr_line_buffer ~= "" then
-    text = text .. session.stderr_line_buffer
-  end
-  local items = parse_typst_stderr(session, text)
-  for _, item in ipairs(items) do
-    item.text = ("[%s] %s"):format(session.kind, item.text)
-  end
-  state.watch_diagnostics[session.bufnr] = state.watch_diagnostics[session.bufnr] or {}
-  state.watch_diagnostics[session.bufnr][session.kind] = items
-  fail_active_watch_request_on_diagnostics(session, items)
-  rebuild_quickfix(session.bufnr)
 end
 
 --- Returns (and creates) a per-buffer cache directory.
@@ -726,56 +486,6 @@ function M._cleanup_service_workspace_for_buf(bufnr)
   end
 end
 
---- Generates the fixed input path for a watch session.
---- @param bufnr integer
---- @param source_root string|nil
---- @return string
-local function session_input_path(bufnr, source_root)
-  local dir = get_cache_dir(bufnr, source_root)
-  return dir .. "/.typst-concealer-" .. state.full_pid .. "-" .. bufnr .. ".typ"
-end
-
---- Generates the fixed output template/prefix for a watch session.
---- @param bufnr integer
---- @return string template, string prefix
-local function session_output_template(bufnr)
-  local prefix = "/tmp/tty-graphics-protocol-typst-concealer-" .. state.full_pid .. "-" .. bufnr
-  return prefix .. "-{p}.png", prefix
-end
-
---- @param bufnr integer
---- @param source_root string|nil
---- @return string
-local function session_preview_sidecar_path(bufnr, source_root)
-  local dir = get_cache_dir(bufnr, source_root)
-  return dir .. "/.typst-concealer-" .. state.full_pid .. "-" .. bufnr .. "-preview.typ"
-end
-
-local function get_watch_session(bufnr, kind)
-  local bucket = state.watch_sessions[bufnr]
-  return bucket and bucket[kind] or nil
-end
-
---- Report whether a watch session exists and is still alive.
---- @param bufnr integer
---- @param kind "full"
---- @return boolean
-function M.has_watch_session(bufnr, kind)
-  local session = get_watch_session(bufnr, kind)
-  return session ~= nil and session.dead ~= true
-end
-
-local function compose_session_items(session)
-  local items = {}
-  for _, item in ipairs(session.base_items or {}) do
-    items[#items + 1] = item
-  end
-  if session.preview_tail_item ~= nil then
-    items[#items + 1] = session.preview_tail_item
-  end
-  return items
-end
-
 --- @param request RenderRequest
 --- @return RenderRequestMeta
 local function build_render_request_meta(request)
@@ -822,233 +532,17 @@ local function build_render_request_meta(request)
   }
 end
 
---- Watch adapter metadata retains fixed output page maps required by typst
---- watch polling. Service code uses build_render_request_meta directly.
---- @param request RenderRequest
---- @return RenderRequestMeta
-local function build_watch_request_meta(request)
-  local meta = build_render_request_meta(request)
-  local page_to_overlay = {}
-  local overlay_to_page = {}
-  for i, job in ipairs(meta.jobs or {}) do
-    local page_index = job.request_page_index or i
-    if job.overlay_id ~= nil then
-      page_to_overlay[page_index] = job.overlay_id
-      overlay_to_page[job.overlay_id] = page_index
-    end
-  end
-  meta.page_to_overlay = page_to_overlay
-  meta.overlay_to_page = overlay_to_page
-  return meta
-end
-
-local function is_active_request_page(session, i)
-  local request = session.current_request
-  return request ~= nil and request.status == "active" and i >= 1 and i <= request.page_count
-end
-
-local function replace_current_request(session, request)
-  if session.current_request ~= nil then
-    session.current_request.status = "abandoned"
-  end
-  session.current_request = build_watch_request_meta(request)
-  return session.current_request
-end
-
-local function clear_request_output_pages(session, page_count)
-  local last_count = session.last_page_count or 0
-  local clear_count = math.max(last_count, page_count or 0)
-  for i = 1, clear_count do
-    clear_session_output_page(session.output_prefix, i)
-  end
-  session.page_state = {}
-  session.last_page_count = 0
-  -- If the generated input text is identical to the previous request, Typst
-  -- still needs a fresh write after pages were cleared.
-  session.last_input_text = nil
-end
-
-local function session_render_start_index(session)
-  local total = #(session.items or {})
-  if total == 0 then
-    return 1
-  end
-  local start_idx = tonumber(session.render_start_index) or 1
-  if start_idx > total then
-    return total + 1
-  end
-  return math.max(1, start_idx)
-end
-
-local FAST_POLL_INTERVAL_MS = 30
-local IDLE_POLL_INTERVAL_MS = 80
-local try_render_session_page
 local on_service_response
 local finish_service_response
 local get_compiler_service
 local send_next_service_payload
 local service_cache_key
 
---- @param session typst_watch_session
---- @return boolean
-local function full_pages_have_stable_renders(session)
-  local total = session.current_request and session.current_request.page_count or #(session.base_items or {})
-  if total == 0 then
-    return false
-  end
-  for i = 1, total do
-    local page_state = session.page_state[i]
-    if page_state == nil or page_state.rendered == nil then
-      return false
-    end
-  end
-  return true
-end
-
 --- @param bufnr integer
 --- @return string[]
 local function snapshot_full_context_preludes(bufnr)
   local bstate = state.buffer_render_state[bufnr]
   return (bstate and bstate.runtime_preludes) or {}
-end
-
---- @param session typst_watch_session
---- @param item table|nil
---- @return string
-local function build_preview_sidecar_document(session, item)
-  local wrapper = require("typst-concealer.wrapper")
-  local preview_item = item
-  if preview_item == nil then
-    preview_item = {
-      bufnr = session.bufnr,
-      range = { 0, 0, 0, 0 },
-      str = "[]",
-      prelude_count = 0,
-      node_type = "math",
-      semantics = { constraint_kind = "inline" },
-    }
-  else
-    preview_item = vim.tbl_extend("force", preview_item, {
-      prelude_count = preview_item.prelude_count or 0,
-    })
-  end
-
-  local doc_str = wrapper.build_item_fragment(
-    preview_item,
-    session.buf_dir,
-    session.source_root,
-    session.effective_root,
-    session.prelude_chunks
-  )
-  return doc_str
-end
-
---- @param session typst_watch_session
---- @param item table|nil
---- @return boolean, string?
-local function write_preview_sidecar(session, item)
-  local text = build_preview_sidecar_document(session, item)
-  if session.last_preview_sidecar_text == text then
-    return true
-  end
-  local ok, err = write_file_in_place(session.preview_sidecar_path, text)
-  if ok then
-    session.last_preview_sidecar_text = text
-  end
-  return ok, err
-end
-
-local function preview_tail_include_text(session)
-  return '#include "' .. session.preview_sidecar_root_relative_path .. '"'
-end
-
---- @param session typst_watch_session
---- @param item table|nil
---- @return table
-local function make_preview_tail_item(session, item)
-  local source = item or {}
-  return {
-    bufnr = session.bufnr,
-    image_id = source.image_id,
-    extmark_id = source.extmark_id,
-    range = source.range and vim.deepcopy(source.range) or { 0, 0, 0, 0 },
-    str = preview_tail_include_text(session),
-    source_str = source.source_str,
-    prelude_count = 0,
-    node_type = source.node_type or "math",
-    semantics = source.semantics or { constraint_kind = "inline" },
-    skip_wrapper = true,
-    render_target = source.render_target or "preview_tail_inactive",
-    source_image_id = source.source_image_id,
-  }
-end
-
---- @param session typst_watch_session
---- @param mode '"full"' | '"preview"'
-local function write_session_document(session, mode)
-  local items = compose_session_items(session)
-  if #items == 0 then
-    M.stop_watch_session(session.bufnr, session.kind)
-    return
-  end
-
-  local old_page_count = session.last_page_count or 0
-  session.items = items
-  session.line_map = nil
-  session.last_page_count = #items
-
-  if mode == "preview" then
-    local tail_idx = #session.base_items + 1
-    clear_session_output_page(session.output_prefix, tail_idx)
-    session.page_state[tail_idx] = nil
-    if old_page_count > #items then
-      clear_session_output_page(session.output_prefix, old_page_count)
-      session.page_state[old_page_count] = nil
-    end
-  else
-    -- Keep the previous full render visible until replacement pages arrive.
-    -- Only prune stale tail pages when the new document shrinks.
-    if old_page_count > #items then
-      for i = #items + 1, old_page_count do
-        clear_session_output_page(session.output_prefix, i)
-        session.page_state[i] = nil
-      end
-    end
-  end
-
-  if require("typst-concealer").config.do_diagnostics then
-    session.stderr_chunks = {}
-    session.stderr_text = ""
-    session.stderr_line_buffer = ""
-    clear_quickfix(session.bufnr, session.kind)
-  end
-
-  local wrapper = require("typst-concealer.wrapper")
-  local do_diagnostics = require("typst-concealer").config.do_diagnostics
-  local doc_str, line_map = wrapper.build_batch_document(
-    items,
-    session.buf_dir,
-    session.source_root,
-    session.effective_root,
-    "full",
-    session.prelude_chunks,
-    session.preamble_include_line,
-    do_diagnostics,
-    session.wrapper_cache
-  )
-  session.line_map = line_map
-  if session.last_input_text == doc_str then
-    return
-  end
-  local ok, err = write_file_in_place(session.input_path, doc_str)
-  if not ok then
-    vim.schedule(function()
-      vim.notify("[typst-concealer] failed to update watch input: " .. tostring(err), vim.log.levels.ERROR)
-    end)
-    return
-  end
-  session.last_input_text = doc_str
-  session.last_input_write_count = (session.last_input_write_count or 0) + 1
 end
 
 --- @param bufnr integer
@@ -1089,60 +583,6 @@ local function range_to_string(bufnr, range)
   end
 
   return table.concat(content, "\n")
-end
-
---- Stop a watch session and clean up its files.
---- @param bufnr integer
---- @param kind  'full'
-function M.stop_watch_session(bufnr, kind)
-  local bucket = state.watch_sessions[bufnr]
-  if bucket == nil or bucket[kind] == nil then
-    return
-  end
-  local session = bucket[kind]
-
-  if session.stderr_debounce and not session.stderr_debounce:is_closing() then
-    session.stderr_debounce:stop()
-    session.stderr_debounce:close()
-  end
-  if session.poll_timer and not session.poll_timer:is_closing() then
-    session.poll_timer:stop()
-    session.poll_timer:close()
-  end
-  if session.stdout and not session.stdout:is_closing() then
-    session.stdout:close()
-  end
-  if session.stderr and not session.stderr:is_closing() then
-    session.stderr:close()
-  end
-  if session.handle and not session.handle:is_closing() then
-    session.handle:kill(15)
-    session.handle:close()
-  end
-
-  safe_unlink(session.input_path)
-  safe_unlink(session.preview_sidecar_path)
-  for i = 1, session.last_page_count or 0 do
-    safe_unlink(session.output_prefix .. "-" .. i .. ".png")
-  end
-
-  bucket[kind] = nil
-  if state.watch_diagnostics[bufnr] then
-    state.watch_diagnostics[bufnr][kind] = nil
-    if next(state.watch_diagnostics[bufnr]) == nil then
-      state.watch_diagnostics[bufnr] = nil
-    end
-    rebuild_quickfix(bufnr)
-  end
-  if next(bucket) == nil then
-    state.watch_sessions[bufnr] = nil
-  end
-end
-
---- @param bufnr integer
-function M.stop_watch_sessions_for_buf(bufnr)
-  M.stop_watch_session(bufnr, "full")
-  M.stop_compiler_service(bufnr)
 end
 
 --- Called when a rendered page file is stable enough to inspect.
@@ -1214,71 +654,6 @@ local function build_page_update(bufnr, page_path, item, original_range, page_st
     natural_rows = natural_rows,
     source_rows = source_rows,
   }
-end
-
---- Called when a legacy rendered page is ready to display.
---- @param bufnr          integer
---- @param page_path      string
---- @param image_id       integer
---- @param extmark_id     integer
---- @param original_range table
---- @param page_stamp     string
-local function on_page_rendered(bufnr, page_path, image_id, extmark_id, original_range, page_stamp)
-  local item = state.get_item_by_image_id(image_id)
-  if item == nil or type(extmark_id) ~= "number" then
-    return false
-  end
-
-  local update = build_page_update(bufnr, page_path, item, original_range, page_stamp)
-  if update == nil then
-    return false
-  end
-  if item.preview_request_id ~= nil then
-    update.preview_request_id = item.preview_request_id
-    return require("typst-concealer.machine.runtime").accept_preview_page_update(update)
-  end
-  require("typst-concealer.apply").accept_page_update(update)
-  return true
-end
-
---- @param session typst_watch_session
---- @param request RenderRequestMeta
---- @param request_page_index integer
---- @param job RenderJob
---- @param page_path string
---- @param page_stamp string
---- @return boolean
-local function on_request_page_rendered(session, request, request_page_index, job, page_path, page_stamp)
-  if job == nil or request == nil or request.status ~= "active" then
-    return false
-  end
-  if request.page_to_overlay[request_page_index] ~= job.overlay_id then
-    return false
-  end
-
-  local update = build_page_update(session.bufnr, page_path, job, job.range, page_stamp)
-  if update == nil then
-    return false
-  end
-
-  require("typst-concealer.machine.runtime").dispatch({
-    type = "overlay_page_ready",
-    request_id = request.request_id,
-    request_page_index = request_page_index,
-    overlay_id = job.overlay_id,
-    owner_node_id = job.node_id,
-    owner_bufnr = job.bufnr,
-    owner_project_scope_id = job.project_scope_id,
-    render_epoch = job.render_epoch,
-    buffer_version = job.buffer_version,
-    layout_version = job.layout_version,
-    page_path = page_path,
-    page_stamp = page_stamp,
-    natural_cols = update.natural_cols,
-    natural_rows = update.natural_rows,
-    source_rows = update.source_rows,
-  })
-  return true
 end
 
 --- @param width_px integer
@@ -1986,8 +1361,8 @@ local function handle_compile_diagnostics(bufnr, meta, diagnostics)
     }
   end
 
-  state.watch_diagnostics[bufnr] = state.watch_diagnostics[bufnr] or {}
-  state.watch_diagnostics[bufnr].full_base = items
+  state.render_diagnostics[bufnr] = state.render_diagnostics[bufnr] or {}
+  state.render_diagnostics[bufnr].full_base = items
   rebuild_full_diagnostics_bucket(bufnr)
   rebuild_quickfix(bufnr)
 end
@@ -2014,8 +1389,8 @@ local function handle_formula_diagnostics(bufnr, meta, resp, job)
     return
   end
 
-  state.watch_diagnostics[bufnr] = state.watch_diagnostics[bufnr] or {}
-  local bucket = state.watch_diagnostics[bufnr]
+  state.render_diagnostics[bufnr] = state.render_diagnostics[bufnr] or {}
+  local bucket = state.render_diagnostics[bufnr]
   bucket.formula_by_node = bucket.formula_by_node or {}
   local node_id = resp.node_id or (job and job.node_id)
   if node_id == nil then
@@ -2101,7 +1476,7 @@ local function reconcile_formula_diagnostics_for_request(bufnr)
     return
   end
 
-  local bucket = state.watch_diagnostics[bufnr]
+  local bucket = state.render_diagnostics[bufnr]
   if bucket == nil or bucket.formula_by_node == nil then
     return
   end
@@ -2637,378 +2012,6 @@ on_service_response = function(bufnr, service_kind, resp)
     response_at = vim.uv.hrtime(),
   }
   finish_service_response(bufnr, service_kind, resp.request_id)
-end
-
---- @param session typst_watch_session
---- @param interval_ms integer
-local function set_session_poll_interval(session, interval_ms)
-  if session.poll_timer == nil or session.poll_timer:is_closing() then
-    return
-  end
-  if session.poll_interval_ms == interval_ms then
-    return
-  end
-  session.poll_interval_ms = interval_ms
-  session.poll_timer:stop()
-  session.poll_timer:start(
-    interval_ms,
-    interval_ms,
-    vim.schedule_wrap(function()
-      if session.dead then
-        return
-      end
-      local start_idx = session_render_start_index(session)
-      for i = start_idx, #(session.items or {}) do
-        local item = session.items[i]
-        try_render_session_page(session, i, item)
-      end
-    end)
-  )
-end
-
---- @param session typst_watch_session
---- @param i integer
---- @param item table|nil
---- @return boolean
-local function session_page_needs_render(session, i, item)
-  if item == nil or item.image_id == nil or item.render_target == "preview_tail_inactive" then
-    return false
-  end
-  if item.extmark_id == nil and not is_active_request_page(session, i) then
-    return false
-  end
-
-  local page_state = session.page_state[i]
-  if page_state == nil or page_state.rendered == nil then
-    return true
-  end
-
-  local page_path = session.output_prefix .. "-" .. i .. ".png"
-  local stat = vim.uv.fs_stat(page_path)
-  if stat == nil or stat.size == 0 then
-    return true
-  end
-
-  local stamp = tostring(stat.mtime.sec) .. ":" .. tostring(stat.mtime.nsec) .. ":" .. tostring(stat.size)
-  return page_state.rendered ~= stamp
-end
-
---- @param session typst_watch_session
-local function refresh_session_poll_interval(session)
-  local start_idx = session_render_start_index(session)
-  local has_pending = false
-  for i = start_idx, #(session.items or {}) do
-    if session_page_needs_render(session, i, session.items[i]) then
-      has_pending = true
-      break
-    end
-  end
-  set_session_poll_interval(session, has_pending and FAST_POLL_INTERVAL_MS or IDLE_POLL_INTERVAL_MS)
-end
-
---- Schedule a page render attempt once the poller decides the current stamp is ready enough.
---- @param session typst_watch_session
---- @param i integer
---- @param item table
---- @param page_path string
---- @param stamp string
-local function schedule_session_page_render(session, i, item, page_path, stamp)
-  local page_state = session.page_state[i] or {}
-  session.page_state[i] = page_state
-  local request = is_active_request_page(session, i) and session.current_request or nil
-  vim.schedule(function()
-    local current = get_watch_session(session.bufnr, session.kind)
-    if current ~= session then
-      return
-    end
-    if request ~= nil then
-      if session.current_request ~= request or request.status ~= "active" then
-        return
-      end
-      local job = request.jobs[i]
-      if job == nil then
-        return
-      end
-      if on_request_page_rendered(session, request, i, job, page_path, stamp) then
-        page_state.rendered = stamp
-        session.page_state[i] = page_state
-        refresh_session_poll_interval(session)
-      end
-      return
-    end
-
-    local before_item = state.get_item_by_image_id(item.image_id)
-    local before_stamp = before_item and before_item.page_stamp or nil
-    on_page_rendered(session.bufnr, page_path, item.image_id, item.extmark_id, item.range, stamp)
-    local after_item = state.get_item_by_image_id(item.image_id)
-    if after_item ~= nil and after_item.page_stamp == stamp and before_stamp ~= stamp then
-      page_state.rendered = stamp
-      session.page_state[i] = page_state
-      refresh_session_poll_interval(session)
-    end
-  end)
-end
-
---- Attempt to render page i of session.
---- First paint goes through immediately once the file exists and is non-empty.
---- Subsequent updates still require two consecutive equal stamps.
---- @param session typst_watch_session
---- @param i       integer
---- @param item    table
-try_render_session_page = function(session, i, item)
-  if item == nil or item.image_id == nil or item.render_target == "preview_tail_inactive" then
-    return
-  end
-  if item.extmark_id == nil and not is_active_request_page(session, i) then
-    return
-  end
-  local page_path = session.output_prefix .. "-" .. i .. ".png"
-  local stat = vim.uv.fs_stat(page_path)
-  if stat == nil or stat.size == 0 then
-    return
-  end
-
-  local stamp = tostring(stat.mtime.sec) .. ":" .. tostring(stat.mtime.nsec) .. ":" .. tostring(stat.size)
-  local page_state = session.page_state[i] or {}
-
-  -- First paint fast path: try immediately once a non-empty page appears.
-  if page_state.rendered == nil and page_state.last_seen == nil then
-    page_state.last_seen = stamp
-    session.page_state[i] = page_state
-    schedule_session_page_render(session, i, item, page_path, stamp)
-    return
-  end
-
-  -- Subsequent updates stay conservative and wait for a repeated stamp.
-  if page_state.last_seen ~= stamp then
-    page_state.last_seen = stamp
-    session.page_state[i] = page_state
-    return
-  end
-
-  if page_state.rendered == stamp then
-    return
-  end
-  schedule_session_page_render(session, i, item, page_path, stamp)
-end
-
---- @param session typst_watch_session
-local function ensure_session_poller(session)
-  if session.poll_timer ~= nil and not session.poll_timer:is_closing() then
-    return
-  end
-  session.poll_timer = vim.uv.new_timer()
-  session.poll_interval_ms = nil
-  refresh_session_poll_interval(session)
-end
-
---- Start or reuse a `typst watch` session for bufnr.
---- @param bufnr integer
---- @return typst_watch_session|nil
-function M.ensure_watch_session(bufnr)
-  local kind = "full"
-  local existing = get_watch_session(bufnr, kind)
-  if existing ~= nil and existing.handle ~= nil and not existing.dead then
-    return existing
-  end
-
-  local main = require("typst-concealer")
-  local config = main.config
-  local stdout = vim.uv.new_pipe()
-  local stderr = vim.uv.new_pipe()
-
-  local path_rewrite = require("typst-concealer.path-rewrite")
-  local project_scope = require("typst-concealer.project-scope").resolve(bufnr, kind)
-  local buf_dir = project_scope.buf_dir
-  local source_root = project_scope.source_root
-  local effective_root = project_scope.effective_root
-  -- Strip any --root from compiler_args (typst rejects duplicates). Source root
-  -- comes only from get_root or project auto-detection.
-  local filtered_compiler_args = {}
-  if config.compiler_args then
-    local i = 1
-    while i <= #config.compiler_args do
-      local arg = config.compiler_args[i]
-      if arg == "--root" and i + 1 <= #config.compiler_args then
-        i = i + 2
-      elseif arg:sub(1, 7) == "--root=" then
-        i = i + 1
-      else
-        filtered_compiler_args[#filtered_compiler_args + 1] = arg
-        i = i + 1
-      end
-    end
-  end
-
-  local input_path = session_input_path(bufnr, source_root)
-  local template, prefix = session_output_template(bufnr)
-  local preview_sidecar_path = session_preview_sidecar_path(bufnr, source_root)
-
-  local args = { "watch", input_path, template, "--ppi=" .. (state._render_ppi or config.ppi) }
-  for _, arg in ipairs(filtered_compiler_args) do
-    args[#args + 1] = arg
-  end
-  args[#args + 1] = "--root=" .. effective_root
-  for _, s in ipairs(project_scope.inputs or {}) do
-    args[#args + 1] = "--input"
-    args[#args + 1] = s
-  end
-
-  -- typst watch expects the input file to exist before startup.
-  local ok, err = write_file_in_place(input_path, main._styling_prelude)
-  if not ok then
-    vim.schedule(function()
-      vim.notify("[typst-concealer] failed to create watch input: " .. tostring(err), vim.log.levels.ERROR)
-    end)
-    return nil
-  end
-
-  local preview_sidecar_root_relative_path = path_rewrite.encode_root_relative(preview_sidecar_path, effective_root)
-  local preamble_include_line = resolve_preamble_include_line(bufnr, effective_root, kind)
-  local ok_preview, preview_err = write_preview_sidecar({
-    bufnr = bufnr,
-    buf_dir = buf_dir,
-    source_root = source_root,
-    effective_root = effective_root,
-    preview_sidecar_path = preview_sidecar_path,
-    prelude_chunks = {},
-    last_preview_sidecar_text = nil,
-  }, nil)
-  if not ok_preview then
-    vim.schedule(function()
-      vim.notify("[typst-concealer] failed to create preview sidecar: " .. tostring(preview_err), vim.log.levels.ERROR)
-    end)
-    return nil
-  end
-
-  local session = {
-    kind = kind,
-    bufnr = bufnr,
-    project_scope_id = project_scope.project_scope_id,
-    handle = nil,
-    stdout = stdout,
-    stderr = stderr,
-    input_path = input_path,
-    output_prefix = prefix,
-    output_template = template,
-    poll_timer = nil,
-    items = {},
-    base_items = {},
-    preview_tail_item = nil,
-    preview_sidecar_item = nil,
-    preview_sidecar_path = preview_sidecar_path,
-    preview_sidecar_root_relative_path = preview_sidecar_root_relative_path,
-    preamble_include_line = preamble_include_line,
-    preview_active = false,
-    prelude_chunks = {},
-    page_state = {},
-    render_start_index = 1,
-    poll_interval_ms = nil,
-    last_page_count = 0,
-    last_input_text = nil,
-    last_input_write_count = 0,
-    last_preview_sidecar_text = nil,
-    wrapper_cache = {
-      item_fragments = {},
-    },
-    current_request = nil,
-    line_map = nil,
-    stderr_chunks = {},
-    stderr_text = "",
-    stderr_line_buffer = "",
-    stderr_debounce = nil,
-    dead = false,
-    buf_dir = buf_dir,
-    source_root = source_root,
-    effective_root = effective_root,
-  }
-  session.preview_tail_item = make_preview_tail_item(session, nil)
-
-  local handle
-  handle = vim.uv.spawn(config.typst_location, {
-    stdio = { nil, stdout, stderr },
-    args = args,
-  }, function()
-    session.dead = true
-    if session.stderr_line_buffer and session.stderr_line_buffer ~= "" then
-      session.stderr_text = (session.stderr_text or "") .. session.stderr_line_buffer
-      session.stderr_line_buffer = ""
-    end
-    if config.do_diagnostics then
-      update_quickfix_from_stderr(session)
-    end
-    if session.stderr_debounce and not session.stderr_debounce:is_closing() then
-      session.stderr_debounce:stop()
-      session.stderr_debounce:close()
-      session.stderr_debounce = nil
-    end
-    if session.poll_timer and not session.poll_timer:is_closing() then
-      session.poll_timer:stop()
-      session.poll_timer:close()
-      session.poll_timer = nil
-    end
-    if stdout and not stdout:is_closing() then
-      stdout:close()
-    end
-    if stderr and not stderr:is_closing() then
-      stderr:close()
-    end
-    if handle and not handle:is_closing() then
-      handle:close()
-    end
-  end)
-
-  if handle == nil then
-    vim.schedule(function()
-      vim.notify("[typst-concealer] failed to spawn typst watch", vim.log.levels.ERROR)
-    end)
-    return nil
-  end
-
-  session.handle = handle
-
-  stdout:read_start(function() end)
-  stderr:read_start(function(err2, data)
-    if err2 ~= nil then
-      return
-    end
-    if not config.do_diagnostics then
-      return
-    end
-    if data ~= nil and data ~= "" then
-      session.stderr_line_buffer = (session.stderr_line_buffer or "") .. data
-      while true do
-        local nl = session.stderr_line_buffer:find("\n", 1, true)
-        if nl == nil then
-          break
-        end
-        local line = session.stderr_line_buffer:sub(1, nl)
-        session.stderr_text = (session.stderr_text or "") .. line
-        session.stderr_line_buffer = session.stderr_line_buffer:sub(nl + 1)
-      end
-
-      if session.stderr_debounce == nil or session.stderr_debounce:is_closing() then
-        session.stderr_debounce = vim.uv.new_timer()
-      end
-      session.stderr_debounce:stop()
-      session.stderr_debounce:start(
-        120,
-        0,
-        vim.schedule_wrap(function()
-          local current = get_watch_session(bufnr, kind)
-          if current ~= session or session.dead then
-            return
-          end
-          update_quickfix_from_stderr(session)
-        end)
-      )
-    end
-  end)
-
-  state.watch_sessions[bufnr] = state.watch_sessions[bufnr] or {}
-  state.watch_sessions[bufnr][kind] = session
-  ensure_session_poller(session)
-  return session
 end
 
 --- Report whether a compiler service exists and is still alive.
@@ -3739,36 +2742,6 @@ function M.stop_compiler_service(bufnr, kind)
   end
 end
 
---- Send a batch of items to the full watch session for rendering.
---- @param bufnr integer
---- @param items table[]
-function M.render_items_via_watch(bufnr, items)
-  local session = M.ensure_watch_session(bufnr)
-  if session == nil then
-    return
-  end
-  if session.current_request ~= nil then
-    session.current_request.status = "abandoned"
-    session.current_request = nil
-  end
-  session.base_items = items or {}
-  session.prelude_chunks = snapshot_full_context_preludes(bufnr)
-  if session.preview_active and session.preview_sidecar_item ~= nil then
-    session.preview_tail_item = make_preview_tail_item(session, session.preview_sidecar_item)
-  else
-    session.preview_tail_item = make_preview_tail_item(session, nil)
-  end
-  local ok_preview, preview_err = write_preview_sidecar(session, session.preview_sidecar_item)
-  if not ok_preview then
-    vim.schedule(function()
-      vim.notify("[typst-concealer] failed to refresh preview sidecar: " .. tostring(preview_err), vim.log.levels.ERROR)
-    end)
-  end
-  session.render_start_index = 1
-  write_session_document(session, "full")
-  refresh_session_poll_interval(session)
-end
-
 --- Send per-node formula jobs as a transport batch to the compiler service.
 --- Unlike render_request_via_service(), this does not install a buffer-global
 --- active request.  The batch is only IO bookkeeping; each job remains owned by
@@ -4115,107 +3088,6 @@ function M.render_preview_tail_via_service(bufnr, item)
   })
   if not sent then
     state.active_preview_service_requests[bufnr] = nil
-  end
-end
-
---- Send a machine-owned full render request to the watch session.
---- @param bufnr integer
---- @param request RenderRequest
-function M.render_request_via_watch(bufnr, request)
-  local session = M.ensure_watch_session(bufnr)
-  if session == nil then
-    return
-  end
-
-  local current_request = replace_current_request(session, request)
-  clear_request_output_pages(session, current_request.page_count)
-  -- Rewriting the same Typst document is still required after clearing pages:
-  -- watch only regenerates the fixed output paths when the input file changes.
-  session.last_input_text = nil
-  session.base_items = current_request.jobs
-  session.prelude_chunks = snapshot_full_context_preludes(bufnr)
-  if session.preview_active and session.preview_sidecar_item ~= nil then
-    session.preview_tail_item = make_preview_tail_item(session, session.preview_sidecar_item)
-  else
-    session.preview_tail_item = make_preview_tail_item(session, nil)
-  end
-  local ok_preview, preview_err = write_preview_sidecar(session, session.preview_sidecar_item)
-  if not ok_preview then
-    vim.schedule(function()
-      vim.notify("[typst-concealer] failed to refresh preview sidecar: " .. tostring(preview_err), vim.log.levels.ERROR)
-    end)
-  end
-  session.render_start_index = 1
-  write_session_document(session, "full")
-  refresh_session_poll_interval(session)
-end
-
---- Mark an in-flight machine request as abandoned if it is still current.
---- @param bufnr integer
---- @param old_request_id string
---- @param _new_request_id string
-function M.abandon_request(bufnr, old_request_id, _new_request_id)
-  local session = get_watch_session(bufnr, "full")
-  if session == nil or session.current_request == nil then
-    return
-  end
-  if session.current_request.request_id == old_request_id then
-    session.current_request.status = "abandoned"
-  end
-end
-
---- Update the transient preview tail page on the full watch session.
---- @param bufnr integer
---- @param item table
-function M.render_preview_tail(bufnr, item)
-  local session = get_watch_session(bufnr, "full")
-  if session == nil or #(session.base_items or {}) == 0 then
-    return
-  end
-
-  session.preview_sidecar_item = vim.deepcopy(item)
-  local ok, err = write_preview_sidecar(session, session.preview_sidecar_item)
-  if not ok then
-    vim.schedule(function()
-      vim.notify("[typst-concealer] failed to update preview sidecar: " .. tostring(err), vim.log.levels.ERROR)
-    end)
-    return
-  end
-
-  session.preview_active = true
-  session.preview_tail_item = make_preview_tail_item(session, item)
-  if full_pages_have_stable_renders(session) then
-    session.render_start_index = #session.base_items + 1
-  else
-    session.render_start_index = 1
-  end
-  write_session_document(session, "preview")
-  refresh_session_poll_interval(session)
-end
-
---- Disable the transient preview tail page on the full watch session.
---- @param bufnr integer
-function M.clear_preview_tail(bufnr)
-  local session = get_watch_session(bufnr, "full")
-  if session == nil then
-    return
-  end
-
-  local had_preview = session.preview_active
-  session.preview_active = false
-  session.preview_sidecar_item = nil
-  session.preview_tail_item = make_preview_tail_item(session, nil)
-  local ok, err = write_preview_sidecar(session, nil)
-  if not ok then
-    vim.schedule(function()
-      vim.notify("[typst-concealer] failed to clear preview sidecar: " .. tostring(err), vim.log.levels.ERROR)
-    end)
-  end
-
-  if had_preview then
-    session.render_start_index = #session.base_items + 1
-    write_session_document(session, "preview")
-    refresh_session_poll_interval(session)
   end
 end
 
