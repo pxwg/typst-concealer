@@ -73,6 +73,7 @@ local M = {}
 --- @field source_text string
 --- @field source_str string|nil
 --- @field source_text_hash string
+--- @field node_rev integer
 --- @field requires_mitex boolean|nil
 --- @field context_hash string
 --- @field prelude_count integer
@@ -116,6 +117,10 @@ local M = {}
 --- @field page_index integer|nil
 --- @field session_id string|nil
 --- @field render_epoch integer
+--- @field node_rev integer|nil
+--- @field context_id string|nil
+--- @field context_rev integer|nil
+--- @field source_text_hash string|nil
 --- @field buffer_version integer
 --- @field layout_version integer
 --- @field extmark_id integer|nil
@@ -125,6 +130,7 @@ local M = {}
 --- @field natural_cols integer|nil
 --- @field natural_rows integer|nil
 --- @field source_rows integer|nil
+--- @field terminal_upload_epoch integer|nil
 --- @field binding_buffer_version integer|nil
 --- @field binding_layout_version integer|nil
 --- @field binding_display_range Range4|nil
@@ -162,6 +168,8 @@ local M = {}
 --- @field next_slot_id integer
 --- @field shape_epoch integer
 --- @field render_context_hash string|nil
+--- @field context_id string|nil
+--- @field context_rev integer
 
 --- @class MachineCounters
 --- @field next_node_id integer
@@ -222,12 +230,16 @@ local M = {}
 --- @field bufnr integer
 --- @field project_scope_id string
 --- @field render_epoch integer
+--- @field node_rev integer|nil
+--- @field context_id string|nil
+--- @field context_rev integer|nil
 --- @field buffer_version integer
 --- @field layout_version integer
 --- @field item_idx integer
 --- @field range Range4
 --- @field display_range Range4
 --- @field source_text string
+--- @field source_text_hash string|nil
 --- @field str string
 --- @field prelude_count integer
 --- @field semantics NodeSemantics
@@ -263,11 +275,17 @@ local M = {}
 --- @field page_to_slot table<integer, string>|nil
 --- @field slot_to_node table<string, string>|nil
 --- @field slot_to_overlay table<string, string>|nil
+--- @field node_to_job table<string, RenderJob>|nil
 --- @field page_count integer
 --- @field status RenderRequestStatus
 --- @field line_map table[]|nil
 --- @field slot_line_maps table<string, table>|nil
+--- @field formula_line_maps table<string, table>|nil
+--- @field formula_line_offsets table<string, integer>|nil
+--- @field pending_formula_count integer|nil
+--- @field formula_response_count integer|nil
 --- @field generated_slot_paths table<string, string>|nil
+--- @field generated_node_paths table<string, string>|nil
 --- @field generated_context_path string|nil
 --- @field generated_input_path string|nil
 

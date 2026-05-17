@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
@@ -8,7 +9,10 @@ use image::{ColorType, ImageEncoder};
 use typst::diag::{Severity, SourceDiagnostic};
 use typst::layout::PagedDocument;
 
-use crate::protocol::{CompileRequest, CompileResponse, CompileStatus, DiagnosticInfo, PageResult};
+use crate::protocol::{
+    CompileRequest, CompileResponse, CompileStatus, DiagnosticInfo, FormulaNodeRequest,
+    FormulaRenderResponse, PageResult, RenderFormulasRequest,
+};
 use crate::world::ConcealerWorld;
 
 pub struct Compiler {
@@ -18,6 +22,7 @@ pub struct Compiler {
     prev_page_paths: Vec<PathBuf>,
     prev_page_dims: Vec<(u32, u32)>,
     prev_ppi: u32,
+    formula_artifacts: HashMap<u64, (PathBuf, u32, u32)>,
 }
 
 impl Compiler {
@@ -28,6 +33,7 @@ impl Compiler {
             prev_page_paths: Vec::new(),
             prev_page_dims: Vec::new(),
             prev_ppi: 0,
+            formula_artifacts: HashMap::new(),
         }
     }
 
@@ -191,6 +197,182 @@ impl Compiler {
         }
     }
 
+    pub fn render_formula(
+        &mut self,
+        req: &RenderFormulasRequest,
+        node: &FormulaNodeRequest,
+    ) -> FormulaRenderResponse {
+        let ppi = req.ppi.max(1);
+        let node_path = formula_node_path(&node.node_id);
+        let source_text = build_formula_entry_document(&req.context_source, &node_path);
+        self.world.update_with_virtuals(
+            source_text,
+            "/__typst_concealer__/main.typ",
+            req.root.clone(),
+            req.inputs.clone(),
+            vec![(node_path, node.source.clone())],
+        );
+        comemo::evict(30);
+
+        let cache_key = formula_cache_key(req, node, ppi);
+        if let Some((path, width_px, height_px)) = self.formula_artifacts.get(&cache_key) {
+            if path.exists() && self.world.cached_external_files_fresh() {
+                return FormulaRenderResponse {
+                    request_id: req.request_id.clone(),
+                    context_id: req.context_id.clone(),
+                    context_rev: req.context_rev,
+                    node_id: node.node_id.clone(),
+                    node_rev: node.node_rev,
+                    status: CompileStatus::Ok,
+                    path: Some(path.clone()),
+                    width_px: Some(*width_px),
+                    height_px: Some(*height_px),
+                    cached: true,
+                    diagnostics: Vec::new(),
+                    compile_us: Some(0),
+                    render_us: Some(0),
+                };
+            }
+        }
+
+        if let Err(err) = fs::create_dir_all(&req.output_dir) {
+            return FormulaRenderResponse {
+                request_id: req.request_id.clone(),
+                context_id: req.context_id.clone(),
+                context_rev: req.context_rev,
+                node_id: node.node_id.clone(),
+                node_rev: node.node_rev,
+                status: CompileStatus::Error,
+                path: None,
+                width_px: None,
+                height_px: None,
+                cached: false,
+                diagnostics: vec![DiagnosticInfo {
+                    message: format!("failed to create output directory: {err}"),
+                    severity: "error".to_string(),
+                    file: None,
+                    line: None,
+                    column: None,
+                }],
+                compile_us: None,
+                render_us: None,
+            };
+        }
+
+        let t_compile = Instant::now();
+        let warned = typst::compile::<PagedDocument>(&self.world);
+        let compile_us = t_compile.elapsed().as_micros() as u64;
+
+        let warnings = self.format_diagnostics(warned.warnings.iter());
+        let document = match warned.output {
+            Ok(document) => document,
+            Err(errors) => {
+                let mut diagnostics = warnings;
+                diagnostics.extend(self.format_diagnostics(errors.iter()));
+                return FormulaRenderResponse {
+                    request_id: req.request_id.clone(),
+                    context_id: req.context_id.clone(),
+                    context_rev: req.context_rev,
+                    node_id: node.node_id.clone(),
+                    node_rev: node.node_rev,
+                    status: CompileStatus::Error,
+                    path: None,
+                    width_px: None,
+                    height_px: None,
+                    cached: false,
+                    diagnostics,
+                    compile_us: Some(compile_us),
+                    render_us: None,
+                };
+            }
+        };
+
+        let Some(page) = document.pages.last() else {
+            return FormulaRenderResponse {
+                request_id: req.request_id.clone(),
+                context_id: req.context_id.clone(),
+                context_rev: req.context_rev,
+                node_id: node.node_id.clone(),
+                node_rev: node.node_rev,
+                status: CompileStatus::Error,
+                path: None,
+                width_px: None,
+                height_px: None,
+                cached: false,
+                diagnostics: vec![DiagnosticInfo {
+                    message: "formula rendered no pages".to_string(),
+                    severity: "error".to_string(),
+                    file: None,
+                    line: None,
+                    column: None,
+                }],
+                compile_us: Some(compile_us),
+                render_us: None,
+            };
+        };
+
+        let pixel_per_pt = ppi as f32 / 72.0;
+        let t_render = Instant::now();
+        let pixmap = typst_render::render(page, pixel_per_pt);
+        let render_us = t_render.elapsed().as_micros() as u64;
+        let dims = (pixmap.width(), pixmap.height());
+
+        let mut px_hasher = DefaultHasher::new();
+        pixmap.data().hash(&mut px_hasher);
+        let px_hash = px_hasher.finish();
+        let path = req.output_dir.join(format!(
+            "formula-{}-{px_hash:016x}.png",
+            sanitize_filename(&node.node_id)
+        ));
+
+        if !path.exists() {
+            if let Err(err) = write_pixmap_png(&path, &pixmap) {
+                let mut diagnostics = warnings;
+                diagnostics.push(DiagnosticInfo {
+                    message: format!("failed to write rendered formula: {err}"),
+                    severity: "error".to_string(),
+                    file: None,
+                    line: None,
+                    column: None,
+                });
+                return FormulaRenderResponse {
+                    request_id: req.request_id.clone(),
+                    context_id: req.context_id.clone(),
+                    context_rev: req.context_rev,
+                    node_id: node.node_id.clone(),
+                    node_rev: node.node_rev,
+                    status: CompileStatus::Error,
+                    path: None,
+                    width_px: None,
+                    height_px: None,
+                    cached: false,
+                    diagnostics,
+                    compile_us: Some(compile_us),
+                    render_us: Some(render_us),
+                };
+            }
+        }
+
+        self.formula_artifacts
+            .insert(cache_key, (path.clone(), dims.0, dims.1));
+
+        FormulaRenderResponse {
+            request_id: req.request_id.clone(),
+            context_id: req.context_id.clone(),
+            context_rev: req.context_rev,
+            node_id: node.node_id.clone(),
+            node_rev: node.node_rev,
+            status: CompileStatus::Ok,
+            path: Some(path),
+            width_px: Some(dims.0),
+            height_px: Some(dims.1),
+            cached: false,
+            diagnostics: warnings,
+            compile_us: Some(compile_us),
+            render_us: Some(render_us),
+        }
+    }
+
     fn format_diagnostics<'a>(
         &self,
         diagnostics: impl IntoIterator<Item = &'a SourceDiagnostic>,
@@ -216,7 +398,7 @@ impl Compiler {
 }
 
 fn write_pixmap_png(
-    path: &std::path::Path,
+    path: &Path,
     pixmap: &tiny_skia::Pixmap,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let file = fs::File::create(path)?;
@@ -228,6 +410,193 @@ fn write_pixmap_png(
         ColorType::Rgba8.into(),
     )?;
     Ok(())
+}
+
+fn build_formula_entry_document(context_source: &str, node_path: &str) -> String {
+    let mut source = String::new();
+    if !context_source.is_empty() {
+        source.push_str(context_source);
+        if !context_source.ends_with('\n') {
+            source.push('\n');
+        }
+        source.push_str("#pagebreak(weak: true)\n");
+    }
+    source.push_str("#include \"");
+    source.push_str(node_path);
+    source.push_str("\"\n");
+    source
+}
+
+fn formula_node_path(node_id: &str) -> String {
+    format!(
+        "/__typst_concealer__/nodes/{}.typ",
+        sanitize_filename(node_id)
+    )
+}
+
+fn formula_cache_key(req: &RenderFormulasRequest, node: &FormulaNodeRequest, ppi: u32) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    req.context_id.hash(&mut hasher);
+    req.context_source.hash(&mut hasher);
+    req.root.hash(&mut hasher);
+    ppi.hash(&mut hasher);
+    let mut inputs: Vec<_> = req.inputs.iter().collect();
+    inputs.sort_by(|a, b| a.0.cmp(b.0));
+    for (key, value) in inputs {
+        key.hash(&mut hasher);
+        value.hash(&mut hasher);
+    }
+    node.kind.hash(&mut hasher);
+    node.source_hash.hash(&mut hasher);
+    node.source.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn sanitize_filename(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+    }
+    if out.is_empty() {
+        "node".to_string()
+    } else {
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "typst-concealer-service-{name}-{}-{stamp}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn formula_cache_revalidates_imported_files() {
+        let root = temp_dir("formula-cache");
+        let output_dir = root.join("out");
+        fs::create_dir_all(&output_dir).unwrap();
+        fs::write(
+            root.join("dep.typ"),
+            "#rect(width: 8pt, height: 8pt, fill: red)\n",
+        )
+        .unwrap();
+
+        let req = RenderFormulasRequest {
+            request_id: "formula:test".to_string(),
+            cache_key: None,
+            context_id: "ctx".to_string(),
+            context_rev: 1,
+            context_source: String::new(),
+            root: root.clone(),
+            inputs: HashMap::new(),
+            output_dir: output_dir.clone(),
+            ppi: 72,
+            worker_count: None,
+            nodes: Vec::new(),
+        };
+        let node = FormulaNodeRequest {
+            node_id: "node".to_string(),
+            node_rev: 1,
+            source_hash: None,
+            kind: None,
+            source: "#include \"/dep.typ\"\n".to_string(),
+        };
+
+        let mut compiler = Compiler::new();
+        let first = compiler.render_formula(&req, &node);
+        assert!(matches!(&first.status, CompileStatus::Ok));
+        assert!(!first.cached);
+
+        let second = compiler.render_formula(&req, &node);
+        assert!(matches!(&second.status, CompileStatus::Ok));
+        assert!(second.cached);
+
+        thread::sleep(Duration::from_millis(20));
+        fs::write(
+            root.join("dep.typ"),
+            "#rect(width: 8pt, height: 8pt, fill: blue)\n",
+        )
+        .unwrap();
+
+        let third = compiler.render_formula(&req, &node);
+        assert!(matches!(&third.status, CompileStatus::Ok));
+        assert!(!third.cached);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn formula_context_prelude_controls_page_setup() {
+        let root = temp_dir("formula-context-page");
+        let output_dir = root.join("out");
+        fs::create_dir_all(&output_dir).unwrap();
+
+        let req = RenderFormulasRequest {
+            request_id: "formula:test".to_string(),
+            cache_key: None,
+            context_id: "ctx".to_string(),
+            context_rev: 1,
+            context_source:
+                "#set page(width: auto, height: auto, margin: (x: 0pt, y: 0pt), fill: none)\n"
+                    .to_string(),
+            root: root.clone(),
+            inputs: HashMap::new(),
+            output_dir: output_dir.clone(),
+            ppi: 72,
+            worker_count: None,
+            nodes: Vec::new(),
+        };
+        let node = FormulaNodeRequest {
+            node_id: "node".to_string(),
+            node_rev: 1,
+            source_hash: None,
+            kind: None,
+            source: "$x$\n".to_string(),
+        };
+
+        let mut compiler = Compiler::new();
+        let rendered = compiler.render_formula(&req, &node);
+        assert!(matches!(&rendered.status, CompileStatus::Ok));
+        let width = rendered.width_px.unwrap();
+        let height = rendered.height_px.unwrap();
+        assert!(
+            width < 200,
+            "expected auto-width formula page, got {width}px"
+        );
+        assert!(
+            height < 200,
+            "expected auto-height formula page, got {height}px"
+        );
+
+        let image = image::ImageReader::open(rendered.path.unwrap())
+            .unwrap()
+            .decode()
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(
+            image.get_pixel(0, 0).0[3],
+            0,
+            "formula page prelude should keep the background transparent"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 fn unpremultiply_to_rgba(pixmap: &tiny_skia::Pixmap) -> Vec<u8> {

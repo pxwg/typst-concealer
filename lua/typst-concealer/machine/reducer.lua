@@ -162,10 +162,13 @@ local function ensure_buffer(state, bufnr, project_scope_id)
       next_slot_id = 1,
       shape_epoch = 0,
       render_context_hash = nil,
+      context_id = nil,
+      context_rev = 1,
     }
     state.buffers[bufnr] = buf
   end
   ensure_slot_registry(buf)
+  buf.context_rev = buf.context_rev or 1
   return buf
 end
 
@@ -188,6 +191,8 @@ local function allocate_slot(buf, node)
     requires_mitex = node.requires_mitex,
     source_range = copy_range(node.source_range),
     source_rows = source_rows_from_range(node.source_range),
+    context_id = buf.context_id,
+    context_rev = buf.context_rev,
     context_hash = node.context_hash,
     prelude_count = node.prelude_count or 0,
     node_type = node.node_type,
@@ -233,6 +238,8 @@ local function sync_slot_from_node(buf, node, force_dirty)
   slot.requires_mitex = node.requires_mitex
   slot.source_range = copy_range(node.source_range)
   slot.source_rows = source_rows_from_range(node.source_range)
+  slot.context_id = buf.context_id
+  slot.context_rev = buf.context_rev
   slot.context_hash = node.context_hash
   slot.prelude_count = node.prelude_count or 0
   slot.node_type = node.node_type
@@ -543,13 +550,21 @@ local function retire_orphans_covered_by_visible_nodes(state, buf, effects)
   end
 end
 
-local function node_render_inputs_equal(node, scanned)
+local function node_is_layout_sensitive(node)
+  local semantics = (node and node.semantics) or {}
+  return semantics.constraint_kind == "flow"
+end
+
+local function node_render_inputs_equal(node, scanned, layout_version)
+  local layout_equal = (not node_is_layout_sensitive(scanned))
+    or tonumber(node.last_layout_version) == tonumber(layout_version)
   return node.source_text_hash == scanned.source_text_hash
     and node.context_hash == scanned.context_hash
     and node.prelude_count == (scanned.prelude_count or 0)
     and node.node_type == scanned.node_type
     and source_rows_from_range(node.source_range) == source_rows_from_range(scanned.source_range)
     and semantics_equal(node.semantics, scanned.semantics)
+    and layout_equal
 end
 
 local function patch_node(prev, scanned, buffer_version, layout_version)
@@ -589,6 +604,7 @@ local function new_node(state, bufnr, project_scope_id, scanned, buffer_version,
     source_text = scanned.source_text,
     source_str = scanned.source_str,
     source_text_hash = scanned.source_text_hash,
+    node_rev = 1,
     requires_mitex = scanned.requires_mitex,
     context_hash = scanned.context_hash,
     prelude_count = scanned.prelude_count or 0,
@@ -614,6 +630,10 @@ local function new_overlay(state, buf, node, request_id, page_index, slot_id)
     page_index = page_index,
     session_id = "full:" .. tostring(buf.bufnr),
     render_epoch = buf.render_epoch,
+    node_rev = node.node_rev,
+    context_id = buf.context_id,
+    context_rev = buf.context_rev,
+    source_text_hash = node.source_text_hash,
     buffer_version = buf.buffer_version,
     layout_version = buf.layout_version,
     extmark_id = nil,
@@ -623,6 +643,7 @@ local function new_overlay(state, buf, node, request_id, page_index, slot_id)
     natural_cols = nil,
     natural_rows = nil,
     source_rows = nil,
+    terminal_upload_epoch = nil,
     binding_buffer_version = nil,
     binding_layout_version = nil,
     binding_display_range = nil,
@@ -642,6 +663,9 @@ local function render_job_from_node(node, overlay)
     bufnr = node.bufnr,
     project_scope_id = node.project_scope_id,
     render_epoch = overlay.render_epoch,
+    node_rev = overlay.node_rev,
+    context_id = overlay.context_id,
+    context_rev = overlay.context_rev,
     buffer_version = overlay.buffer_version,
     layout_version = overlay.layout_version,
     item_idx = node.item_idx,
@@ -650,6 +674,7 @@ local function render_job_from_node(node, overlay)
     display_prefix = node.display_prefix,
     display_suffix = node.display_suffix,
     source_text = node.source_text,
+    source_text_hash = node.source_text_hash,
     source_str = node.source_str,
     str = node.source_text,
     requires_mitex = node.requires_mitex,
@@ -718,12 +743,16 @@ local function render_stub_from_node(node, slot)
     node_id = node.node_id,
     bufnr = node.bufnr,
     project_scope_id = node.project_scope_id,
+    node_rev = node.node_rev,
+    context_id = slot.context_id,
+    context_rev = slot.context_rev,
     item_idx = node.item_idx,
     range = copy_range(node.source_range),
     display_range = copy_range(node.display_range),
     display_prefix = node.display_prefix,
     display_suffix = node.display_suffix,
     source_text = node.source_text,
+    source_text_hash = node.source_text_hash,
     source_str = node.source_str,
     str = node.source_text,
     requires_mitex = node.requires_mitex,
@@ -781,6 +810,45 @@ local function retire_old_request_candidates(state, buf, old_request_id, effects
       }
     end
   end
+end
+
+local function retire_node_candidate(state, node, effects)
+  if node == nil or node.candidate_overlay_id == nil then
+    return
+  end
+
+  local overlay = state.overlays[node.candidate_overlay_id]
+  if
+    overlay ~= nil
+    and overlay.status ~= "visible"
+    and overlay.status ~= "retiring"
+    and overlay.status ~= "retired"
+  then
+    overlay.status = "retiring"
+    effects[#effects + 1] = {
+      kind = "retire_overlay",
+      overlay_id = overlay.overlay_id,
+    }
+  end
+  node.candidate_overlay_id = nil
+end
+
+local function pending_candidate_matches_node(state, buf, node)
+  if node == nil or node.candidate_overlay_id == nil then
+    return false
+  end
+  local overlay = state.overlays[node.candidate_overlay_id]
+  return overlay ~= nil
+    and overlay.status ~= "visible"
+    and overlay.status ~= "retiring"
+    and overlay.status ~= "retired"
+    and overlay.owner_node_id == node.node_id
+    and overlay.owner_bufnr == buf.bufnr
+    and overlay.owner_project_scope_id == buf.project_scope_id
+    and overlay.node_rev == node.node_rev
+    and overlay.context_id == buf.context_id
+    and overlay.context_rev == buf.context_rev
+    and overlay.source_text_hash == node.source_text_hash
 end
 
 local function request_has_pending_overlay(state, buf, request_id)
@@ -850,6 +918,11 @@ local function reduce_nodes_scanned(state, ev)
     and buf.render_context_hash ~= next_context_hash
     and (buf.render_context_hash ~= nil or has_existing_slots)
   buf.project_scope_id = ev.project_scope_id
+  buf.context_id = ev.project_scope_id or buf.context_id
+  buf.context_rev = buf.context_rev or 1
+  if project_changed or context_changed then
+    buf.context_rev = buf.context_rev + 1
+  end
   buf.render_context_hash = next_context_hash
   buf.buffer_version = ev.buffer_version
   buf.layout_version = ev.layout_version
@@ -891,9 +964,11 @@ local function reduce_nodes_scanned(state, ev)
 
     if prev ~= nil then
       used_old[prev.node_id] = true
-      local unchanged = node_render_inputs_equal(prev, scanned)
+      local unchanged = node_render_inputs_equal(prev, scanned, ev.layout_version)
       local display_range_changed = not ranges_equal(prev.display_range, scanned.display_range)
+      local prev_node_rev = prev.node_rev or 1
       node = patch_node(prev, scanned, ev.buffer_version, ev.layout_version)
+      node.node_rev = unchanged and prev_node_rev or (prev_node_rev + 1)
       if unchanged and prev.status ~= "deleted_confirmed" then
         if node.candidate_overlay_id ~= nil then
           node.status = prev.status
@@ -903,7 +978,7 @@ local function reduce_nodes_scanned(state, ev)
           node.status = "pending"
         end
       else
-        node.candidate_overlay_id = nil
+        retire_node_candidate(new_state, node, effects)
         node.status = node.visible_overlay_id ~= nil and "stale" or "pending"
       end
       if
@@ -926,7 +1001,7 @@ local function reduce_nodes_scanned(state, ev)
 
   for node_id, old in pairs(old_nodes) do
     if not used_old[node_id] then
-      old.candidate_overlay_id = nil
+      retire_node_candidate(new_state, old, effects)
       old.missing_since_buffer_version = ev.buffer_version
       tombstone_slot(buf, old.slot_id, true)
       if old.visible_overlay_id ~= nil then
@@ -1058,6 +1133,114 @@ local function reduce_full_render_requested(state, ev)
   return new_state, effects
 end
 
+local function reduce_formula_renders_requested(state, ev)
+  local new_state = clone_state(state)
+  local effects = {}
+
+  local buf = new_state.buffers[ev.bufnr]
+  if buf == nil then
+    return new_state, effects
+  end
+
+  retire_orphans_covered_by_visible_nodes(new_state, buf, effects)
+  retire_orphans_without_replacement(new_state, buf, effects)
+  ensure_slot_registry(buf)
+
+  local jobs = {}
+  local requested = ev.node_ids
+  local requested_set = nil
+  if type(requested) == "table" then
+    requested_set = {}
+    for _, node_id in ipairs(requested) do
+      requested_set[node_id] = true
+    end
+  end
+
+  local request_id = nil
+  local function ensure_request_id()
+    if request_id == nil then
+      buf.render_epoch = (buf.render_epoch or 0) + 1
+      request_id = ev.request_id or next_id(new_state.counters, "next_request_id", "formula:")
+    end
+    return request_id
+  end
+
+  for _, slot_id in ipairs(buf.slot_order or {}) do
+    local slot = buf.slots[slot_id]
+    if slot ~= nil then
+      if slot.status == "tombstone" then
+        slot.pending_request_id = nil
+        slot.dirty = false
+      else
+        local node = slot.node_id and buf.nodes[slot.node_id] or nil
+        if
+          node ~= nil
+          and node.status ~= "orphaned"
+          and node.status ~= "deleted_confirmed"
+          and (requested_set == nil or requested_set[node.node_id])
+        then
+          local dirty = slot.status == "dirty" or slot.dirty == true or should_rerender_node(node)
+          if dirty then
+            if pending_candidate_matches_node(new_state, buf, node) then
+              local overlay = new_state.overlays[node.candidate_overlay_id]
+              node.status = "pending"
+              node.pending_request_id = overlay.request_id
+              slot.candidate_overlay_id = overlay.overlay_id
+              slot.pending_request_id = overlay.request_id
+              slot.status = "dirty"
+              slot.dirty = true
+              goto continue_slot
+            end
+
+            retire_node_candidate(new_state, node, effects)
+
+            local current_request_id = ensure_request_id()
+            local overlay = new_overlay(new_state, buf, node, current_request_id, slot.page_index, slot.slot_id)
+            node.candidate_overlay_id = overlay.overlay_id
+            node.status = "pending"
+            node.pending_request_id = current_request_id
+            slot.candidate_overlay_id = overlay.overlay_id
+            slot.pending_request_id = current_request_id
+            slot.status = "dirty"
+            slot.dirty = true
+            jobs[#jobs + 1] = render_job_from_node(node, overlay)
+
+            if node.visible_overlay_id == nil then
+              effects[#effects + 1] = {
+                kind = "ensure_overlay_placeholder",
+                overlay_id = overlay.overlay_id,
+                bufnr = buf.bufnr,
+                node_id = node.node_id,
+                display_range = copy_range(node.display_range),
+                semantics = deepcopy(node.semantics),
+              }
+            end
+          end
+        end
+      end
+      ::continue_slot::
+    end
+  end
+
+  if #jobs > 0 then
+    effects[#effects + 1] = {
+      kind = "request_formula_render_batch",
+      request = {
+        request_id = request_id,
+        bufnr = buf.bufnr,
+        project_scope_id = buf.project_scope_id,
+        render_epoch = buf.render_epoch,
+        buffer_version = buf.buffer_version,
+        layout_version = buf.layout_version,
+        shape_epoch = buf.shape_epoch or 0,
+        jobs = jobs,
+      },
+    }
+  end
+
+  return new_state, effects
+end
+
 local function reduce_overlay_page_ready(state, ev)
   local new_state = clone_state(state)
   local effects = {}
@@ -1095,6 +1278,15 @@ local function reduce_overlay_page_ready(state, ev)
   end
 
   if overlay.render_epoch ~= ev.render_epoch then
+    return new_state, effects
+  end
+  if ev.node_rev ~= nil and overlay.node_rev ~= ev.node_rev then
+    return new_state, effects
+  end
+  if ev.context_id ~= nil and overlay.context_id ~= ev.context_id then
+    return new_state, effects
+  end
+  if ev.context_rev ~= nil and overlay.context_rev ~= ev.context_rev then
     return new_state, effects
   end
   if overlay.buffer_version ~= ev.buffer_version then
@@ -1205,25 +1397,30 @@ local function reduce_buffer_layout_changed(state, ev)
 
   buf.layout_version = ev.new_layout_version
   ensure_slot_registry(buf)
-  buf.shape_epoch = (buf.shape_epoch or 0) + 1
   for _, node_id in ipairs(buf.node_order or {}) do
     local node = buf.nodes[node_id]
-    if node ~= nil and node.status ~= "orphaned" and node.status ~= "deleted_confirmed" then
-      node.candidate_overlay_id = nil
-      node.status = node.visible_overlay_id ~= nil and "stale" or "pending"
-      local slot = node.slot_id and buf.slots[node.slot_id] or nil
-      if slot ~= nil then
-        slot.candidate_overlay_id = nil
-        slot.status = "dirty"
-        slot.dirty = true
+    if
+      node ~= nil
+      and node.status ~= "orphaned"
+      and node.status ~= "deleted_confirmed"
+      and node.visible_overlay_id ~= nil
+    then
+      local overlay = new_state.overlays[node.visible_overlay_id]
+      if overlay_can_bind_without_render(overlay) then
+        effects[#effects + 1] = {
+          kind = "bind_overlay",
+          overlay_id = overlay.overlay_id,
+          request_id = overlay.request_id,
+          node_id = node.node_id,
+          bufnr = node.bufnr,
+          buffer_version = buf.buffer_version,
+          layout_version = ev.new_layout_version,
+          display_range = copy_range(node.display_range),
+          semantics = deepcopy(node.semantics),
+        }
       end
     end
   end
-
-  effects[#effects + 1] = {
-    kind = "rerender_buffer",
-    bufnr = ev.bufnr,
-  }
 
   return new_state, effects
 end
@@ -1312,6 +1509,15 @@ local function reduce_overlay_pages_batch_ready(state, ev)
     if overlay.render_epoch ~= entry.render_epoch then
       goto continue_entry
     end
+    if entry.node_rev ~= nil and overlay.node_rev ~= entry.node_rev then
+      goto continue_entry
+    end
+    if entry.context_id ~= nil and overlay.context_id ~= entry.context_id then
+      goto continue_entry
+    end
+    if entry.context_rev ~= nil and overlay.context_rev ~= entry.context_rev then
+      goto continue_entry
+    end
     if overlay.buffer_version ~= entry.buffer_version then
       goto continue_entry
     end
@@ -1343,6 +1549,62 @@ local function reduce_overlay_pages_batch_ready(state, ev)
 
     ::continue_entry::
   end
+
+  return new_state, effects
+end
+
+local function reduce_overlay_render_failed(state, ev)
+  local new_state = clone_state(state)
+  local effects = {}
+
+  local overlay = new_state.overlays[ev.overlay_id]
+  if overlay == nil then
+    return new_state, effects
+  end
+  local buf = new_state.buffers[overlay.owner_bufnr]
+  if buf == nil then
+    return new_state, effects
+  end
+  local node = buf.nodes[overlay.owner_node_id]
+  if node == nil then
+    return new_state, effects
+  end
+
+  if overlay.request_id ~= ev.request_id then
+    return new_state, effects
+  end
+  if ev.node_rev ~= nil and overlay.node_rev ~= ev.node_rev then
+    return new_state, effects
+  end
+  if ev.context_id ~= nil and overlay.context_id ~= ev.context_id then
+    return new_state, effects
+  end
+  if ev.context_rev ~= nil and overlay.context_rev ~= ev.context_rev then
+    return new_state, effects
+  end
+  if node.candidate_overlay_id ~= overlay.overlay_id then
+    return new_state, effects
+  end
+
+  overlay.status = "retiring"
+  node.candidate_overlay_id = nil
+  if node.status ~= "orphaned" and node.status ~= "deleted_confirmed" then
+    node.status = node.visible_overlay_id ~= nil and "stale" or "pending"
+  end
+
+  ensure_slot_registry(buf)
+  local slot = node.slot_id and buf.slots[node.slot_id] or nil
+  if slot ~= nil and slot.pending_request_id == ev.request_id then
+    slot.pending_request_id = nil
+    slot.candidate_overlay_id = nil
+    slot.status = "dirty"
+    slot.dirty = true
+  end
+
+  effects[#effects + 1] = {
+    kind = "retire_overlay",
+    overlay_id = overlay.overlay_id,
+  }
 
   return new_state, effects
 end
@@ -1458,6 +1720,53 @@ local function reduce_overlay_bindings_batch_succeeded(state, ev)
   return new_state, {}
 end
 
+local function reduce_visible_overlay_lost(state, ev)
+  local new_state = clone_state(state)
+  local effects = {}
+
+  local overlay = new_state.overlays[ev.overlay_id]
+  if overlay == nil then
+    return new_state, effects
+  end
+
+  local buf = new_state.buffers[overlay.owner_bufnr]
+  if buf == nil or (ev.bufnr ~= nil and buf.bufnr ~= ev.bufnr) then
+    return new_state, effects
+  end
+
+  local node = buf.nodes[overlay.owner_node_id]
+  if node == nil or (ev.node_id ~= nil and node.node_id ~= ev.node_id) then
+    return new_state, effects
+  end
+  if node.visible_overlay_id ~= overlay.overlay_id then
+    return new_state, effects
+  end
+
+  overlay.status = "retiring"
+  node.visible_overlay_id = nil
+  if node.status ~= "orphaned" and node.status ~= "deleted_confirmed" then
+    node.status = node.candidate_overlay_id ~= nil and "stale" or "pending"
+  end
+
+  ensure_slot_registry(buf)
+  local slot = node.slot_id and buf.slots[node.slot_id] or nil
+  if slot ~= nil then
+    slot.visible_overlay_id = nil
+    slot.status = "dirty"
+    slot.dirty = true
+    slot.candidate_overlay_id = node.candidate_overlay_id
+    local candidate = node.candidate_overlay_id and new_state.overlays[node.candidate_overlay_id] or nil
+    slot.pending_request_id = candidate and candidate.request_id or nil
+  end
+
+  effects[#effects + 1] = {
+    kind = "retire_overlay",
+    overlay_id = overlay.overlay_id,
+  }
+
+  return new_state, effects
+end
+
 local function reduce_node_deleted_confirmed(state, ev)
   local new_state = clone_state(state)
   local effects = {}
@@ -1497,6 +1806,8 @@ function M.reduce(state, event)
     return reduce_nodes_scanned(state, event)
   elseif event.type == "full_render_requested" then
     return reduce_full_render_requested(state, event)
+  elseif event.type == "formula_renders_requested" then
+    return reduce_formula_renders_requested(state, event)
   elseif event.type == "overlay_page_ready" then
     return reduce_overlay_page_ready(state, event)
   elseif event.type == "overlay_resources_allocated" then
@@ -1505,12 +1816,16 @@ function M.reduce(state, event)
     return reduce_overlay_commit_succeeded(state, event)
   elseif event.type == "overlay_pages_batch_ready" then
     return reduce_overlay_pages_batch_ready(state, event)
+  elseif event.type == "overlay_render_failed" then
+    return reduce_overlay_render_failed(state, event)
   elseif event.type == "overlay_commits_batch_succeeded" then
     return reduce_overlay_commits_batch_succeeded(state, event)
   elseif event.type == "render_request_completed" then
     return reduce_render_request_completed(state, event)
   elseif event.type == "overlay_bindings_batch_succeeded" then
     return reduce_overlay_bindings_batch_succeeded(state, event)
+  elseif event.type == "visible_overlay_lost" then
+    return reduce_visible_overlay_lost(state, event)
   elseif event.type == "buffer_layout_changed" then
     return reduce_buffer_layout_changed(state, event)
   elseif

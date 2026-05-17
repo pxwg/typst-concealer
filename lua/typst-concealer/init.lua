@@ -21,6 +21,9 @@ local TIOCGWINSZ = vim.fn.has("mac") == 1 and 0x40087468 or 0x5413
 --- Called at setup time and on VimResized.
 local function refresh_cell_px_size()
   local state = require("typst-concealer.state")
+  local old_cell_w = state._cell_px_w
+  local old_cell_h = state._cell_px_h
+  local old_ppi = state._render_ppi
   local ws = ffi.new("winsize_t")
   if ffi.C.ioctl(1, TIOCGWINSZ, ws) == 0 and ws.ws_xpixel > 0 and ws.ws_col > 0 then
     state._cell_px_w = ws.ws_xpixel / ws.ws_col
@@ -28,7 +31,30 @@ local function refresh_cell_px_size()
     local baseline_pt = (M.config and M.config.math_baseline_pt) or 10
     state._render_ppi = math.max(72, math.floor(state._cell_px_h * 72 / baseline_pt))
   end
+  return old_cell_w ~= state._cell_px_w or old_cell_h ~= state._cell_px_h or old_ppi ~= state._render_ppi
 end
+
+local last_resize_columns = vim.o.columns
+
+local function handle_vim_resized()
+  local previous_columns = last_resize_columns
+  local render_inputs_changed = refresh_cell_px_size()
+  local columns_changed = previous_columns ~= vim.o.columns
+  last_resize_columns = vim.o.columns
+
+  local runtime = require("typst-concealer.machine.runtime")
+  for bufnr in pairs(M._enabled_buffers) do
+    if M.is_supported_bufnr(bufnr) and M.is_render_allowed(bufnr) then
+      if render_inputs_changed or columns_changed then
+        runtime.render_buf(bufnr)
+      else
+        runtime.refresh_visible_overlays(bufnr, { force_reupload = true })
+      end
+    end
+  end
+end
+
+M._handle_vim_resized = handle_vim_resized
 
 -- ── Typst prelude / styling ────────────────────────────────────────────────────
 
@@ -86,6 +112,8 @@ end
 --- @class typstconfig
 --- @field typst_location?        string    Path to typst binary. Defaults to "typst" (PATH).
 --- @field use_compiler_service?  boolean   Route full overlay renders through typst-concealer-service. Default false.
+--- @field use_formula_service?   boolean   Use formula-level compiler-service requests for full overlays. Default true.
+--- @field formula_worker_count?  integer   Worker count for formula-level service batches. Default 2.
 --- @field service_binary?        string    Path to typst-concealer-service. Defaults to "typst-concealer-service".
 --- @field do_diagnostics?        boolean   Provide diagnostics on compile error.
 --- @field color?                 string    Render colour (only when styling_type = "colorscheme").
@@ -389,6 +417,8 @@ function M.setup(cfg)
   M.config = {
     typst_location = default(cfg.typst_location, "typst"),
     use_compiler_service = default(cfg.use_compiler_service, false),
+    use_formula_service = default(cfg.use_formula_service, true),
+    formula_worker_count = default(cfg.formula_worker_count, 2),
     service_binary = default(cfg.service_binary, "typst-concealer-service"),
     do_diagnostics = default(cfg.do_diagnostics, true),
     enabled_by_default = default(cfg.enabled_by_default, true),
@@ -435,6 +465,7 @@ function M.setup(cfg)
 
   setup_prelude()
   refresh_cell_px_size()
+  last_resize_columns = vim.o.columns
 
   if not cfg.allow_missing_typst and vim.fn.executable(M.config.typst_location) ~= 1 then
     if M.config.typst_location == "typst" then
@@ -681,10 +712,7 @@ function M.setup(cfg)
   vim.api.nvim_create_autocmd("VimResized", {
     group = augroup,
     desc = "refresh cell pixel size on terminal resize",
-    callback = function(ev)
-      refresh_cell_px_size()
-      require("typst-concealer.machine.runtime").render_buf(ev.buf)
-    end,
+    callback = handle_vim_resized,
   })
 
   vim.api.nvim_create_autocmd({ "BufLeave", "BufWinLeave", "BufHidden", "BufDelete" }, {

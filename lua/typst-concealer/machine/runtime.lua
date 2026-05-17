@@ -71,6 +71,10 @@ function M.invalidate_hover(bufnr)
 end
 
 function M.reconcile_visible_overlay_bindings(bufnr)
+  if state.formula_managers ~= nil and state.formula_managers[bufnr] ~= nil then
+    return require("typst-concealer.formula.manager").reconcile_visible_overlay_bindings(bufnr)
+  end
+
   local machine_state = ensure_machine_state()
   local buf = machine_state.buffers[bufnr]
   if buf == nil or not vim.api.nvim_buf_is_valid(bufnr) then
@@ -108,6 +112,14 @@ function M.reconcile_visible_overlay_bindings(bufnr)
   end
 
   return repaired
+end
+
+function M.invalidate_terminal_uploads(bufnr)
+  state.terminal_upload_epoch = (state.terminal_upload_epoch or 1) + 1
+  if bufnr ~= nil and vim.api.nvim_buf_is_valid(bufnr) then
+    M.schedule_visible_overlay_refresh(bufnr, { immediate = true })
+  end
+  return state.terminal_upload_epoch
 end
 
 local function get_window_visible_ranges(bufnr, margin)
@@ -166,128 +178,7 @@ function M.refresh_visible_overlays(bufnr, opts)
     return 0
   end
 
-  local ok_main, main = pcall(require, "typst-concealer")
-  if not ok_main or main._enabled_buffers[bufnr] ~= true or not main.is_render_allowed(bufnr) then
-    return 0
-  end
-
-  M.reconcile_visible_overlay_bindings(bufnr)
-
-  local machine_state = ensure_machine_state()
-  local buf = machine_state.buffers[bufnr]
-  if buf == nil then
-    return 0
-  end
-
-  local ranges = get_window_visible_ranges(bufnr, opts.margin or 2)
-  if #ranges == 0 then
-    return 0
-  end
-
-  local bs = state.get_buf_state(bufnr)
-  local previous_visible = bs.visible_refresh_visible_overlays or {}
-  local next_visible = {}
-  local refreshed = 0
-  local uploaded = false
-  local extmark = require("typst-concealer.extmark")
-
-  for _, node_id in ipairs(buf.node_order or {}) do
-    local node = buf.nodes[node_id]
-    local overlay = node and node.visible_overlay_id and machine_state.overlays[node.visible_overlay_id] or nil
-    if
-      overlay ~= nil
-      and overlay.status == "visible"
-      and overlay.image_id ~= nil
-      and overlay.page_path ~= nil
-      and overlay.natural_cols ~= nil
-      and overlay.natural_rows ~= nil
-      and overlay_intersects_any_window(node, overlay, ranges)
-    then
-      local is_block = node.semantics ~= nil and node.semantics.display_kind == "block"
-      if opts.skip_blocks == true and is_block then
-        local visible_key = table.concat({
-          tostring(overlay.page_stamp or ""),
-          tostring(overlay.page_path or ""),
-          tostring(overlay.image_id or ""),
-          tostring(overlay.extmark_id or ""),
-        }, "\0")
-        next_visible[overlay.overlay_id] = visible_key
-      else
-        local extmark_id = overlay.extmark_id
-        local concealing = concealing_for_cursor(node)
-        if extmark_id ~= nil then
-          extmark.swap_extmark_to_range(
-            bufnr,
-            overlay.image_id,
-            extmark_id,
-            node.display_range,
-            node.semantics,
-            concealing
-          )
-        else
-          extmark_id = resources.place_overlay_extmark(
-            bufnr,
-            overlay.image_id,
-            node.display_range,
-            nil,
-            concealing,
-            node.semantics
-          )
-        end
-
-        if extmark_id ~= overlay.extmark_id then
-          dispatch_without_effects({
-            type = "overlay_resources_allocated",
-            overlay_id = overlay.overlay_id,
-            image_id = overlay.image_id,
-            extmark_id = extmark_id,
-            binding_buffer_version = overlay.buffer_version,
-            binding_layout_version = overlay.layout_version,
-            binding_display_range = copy_range(node.display_range),
-          })
-          machine_state = ensure_machine_state()
-          overlay = machine_state.overlays[overlay.overlay_id]
-        end
-
-        local item = M.build_compat_item(machine_state, node, overlay)
-        if item ~= nil then
-          item.extmark_id = extmark_id
-          resources.bind_image_id(overlay.image_id, item, extmark_id)
-        end
-
-        local visible_key = table.concat({
-          tostring(overlay.page_stamp or ""),
-          tostring(overlay.page_path or ""),
-          tostring(overlay.image_id or ""),
-          tostring(extmark_id or ""),
-        }, "\0")
-        if
-          opts.force_reupload == true
-          or (opts.force_reupload_blocks == true and is_block)
-          or previous_visible[overlay.overlay_id] ~= visible_key
-        then
-          extmark.create_image(overlay.page_path, overlay.image_id, overlay.natural_cols, overlay.natural_rows)
-          uploaded = true
-        end
-        extmark.conceal_for_image_id(
-          bufnr,
-          overlay.image_id,
-          overlay.natural_cols,
-          overlay.natural_rows,
-          overlay.source_rows or 1
-        )
-        next_visible[overlay.overlay_id] = visible_key
-        refreshed = refreshed + 1
-      end
-    end
-  end
-
-  if uploaded then
-    extmark.flush_terminal_data()
-  end
-  bs.visible_refresh_visible_overlays = next_visible
-  M.rebuild_buffer_read_model(machine_state, bufnr)
-  return refreshed
+  return require("typst-concealer.formula.manager").update_presentation_all(bufnr, opts)
 end
 
 function M.schedule_visible_overlay_refresh(bufnr, opts)
@@ -405,6 +296,8 @@ function M.build_compat_item(_machine_state, node, overlay)
 
   return {
     bufnr = node.bufnr,
+    node_id = node.node_id,
+    overlay_id = overlay.overlay_id,
     image_id = overlay.image_id,
     extmark_id = overlay.extmark_id,
     item_idx = node.item_idx,
@@ -425,6 +318,7 @@ function M.build_compat_item(_machine_state, node, overlay)
     natural_cols = overlay.natural_cols,
     natural_rows = overlay.natural_rows,
     source_rows = overlay.source_rows,
+    terminal_upload_epoch = overlay.terminal_upload_epoch,
   }
 end
 
@@ -433,6 +327,10 @@ end
 --- @param bufnr integer
 function M.rebuild_buffer_read_model(machine_state, bufnr)
   machine_state = machine_state or ensure_machine_state()
+  if state.formula_managers ~= nil and state.formula_managers[bufnr] ~= nil then
+    require("typst-concealer.formula.manager").get(bufnr):sync_read_model()
+    return
+  end
   resources.rebuild_indices(machine_state, bufnr, M.build_compat_item)
 end
 
@@ -468,9 +366,13 @@ function M.reset_buffer(bufnr)
   if state.active_service_requests then
     state.active_service_requests[bufnr] = nil
   end
+  if state.active_formula_batches then
+    state.active_formula_batches[bufnr] = nil
+  end
   if state.active_preview_service_requests then
     state.active_preview_service_requests[bufnr] = nil
   end
+  require("typst-concealer.formula.manager").drop(bufnr)
   local session = require("typst-concealer.session")
   if type(session._cleanup_service_workspace_for_buf) == "function" then
     session._cleanup_service_workspace_for_buf(bufnr)
@@ -558,6 +460,9 @@ function M.build_render_job(machine_state, overlay_id)
     bufnr = node.bufnr,
     project_scope_id = node.project_scope_id,
     render_epoch = overlay.render_epoch,
+    node_rev = overlay.node_rev,
+    context_id = overlay.context_id,
+    context_rev = overlay.context_rev,
     buffer_version = overlay.buffer_version,
     layout_version = overlay.layout_version,
     item_idx = node.item_idx,
@@ -566,6 +471,7 @@ function M.build_render_job(machine_state, overlay_id)
     display_prefix = node.display_prefix,
     display_suffix = node.display_suffix,
     source_text = node.source_text,
+    source_text_hash = node.source_text_hash,
     source_str = node.source_str,
     str = node.source_text,
     requires_mitex = node.requires_mitex,
@@ -625,140 +531,37 @@ local function run_request_full_render(effect)
   end
 end
 
+local function run_request_formula_render_batch(effect)
+  local source_request = effect.request or {}
+  local request =
+    require("typst-concealer.formula.manager").get(source_request.bufnr):build_render_batch_request(source_request)
+
+  if #request.jobs == 0 then
+    return
+  end
+
+  local session = require("typst-concealer.session")
+  if type(session.render_formula_batch_via_service) == "function" then
+    session.render_formula_batch_via_service(request.bufnr, request)
+  end
+end
+
 local function run_commit_overlay(effect, batch_mode)
-  local overlay = ensure_overlay_resources(effect.overlay_id, { place_extmark = true })
-  local machine_state = ensure_machine_state()
-  overlay = machine_state.overlays[effect.overlay_id]
-  local _, node = get_overlay_and_node(machine_state, effect.overlay_id)
-  if overlay == nil or node == nil or overlay.image_id == nil or overlay.extmark_id == nil then
-    return nil
-  end
-
-  local item = M.build_compat_item(machine_state, node, overlay)
-  if item == nil then
-    return nil
-  end
-
-  resources.bind_image_id(item.image_id, item, item.extmark_id)
-
-  local extmark = require("typst-concealer.extmark")
-  extmark.create_image(effect.page_path, item.image_id, effect.natural_cols, effect.natural_rows)
-  extmark.conceal_for_image_id(
-    effect.bufnr,
-    item.image_id,
-    effect.natural_cols,
-    effect.natural_rows,
-    effect.source_rows
-  )
-
-  if batch_mode then
-    return { overlay_id = effect.overlay_id, node_id = effect.node_id, bufnr = effect.bufnr }
-  end
-
-  M.dispatch({
-    type = "overlay_commit_succeeded",
-    overlay_id = effect.overlay_id,
-    node_id = effect.node_id,
-  })
-  M.rebuild_buffer_read_model(ensure_machine_state(), effect.bufnr)
-  M.invalidate_hover(effect.bufnr)
-  if state.hooks.on_page_committed then
-    state.hooks.on_page_committed(effect.bufnr)
+  local placement =
+    require("typst-concealer.formula.manager").get(effect.bufnr):placement_for_overlay(effect.overlay_id)
+  if placement ~= nil then
+    return placement:commit_render(effect, batch_mode)
   end
   return nil
 end
 
 local function run_bind_overlay(effect)
-  local machine_state = ensure_machine_state()
-  local overlay, node, buf = get_overlay_and_node(machine_state, effect.overlay_id)
-  if overlay == nil or node == nil or buf == nil then
-    return nil
+  local placement =
+    require("typst-concealer.formula.manager").get(effect.bufnr):placement_for_overlay(effect.overlay_id)
+  if placement ~= nil then
+    return placement:bind(effect)
   end
-  if
-    overlay.status ~= "visible"
-    or node.visible_overlay_id ~= overlay.overlay_id
-    or overlay.request_id ~= effect.request_id
-    or overlay.owner_node_id ~= effect.node_id
-    or buf.buffer_version ~= effect.buffer_version
-    or buf.layout_version ~= effect.layout_version
-    or not ranges_equal(node.display_range, effect.display_range)
-  then
-    return nil
-  end
-  if
-    overlay.image_id == nil
-    or overlay.page_path == nil
-    or overlay.natural_cols == nil
-    or overlay.natural_rows == nil
-  then
-    return nil
-  end
-
-  local extmark = require("typst-concealer.extmark")
-  local extmark_id = overlay.extmark_id
-  local concealing = concealing_for_cursor(node)
-  if extmark_id ~= nil then
-    extmark.swap_extmark_to_range(
-      buf.bufnr,
-      overlay.image_id,
-      extmark_id,
-      node.display_range,
-      node.semantics,
-      concealing
-    )
-  else
-    extmark_id =
-      resources.place_overlay_extmark(buf.bufnr, overlay.image_id, node.display_range, nil, concealing, node.semantics)
-  end
-
-  local item = M.build_compat_item(machine_state, node, overlay)
-  if item == nil then
-    item = {
-      bufnr = node.bufnr,
-      image_id = overlay.image_id,
-      extmark_id = extmark_id,
-      range = copy_range(node.source_range),
-      display_range = copy_range(node.display_range),
-      display_prefix = node.display_prefix,
-      display_suffix = node.display_suffix,
-      str = node.source_text,
-      source_str = node.source_str,
-      source_text = node.source_text,
-      prelude_count = node.prelude_count,
-      node_type = node.node_type,
-      semantics = node.semantics,
-      requires_mitex = node.requires_mitex,
-      page_path = overlay.page_path,
-      page_stamp = overlay.page_stamp,
-      natural_cols = overlay.natural_cols,
-      natural_rows = overlay.natural_rows,
-      source_rows = overlay.source_rows,
-    }
-  end
-  item.extmark_id = extmark_id
-  resources.bind_image_id(overlay.image_id, item, extmark_id)
-  -- The kitty image is already loaded with this image_id; Unicode placeholder
-  -- mode (U=1) matches placeholders by fg-color == image_id, so repositioning
-  -- the extmark placeholder text is sufficient.  Re-uploading here is harmful
-  -- because the backing PNG may not exist yet (typst watch is recompiling).
-  extmark.conceal_for_image_id(
-    buf.bufnr,
-    overlay.image_id,
-    overlay.natural_cols,
-    overlay.natural_rows,
-    overlay.source_rows or 1
-  )
-
-  return {
-    overlay_id = overlay.overlay_id,
-    request_id = overlay.request_id,
-    node_id = node.node_id,
-    bufnr = buf.bufnr,
-    extmark_id = extmark_id,
-    buffer_version = effect.buffer_version,
-    layout_version = effect.layout_version,
-    display_range = copy_range(node.display_range),
-  }
+  return nil
 end
 
 local function run_retire_overlay(effect)
@@ -770,7 +573,13 @@ local function run_retire_overlay(effect)
 
   local bufnr = overlay.owner_bufnr
   local page_path = overlay.page_path
-  resources.release_overlay_resources(bufnr, overlay.image_id, overlay.extmark_id)
+  local manager = require("typst-concealer.formula.manager").get(bufnr)
+  local placement = manager:placement_for_overlay(effect.overlay_id)
+  if placement ~= nil then
+    placement:close({ overlay_id = effect.overlay_id })
+  else
+    resources.release_overlay_resources(bufnr, overlay.image_id, overlay.extmark_id)
+  end
   machine_state.overlays[effect.overlay_id] = nil
 
   -- Only delete the backing PNG when no other non-retired overlay shares the
@@ -780,7 +589,7 @@ local function run_retire_overlay(effect)
   if require("typst-concealer").config.use_compiler_service and page_path then
     require("typst-concealer.session")._safe_unlink_service_artifact(page_path)
   end
-  M.rebuild_buffer_read_model(machine_state, bufnr)
+  manager:sync_from_machine()
 end
 
 local function run_rerender_buffer(effect)
@@ -823,6 +632,8 @@ function M.run_effects(effects)
       run_ensure_overlay_placeholder(effect)
     elseif effect.kind == "request_full_render" then
       run_request_full_render(effect)
+    elseif effect.kind == "request_formula_render_batch" then
+      run_request_formula_render_batch(effect)
     elseif effect.kind == "retire_overlay" then
       run_retire_overlay(effect)
     elseif effect.kind == "rerender_buffer" then
@@ -849,9 +660,8 @@ function M.run_effects(effects)
         type = "overlay_bindings_batch_succeeded",
         entries = batch_entries,
       })
-      local ms = ensure_machine_state()
       for bufnr in pairs(affected_buffers) do
-        M.rebuild_buffer_read_model(ms, bufnr)
+        require("typst-concealer.formula.manager").get(bufnr):sync_from_machine()
         M.invalidate_hover(bufnr)
       end
     end
@@ -873,9 +683,8 @@ function M.run_effects(effects)
         type = "overlay_commits_batch_succeeded",
         entries = batch_entries,
       })
-      local ms = ensure_machine_state()
       for bufnr in pairs(affected_buffers) do
-        M.rebuild_buffer_read_model(ms, bufnr)
+        require("typst-concealer.formula.manager").get(bufnr):sync_from_machine()
         M.invalidate_hover(bufnr)
         if state.hooks.on_page_committed then
           state.hooks.on_page_committed(bufnr)
@@ -903,7 +712,27 @@ function M.schedule_full_render(bufnr, opts)
   require("typst-concealer.plan").schedule_full_render(bufnr, opts)
 end
 
+function M.schedule_formula_renders(bufnr, opts)
+  opts = opts or {}
+  return M.dispatch({
+    type = "formula_renders_requested",
+    bufnr = bufnr,
+    node_ids = opts.node_ids,
+    request_id = opts.request_id,
+  })
+end
+
 function M.render_live_preview(bufnr)
+  local ok_main, main = pcall(require, "typst-concealer")
+  if
+    ok_main
+    and main.config
+    and main.config.use_compiler_service == true
+    and main.config.use_formula_service ~= false
+  then
+    require("typst-concealer.formula.manager").sync_cursor_preview(bufnr)
+    return
+  end
   require("typst-concealer.plan").render_live_typst_preview(bufnr)
 end
 
@@ -913,14 +742,24 @@ function M.clear_live_preview(bufnr)
 end
 
 function M.sync_hover(bufnr)
+  local ok_main, main = pcall(require, "typst-concealer")
+  if
+    ok_main
+    and main.config
+    and main.config.use_compiler_service == true
+    and main.config.use_formula_service ~= false
+  then
+    require("typst-concealer.formula.manager").sync_cursor_conceal(bufnr)
+    return
+  end
   require("typst-concealer.plan").hide_extmarks_at_cursor(bufnr)
 end
 
 function M.sync_cursor_ui(bufnr)
-  M.render_live_preview(bufnr)
   local throttle = require("typst-concealer").config.cursor_hover_throttle_ms
   if throttle <= 0 then
     M.sync_hover(bufnr)
+    M.render_live_preview(bufnr)
     return
   end
 
@@ -934,6 +773,7 @@ function M.sync_cursor_ui(bufnr)
     0,
     vim.schedule_wrap(function()
       M.sync_hover(bufnr)
+      M.render_live_preview(bufnr)
     end)
   )
 end

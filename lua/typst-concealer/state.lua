@@ -68,6 +68,7 @@ M.watch_sessions = {}
 --- @field cache_dir string|nil
 --- @field inflight { kind: string, request_id: string, is_prewarm: boolean|nil, preview_context_hash: string|nil }|nil
 --- @field pending_full_request table|nil
+--- @field pending_formula_requests table[]|nil
 --- @field pending_preview_request table|nil
 --- @field pending_prewarm_requests table[]|nil
 --- @field preview_warmed_signatures table<string, boolean>|nil
@@ -77,6 +78,16 @@ M.compiler_services = {}
 
 --- @type { [integer]: RenderRequestMeta|nil }
 M.active_service_requests = {}
+
+--- Formula render batches are transport bookkeeping only.  Per-node ownership
+--- lives on machine nodes/overlays; a batch may contain many independent nodes.
+--- @type { [integer]: table<string, RenderRequestMeta> }
+M.active_formula_batches = {}
+
+--- Persistent per-buffer formula managers.  These are the UI/presentation
+--- boundary for formula nodes; the reducer remains the logical machine.
+--- @type table<integer, table>
+M.formula_managers = {}
 
 --- @type { [integer]: { request_id: string, item: table }|nil }
 M.active_preview_service_requests = {}
@@ -174,6 +185,9 @@ M._cell_px_h = nil
 --- PPI derived so that 1 typst text line ≈ 1 terminal cell height
 M._render_ppi = nil
 M.typst_package_roots = nil
+--- Monotonic generation for terminal-side image backing.  Incrementing this
+--- makes visible overlays re-upload their existing PNGs without re-rendering.
+M.terminal_upload_epoch = 1
 
 -- PID-derived base for image IDs (collision-resistant per session)
 M.pid = vim.fn.getpid() % 256

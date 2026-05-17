@@ -17,6 +17,7 @@ local candidate_bounds_penalty
 local candidate_obstacle_penalty
 local list_nearby_float_obstacles
 local cursor_in_range
+local scan_formula_matches
 
 --- Extract the text contained within a buffer range.
 --- @param range Range4
@@ -767,102 +768,40 @@ function M.render_buf(bufnr)
   end
 
   diagnostics = {}
-  state.runtime_preludes = {}
-
-  local bs = state.get_buf_state(bufnr)
-  local prev_state = state.buffer_render_state[bufnr] or {}
-  local source_kind = buffer_source_kind(bufnr)
-  if source_kind ~= "typst" and source_kind ~= "markdown" then
+  local scan, scan_reason = scan_formula_matches(bufnr, main)
+  if scan_reason == "unsupported" then
     M.hard_reset_buf(bufnr)
     return
   end
-
-  local units
-  local sorted_entries = {}
-  local binding_dirty_ranges = bs.binding_dirty_ranges
-
-  if source_kind == "typst" then
-    local parser, parser_err = get_buffer_parser(bufnr, "typst")
-    if parser == nil then
-      schedule_parser_retry(bufnr, "typst", bs, parser_err)
-      return
-    end
-    if bs.parser_retry_counts then
-      bs.parser_retry_counts.typst = nil
-    end
-    local tree = parser:parse()[1]:root()
-    units = collect_incremental_units(bufnr, tree, main._typst_query, prev_state.full_units, bs.pending_change)
-    if units == nil then
-      units = collect_full_units(bufnr, tree, main._typst_query)
-    end
-    sorted_entries = build_render_entries_from_units(bufnr, units)
-  else
-    units = require("typst-concealer.source-adapters.markdown").collect(bufnr)
-    sorted_entries = units
-  end
-
-  bs.pending_change = nil
-  bs.binding_dirty_ranges = nil
-
-  -- Build machine ScannedNodes from sorted_entries.
-  local scanned_nodes = {}
-  for idx, entry in ipairs(sorted_entries) do
-    local range, prelude_count, node_type = entry.range, entry.prelude_count, entry.node_type
-    local sem = entry.semantics or semantics_mod.classify(range, bufnr, node_type)
-    local source_str = entry.source_text or range_to_string(range, bufnr)
-    local str = entry.render_text or source_str
-    local display_range = entry.display_range or range
-    local display_prefix = nil
-    local display_suffix = nil
-
-    if entry.display_range == nil and node_type == "math" and sem.display_kind == "block" and range[1] == range[3] then
-      display_range = full_line_range(bufnr, range[1])
-
-      if sem.render_whole_line then
-        local line = line_text(bufnr, range[1])
-        display_prefix = trim_right(line:sub(1, range[2]))
-        display_suffix = trim_left(line:sub(range[4] + 1))
-      end
-    end
-
-    scanned_nodes[#scanned_nodes + 1] = {
-      item_idx = idx,
-      stable_key = entry.ts_node and tostring(entry.ts_node:id()) or nil,
-      source_range = range,
-      display_range = display_range,
-      display_prefix = display_prefix,
-      display_suffix = display_suffix,
-      source_text = str,
-      source_str = source_str,
-      source_text_hash = hash_string(str),
-      context_hash = context_hash(prelude_count),
-      prelude_count = prelude_count,
-      node_type = node_type,
-      semantics = sem,
-      requires_mitex = entry.requires_mitex == true,
-    }
+  if scan == nil then
+    return
   end
 
   state.buffer_render_state[bufnr] = state.buffer_render_state[bufnr] or {}
-  state.buffer_render_state[bufnr].full_units = units
-  state.buffer_render_state[bufnr].runtime_preludes = state.runtime_preludes
+  state.buffer_render_state[bufnr].full_units = scan.units
+  state.buffer_render_state[bufnr].runtime_preludes = scan.runtime_preludes
 
   local runtime = require("typst-concealer.machine.runtime")
   local project_scope = require("typst-concealer.project-scope").resolve(bufnr, "full")
-  runtime.dispatch({
+  local scan_event = {
     type = "nodes_scanned",
     bufnr = bufnr,
     project_scope_id = project_scope.project_scope_id,
     render_context_hash = full_render_context_hash(main, project_scope),
     buffer_version = vim.api.nvim_buf_get_changedtick(bufnr),
     layout_version = vim.o.columns,
-    scanned_nodes = scanned_nodes,
-    binding_dirty_ranges = binding_dirty_ranges,
-  })
-  runtime.dispatch({
-    type = "full_render_requested",
-    bufnr = bufnr,
-  })
+    scanned_nodes = scan.scanned_nodes,
+    binding_dirty_ranges = scan.binding_dirty_ranges,
+  }
+  if main.config.use_compiler_service and main.config.use_formula_service ~= false then
+    require("typst-concealer.formula.manager").update_from_scan(scan_event)
+  else
+    runtime.dispatch(scan_event)
+    runtime.dispatch({
+      type = "full_render_requested",
+      bufnr = bufnr,
+    })
+  end
 
   -- Reset hover guard so hide_extmarks_at_cursor re-evaluates after render
   runtime.invalidate_hover(bufnr)
@@ -915,6 +854,11 @@ end
 --- @param bufnr integer
 function M.hide_extmarks_at_cursor(bufnr)
   local main = require("typst-concealer")
+  if main.config.use_compiler_service == true and main.config.use_formula_service ~= false then
+    require("typst-concealer.formula.manager").sync_cursor_conceal(bufnr)
+    return
+  end
+
   local bs = state.get_buf_state(bufnr)
   local hover = require("typst-concealer.machine.runtime").get_ui_buffer(bufnr).hover
 
@@ -1154,6 +1098,93 @@ candidate_obstacle_penalty = function(rect, obstacles)
   return penalty
 end
 
+scan_formula_matches = function(bufnr, main)
+  state.runtime_preludes = {}
+
+  local bs = state.get_buf_state(bufnr)
+  local prev_state = state.buffer_render_state[bufnr] or {}
+  local source_kind = buffer_source_kind(bufnr)
+  if source_kind ~= "typst" and source_kind ~= "markdown" then
+    return nil, "unsupported"
+  end
+
+  local units
+  local sorted_entries = {}
+  local binding_dirty_ranges = bs.binding_dirty_ranges
+
+  if source_kind == "typst" then
+    local parser, parser_err = get_buffer_parser(bufnr, "typst")
+    if parser == nil then
+      schedule_parser_retry(bufnr, "typst", bs, parser_err)
+      return nil, "parser"
+    end
+    if bs.parser_retry_counts then
+      bs.parser_retry_counts.typst = nil
+    end
+    local tree = parser:parse()[1]:root()
+    units = collect_incremental_units(bufnr, tree, main._typst_query, prev_state.full_units, bs.pending_change)
+    if units == nil then
+      units = collect_full_units(bufnr, tree, main._typst_query)
+    end
+    sorted_entries = build_render_entries_from_units(bufnr, units)
+  else
+    units = require("typst-concealer.source-adapters.markdown").collect(bufnr)
+    sorted_entries = units
+  end
+
+  bs.pending_change = nil
+  bs.binding_dirty_ranges = nil
+
+  local scanned_nodes = {}
+  for idx, entry in ipairs(sorted_entries) do
+    local range, prelude_count, node_type = entry.range, entry.prelude_count, entry.node_type
+    local sem = entry.semantics or semantics_mod.classify(range, bufnr, node_type)
+    local source_str = entry.source_text or range_to_string(range, bufnr)
+    local str = entry.render_text or source_str
+    local display_range = entry.display_range or range
+    local display_prefix = nil
+    local display_suffix = nil
+
+    if entry.display_range == nil and node_type == "math" and sem.display_kind == "block" and range[1] == range[3] then
+      display_range = full_line_range(bufnr, range[1])
+
+      if sem.render_whole_line then
+        local line = line_text(bufnr, range[1])
+        display_prefix = trim_right(line:sub(1, range[2]))
+        display_suffix = trim_left(line:sub(range[4] + 1))
+      end
+    end
+
+    scanned_nodes[#scanned_nodes + 1] = {
+      item_idx = idx,
+      stable_key = entry.stable_key or (entry.ts_node and tostring(entry.ts_node:id()) or nil),
+      source_range = range,
+      display_range = display_range,
+      display_prefix = display_prefix,
+      display_suffix = display_suffix,
+      source_text = str,
+      source_str = source_str,
+      source_text_hash = hash_string(str),
+      context_hash = context_hash(prelude_count),
+      prelude_count = prelude_count,
+      node_type = node_type,
+      semantics = sem,
+      requires_mitex = entry.requires_mitex == true,
+    }
+  end
+
+  return {
+    units = units,
+    scanned_nodes = scanned_nodes,
+    binding_dirty_ranges = binding_dirty_ranges,
+    runtime_preludes = state.runtime_preludes,
+  }
+end
+
+function M.scan_formula_matches(bufnr)
+  return scan_formula_matches(bufnr, require("typst-concealer"))
+end
+
 local function candidate_penalty(rect, obstacles, editor_h, editor_w)
   local bounds_penalty = candidate_bounds_penalty(rect, editor_h, editor_w)
   local obstacle_penalty = candidate_obstacle_penalty(rect, obstacles)
@@ -1356,7 +1387,68 @@ local function find_full_item_at_cursor(bufnr, row, col, mode)
   return best_item
 end
 
-local function present_preview_item(bufnr, item, cursor_row, cursor_col)
+local present_preview_item
+
+function M.render_live_typst_preview_for_item(bufnr, item, cursor_row, cursor_col, mode)
+  if item == nil then
+    return false
+  end
+
+  local preview_str, render_key, source_str = make_highlighted_preview_math(item, cursor_row, cursor_col, mode)
+  if type(preview_str) ~= "string" or type(render_key) ~= "string" or type(source_str) ~= "string" then
+    M.clear_live_typst_preview(bufnr)
+    return false
+  end
+  local bs = state.get_buf_state(bufnr)
+  local preview = require("typst-concealer.machine.runtime").get_ui_buffer(bufnr).preview
+  if bs.preview_item ~= nil and preview.render_key == render_key and item_has_stable_render(bs.preview_item) then
+    M.present_rendered_preview_item(bufnr, bs.preview_item)
+    return true, bs.preview_item, render_key
+  end
+  if preview.render_key == render_key then
+    local previous_stable_preview = stable_preview_to_keep(bs)
+    if previous_stable_preview ~= nil then
+      return true, previous_stable_preview, render_key
+    end
+    present_preview_item(bufnr, item, cursor_row, cursor_col)
+    return true, item, render_key
+  end
+
+  local previous_preview_item = bs.preview_item
+  local previous_stable_preview, previous_stable_is_active = stable_preview_to_keep(bs)
+  if previous_stable_preview ~= nil then
+    bs.preview_last_rendered_item = previous_stable_preview
+  end
+  if previous_stable_is_active then
+    bs.preview_last_render_key = preview.render_key
+    preview.last_render_key = preview.render_key
+  end
+  if previous_stable_preview == nil then
+    present_preview_item(bufnr, item, cursor_row, cursor_col)
+  end
+
+  local shared_extmark_id = bs.preview_image and bs.preview_image.extmark_id or nil
+  if
+    previous_preview_item ~= nil
+    and previous_preview_item ~= previous_stable_preview
+    and (bs.preview_image == nil or previous_preview_item.image_id ~= bs.preview_image.image_id)
+  then
+    cleanup_preview_item_request(bufnr, previous_preview_item, { keep_extmark = shared_extmark_id ~= nil })
+  end
+
+  local preview_item = require("typst-concealer.apply").allocate_preview_item(
+    bufnr,
+    item,
+    preview_str,
+    source_str,
+    render_key,
+    shared_extmark_id
+  )
+  require("typst-concealer.machine.runtime").render_preview_tail(bufnr, preview_item)
+  return true, preview_item, render_key
+end
+
+present_preview_item = function(bufnr, item, cursor_row, cursor_col)
   if item == nil then
     cleanup_preview_image(bufnr)
     return
@@ -1498,7 +1590,7 @@ function M.schedule_live_preview_sync(bufnr, opts)
       if scheduled_tick ~= nil and scheduled_tick ~= vim.api.nvim_buf_get_changedtick(bufnr) then
         M.render_buf(bufnr)
       end
-      M.render_live_typst_preview(bufnr)
+      require("typst-concealer.machine.runtime").render_live_preview(bufnr)
       M.hide_extmarks_at_cursor(bufnr)
     end)
   )
@@ -1534,57 +1626,7 @@ function M.render_live_typst_preview(bufnr)
   -- under the cursor while anchoring the float to the wrong range.
   local item = find_full_item_at_cursor(bufnr, cursor_row, cursor_col, mode)
   if item ~= nil then
-    local preview_str, render_key, source_str = make_highlighted_preview_math(item, cursor_row, cursor_col, mode)
-    if type(preview_str) ~= "string" or type(render_key) ~= "string" or type(source_str) ~= "string" then
-      M.clear_live_typst_preview(bufnr)
-      return
-    end
-    local bs = state.get_buf_state(bufnr)
-    local preview = require("typst-concealer.machine.runtime").get_ui_buffer(bufnr).preview
-    if bs.preview_item ~= nil and preview.render_key == render_key and item_has_stable_render(bs.preview_item) then
-      M.present_rendered_preview_item(bufnr, bs.preview_item)
-      return
-    end
-    if preview.render_key == render_key then
-      local previous_stable_preview = stable_preview_to_keep(bs)
-      if previous_stable_preview ~= nil then
-        return
-      end
-      present_preview_item(bufnr, item, cursor_row, cursor_col)
-      return
-    end
-
-    local previous_preview_item = bs.preview_item
-    local previous_stable_preview, previous_stable_is_active = stable_preview_to_keep(bs)
-    if previous_stable_preview ~= nil then
-      bs.preview_last_rendered_item = previous_stable_preview
-    end
-    if previous_stable_is_active then
-      bs.preview_last_render_key = preview.render_key
-      preview.last_render_key = preview.render_key
-    end
-    if previous_stable_preview == nil then
-      present_preview_item(bufnr, item, cursor_row, cursor_col)
-    end
-
-    local shared_extmark_id = bs.preview_image and bs.preview_image.extmark_id or nil
-    if
-      previous_preview_item ~= nil
-      and previous_preview_item ~= previous_stable_preview
-      and (bs.preview_image == nil or previous_preview_item.image_id ~= bs.preview_image.image_id)
-    then
-      cleanup_preview_item_request(bufnr, previous_preview_item, { keep_extmark = shared_extmark_id ~= nil })
-    end
-
-    local preview_item = require("typst-concealer.apply").allocate_preview_item(
-      bufnr,
-      item,
-      preview_str,
-      source_str,
-      render_key,
-      shared_extmark_id
-    )
-    require("typst-concealer.machine.runtime").render_preview_tail(bufnr, preview_item)
+    M.render_live_typst_preview_for_item(bufnr, item, cursor_row, cursor_col, mode)
     return
   end
 

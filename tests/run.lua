@@ -53,6 +53,9 @@ local function reset_modules()
   package.loaded["typst-concealer.machine.effects"] = nil
   package.loaded["typst-concealer.machine.resources"] = nil
   package.loaded["typst-concealer.machine.runtime"] = nil
+  package.loaded["typst-concealer.formula.image"] = nil
+  package.loaded["typst-concealer.formula.manager"] = nil
+  package.loaded["typst-concealer.formula.placement"] = nil
   package.loaded["typst-concealer.wrapper"] = nil
   package.loaded["typst-concealer.path-rewrite"] = nil
   package.loaded["typst-concealer.source-adapters.markdown"] = nil
@@ -153,6 +156,7 @@ local function fresh_state()
   state.path_rewrite_cache = {}
   state.runtime_preludes = {}
   state.machine_state = require("typst-concealer.machine.types").initial_state()
+  state.formula_managers = {}
   return state
 end
 
@@ -517,6 +521,50 @@ local function test_render_buf_scans_markdown_math_nodes()
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
+local function test_vim_resized_renders_on_column_change()
+  local state = fresh_state()
+  local main = require("typst-concealer")
+  main.config = {
+    markdown_filetypes = { "markdown" },
+    render_paths = {},
+    math_baseline_pt = 11,
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(bufnr, "resize-columns.typ")
+  vim.bo[bufnr].filetype = "typst"
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "#rect(width: 100%)" })
+  main._enabled_buffers[bufnr] = true
+
+  local calls = { render = 0, refresh = 0 }
+  package.loaded["typst-concealer.machine.runtime"] = {
+    render_buf = function(target)
+      if target == bufnr then
+        calls.render = calls.render + 1
+      end
+    end,
+    refresh_visible_overlays = function(target)
+      if target == bufnr then
+        calls.refresh = calls.refresh + 1
+      end
+    end,
+  }
+
+  local original_columns = vim.o.columns
+  main._handle_vim_resized()
+  calls.render = 0
+  calls.refresh = 0
+  vim.o.columns = original_columns + 1
+  main._handle_vim_resized()
+  vim.o.columns = original_columns
+
+  assert_eq(calls.render, 1, "column-only resize should schedule a render pass")
+  assert_eq(calls.refresh, 0, "column-only resize should not only reupload existing images")
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+  state.buffer_render_state = {}
+end
+
 _G.__typst_concealer_regression_tests = function()
   test_extmark_flushes_kitty_graphics_to_stdout()
   ok("ok extmark flushes kitty graphics through stdout")
@@ -865,6 +913,8 @@ local function test_session_render_request_via_service_writes_json()
       config = {
         typst_location = "typst",
         use_compiler_service = true,
+        use_formula_service = true,
+        formula_worker_count = 2,
         service_binary = "typst-concealer-service-test",
         ppi = 300,
         compiler_args = {},
@@ -897,6 +947,9 @@ local function test_session_render_request_via_service_writes_json()
           bufnr = bufnr,
           project_scope_id = "project:service",
           render_epoch = 1,
+          node_rev = 1,
+          context_id = "project:service",
+          context_rev = 1,
           buffer_version = 1,
           layout_version = 1,
           item_idx = 1,
@@ -921,22 +974,23 @@ local function test_session_render_request_via_service_writes_json()
     assert_eq(#preview_stdin.writes, 1, "preview backend should prewarm during full render startup")
     local msg = vim.json.decode(vim.trim(stdin.writes[1]))
     local prewarm_msg = vim.json.decode(vim.trim(preview_stdin.writes[1]))
-    assert_eq(msg.type, "compile", "service message should be a compile request")
+    assert_eq(msg.type, "render_formulas", "service message should be a formula render request")
     assert_eq(msg.request_id, "request:service:1", "service message should carry request_id")
-    assert_truthy(msg.cache_key:find("^full:", 1, false) ~= nil, "service message should isolate full cache")
+    assert_truthy(msg.cache_key:find("^formula:", 1, false) ~= nil, "service message should isolate formula cache")
+    assert_eq(msg.context_id, "project:service", "formula request should carry context_id")
+    assert_eq(msg.context_rev, 1, "formula request should carry context_rev")
+    assert_eq(msg.worker_count, 2, "formula request should carry configured worker count")
     assert_eq(msg.root, root, "service message should carry effective root")
     assert_eq(msg.inputs.concealed, "true", "service message should include project inputs")
     assert_truthy(
       msg.output_dir:find("/%.typst%-concealer/", 1, false) ~= nil,
       "service output_dir should use cache dir"
     )
-    local full_slot_include = msg.source_text:match('#include%s+"([^"]*/full/slots/slot%-000001%.typ)"')
-    assert_truthy(full_slot_include ~= nil, "service main source should include a stable slot sidecar")
-    assert_truthy(msg.source_text:find("$x$", 1, true) == nil, "service main source should not inline formula text")
-    local full_slot_path = full_slot_include:sub(1, 1) == "/" and (root .. full_slot_include)
-      or vim.fs.joinpath(root, full_slot_include)
-    local full_slot_text = table.concat(vim.fn.readfile(full_slot_path), "\n")
-    assert_truthy(full_slot_text:find("$x$", 1, true) ~= nil, "dirty full slot sidecar should contain formula text")
+    assert_truthy(msg.context_source:find("$x$", 1, true) == nil, "formula context should not inline formula text")
+    assert_eq(#msg.nodes, 1, "formula request should include one dirty formula")
+    assert_eq(msg.nodes[1].node_id, "node:service", "formula node should carry node_id")
+    assert_eq(msg.nodes[1].node_rev, 1, "formula node should carry node_rev")
+    assert_truthy(msg.nodes[1].source:find("$x$", 1, true) ~= nil, "formula node source should contain formula text")
     assert_startswith(prewarm_msg.request_id, "preview-prewarm:", "preview prewarm should carry a prewarm id")
     assert_truthy(prewarm_msg.cache_key:find("^preview:", 1, false) ~= nil, "preview prewarm should use preview cache")
     assert_truthy(
@@ -1082,6 +1136,8 @@ local function make_service_response_harness(name, opts, fn)
       config = {
         typst_location = "typst",
         use_compiler_service = true,
+        use_formula_service = opts.use_formula_service == true,
+        formula_worker_count = opts.formula_worker_count or 2,
         service_binary = "typst-concealer-service-test",
         ppi = 300,
         compiler_args = {},
@@ -1108,6 +1164,9 @@ local function make_service_response_harness(name, opts, fn)
           bufnr = bufnr,
           project_scope_id = opts.project_scope_id or "project:service",
           render_epoch = 1,
+          node_rev = opts.node_rev or 1,
+          context_id = opts.context_id or opts.project_scope_id or "project:service",
+          context_rev = opts.context_rev or 1,
           buffer_version = tick,
           layout_version = opts.layout_version or 1,
           item_idx = i,
@@ -1128,6 +1187,9 @@ local function make_service_response_harness(name, opts, fn)
         job.bufnr = job.bufnr or bufnr
         job.project_scope_id = job.project_scope_id or opts.project_scope_id or "project:service"
         job.render_epoch = job.render_epoch or 1
+        job.node_rev = job.node_rev or opts.node_rev or 1
+        job.context_id = job.context_id or opts.context_id or opts.project_scope_id or "project:service"
+        job.context_rev = job.context_rev or opts.context_rev or 1
         job.buffer_version = job.buffer_version or tick
         job.layout_version = job.layout_version or opts.layout_version or 1
         job.item_idx = job.item_idx or i
@@ -1165,6 +1227,7 @@ local function make_service_response_harness(name, opts, fn)
         display_range = { 0, 0, 0, 3 },
         source_text = job.source_text,
         source_text_hash = "hash:" .. tostring(job.source_text),
+        node_rev = job.node_rev,
         context_hash = "ctx:0",
         prelude_count = 0,
         semantics = { display_kind = "inline", constraint_kind = "intrinsic" },
@@ -1182,6 +1245,9 @@ local function make_service_response_harness(name, opts, fn)
           request_id = request.request_id,
           page_index = job.request_page_index,
           render_epoch = request.render_epoch,
+          node_rev = job.node_rev,
+          context_id = job.context_id,
+          context_rev = job.context_rev,
           buffer_version = request.buffer_version,
           layout_version = request.layout_version,
           status = "rendering",
@@ -1195,6 +1261,8 @@ local function make_service_response_harness(name, opts, fn)
       buffer_version = tick,
       layout_version = request.layout_version,
       render_epoch = request.render_epoch,
+      context_id = opts.context_id or opts.project_scope_id or "project:service",
+      context_rev = opts.context_rev or 1,
       active_request_id = request.request_id,
       nodes = nodes,
       node_order = node_order,
@@ -1231,6 +1299,13 @@ end
 local function wait_until_service_request_cleared(state, bufnr)
   vim.wait(100, function()
     return state.active_service_requests[bufnr] == nil
+  end)
+end
+
+local function wait_until_formula_batch_cleared(state, bufnr, request_id)
+  vim.wait(100, function()
+    local batches = state.active_formula_batches and state.active_formula_batches[bufnr] or nil
+    return batches == nil or batches[request_id] == nil
   end)
 end
 
@@ -1322,6 +1397,744 @@ local function test_service_success_clears_active_meta()
     assert_eq(ctx.state.active_service_requests[ctx.bufnr], nil, "successful response should clear active meta")
     assert_eq(ctx.state._last_service_bench.request_id, ctx.request.request_id, "success should record bench data")
   end)
+end
+
+local function test_formula_service_success_routes_by_node_revision()
+  make_service_response_harness("formula-success", { use_formula_service = true, context_rev = 7 }, function(ctx)
+    local msg = vim.json.decode(vim.trim(ctx.spawned[1].stdio[1].writes[1]))
+    assert_eq(msg.type, "render_formulas", "formula service should use formula-level request")
+    assert_eq(msg.context_rev, 7, "formula request should include context revision")
+    assert_eq(#msg.nodes, 1, "formula request should render only dirty formula nodes")
+    assert_eq(msg.nodes[1].node_id, ctx.request.jobs[1].node_id, "formula request should identify node")
+    assert_eq(msg.nodes[1].node_rev, ctx.request.jobs[1].node_rev, "formula request should identify node revision")
+
+    local page_path = vim.fn.tempname() .. ".png"
+    write_file(page_path, "png")
+    with_stubbed_extmark(function(calls)
+      feed_service_response(ctx.full_stdout, {
+        type = "formula_rendered",
+        request_id = ctx.request.request_id,
+        context_id = ctx.request.jobs[1].context_id,
+        context_rev = ctx.request.jobs[1].context_rev,
+        node_id = ctx.request.jobs[1].node_id,
+        node_rev = ctx.request.jobs[1].node_rev,
+        status = "ok",
+        path = page_path,
+        width_px = 20,
+        height_px = 10,
+        cached = false,
+        diagnostics = {},
+      })
+      wait_until_service_request_cleared(ctx.state, ctx.bufnr)
+      assert_eq(#calls.created, 1, "formula response should upload the matching formula image")
+      assert_eq(calls.created[1].path, page_path, "formula response should use formula artifact path")
+    end)
+
+    assert_eq(ctx.state.active_service_requests[ctx.bufnr], nil, "formula response should clear active meta")
+    assert_eq(
+      ctx.state._last_service_bench.service_engine,
+      "formula",
+      "formula response should record formula bench data"
+    )
+    assert_eq(ctx.state._last_service_bench.dispatched, 1, "formula bench should count dispatched formulas")
+  end)
+end
+
+local function test_formula_transport_batch_does_not_install_buffer_active_request()
+  local root = make_temp_tree("formula-transport-batch")
+  local main_path = vim.fs.joinpath(root, "main.typ")
+  write_file(main_path, "$x$")
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(bufnr, main_path)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "$x$" })
+  local tick = vim.api.nvim_buf_get_changedtick(bufnr)
+  local state = fresh_state()
+  state.pid = 8100
+  state.buffer_render_state[bufnr] = { runtime_preludes = {} }
+
+  with_stubbed_uv(function(spawned)
+    package.loaded["typst-concealer"] = {
+      config = {
+        typst_location = "typst",
+        use_compiler_service = true,
+        use_formula_service = true,
+        formula_worker_count = 2,
+        service_binary = "typst-concealer-service-test",
+        ppi = 300,
+        compiler_args = {},
+        get_root = function()
+          return root
+        end,
+        get_inputs = nil,
+        get_preamble_file = nil,
+        do_diagnostics = false,
+        header = "",
+        math_baseline_pt = 11,
+      },
+      _styling_prelude = "",
+    }
+
+    local request = {
+      request_id = "formula:transport:1",
+      bufnr = bufnr,
+      project_scope_id = "project:transport",
+      render_epoch = 1,
+      buffer_version = tick,
+      layout_version = 1,
+      jobs = {
+        {
+          request_page_index = 1,
+          overlay_id = "overlay:transport:1",
+          node_id = "node:transport:1",
+          slot_id = "slot:1",
+          bufnr = bufnr,
+          project_scope_id = "project:transport",
+          render_epoch = 1,
+          node_rev = 1,
+          context_id = "project:transport",
+          context_rev = 1,
+          buffer_version = tick,
+          layout_version = 1,
+          item_idx = 1,
+          range = { 0, 0, 0, 3 },
+          display_range = { 0, 0, 0, 3 },
+          source_text = "$x$",
+          str = "$x$",
+          prelude_count = 0,
+          semantics = { display_kind = "inline", constraint_kind = "intrinsic" },
+        },
+      },
+    }
+    state.machine_state.buffers[bufnr] = {
+      bufnr = bufnr,
+      project_scope_id = "project:transport",
+      buffer_version = tick,
+      layout_version = 1,
+      render_epoch = 1,
+      context_id = "project:transport",
+      context_rev = 1,
+      active_request_id = nil,
+      nodes = {
+        ["node:transport:1"] = {
+          node_id = "node:transport:1",
+          slot_id = "slot:1",
+          bufnr = bufnr,
+          project_scope_id = "project:transport",
+          item_idx = 1,
+          node_type = "math",
+          source_range = { 0, 0, 0, 3 },
+          display_range = { 0, 0, 0, 3 },
+          source_text = "$x$",
+          source_text_hash = "hash:x",
+          node_rev = 1,
+          context_hash = "ctx:0",
+          prelude_count = 0,
+          semantics = { display_kind = "inline", constraint_kind = "intrinsic" },
+          status = "pending",
+          candidate_overlay_id = "overlay:transport:1",
+        },
+      },
+      node_order = { "node:transport:1" },
+    }
+    state.machine_state.overlays["overlay:transport:1"] = {
+      overlay_id = "overlay:transport:1",
+      slot_id = "slot:1",
+      owner_node_id = "node:transport:1",
+      owner_bufnr = bufnr,
+      owner_project_scope_id = "project:transport",
+      request_id = request.request_id,
+      page_index = 1,
+      render_epoch = 1,
+      node_rev = 1,
+      context_id = "project:transport",
+      context_rev = 1,
+      buffer_version = tick,
+      layout_version = 1,
+      status = "rendering",
+    }
+
+    local session_mod = require("typst-concealer.session")
+    session_mod.render_formula_batch_via_service(bufnr, request)
+    assert_eq(state.active_service_requests[bufnr], nil, "formula transport must not install buffer active request")
+    assert_truthy(
+      state.active_formula_batches[bufnr] and state.active_formula_batches[bufnr][request.request_id],
+      "formula transport should track only the batch"
+    )
+    local msg = vim.json.decode(vim.trim(spawned[1].stdio[1].writes[1]))
+    assert_eq(msg.type, "render_formulas", "formula transport should use render_formulas")
+    assert_eq(#msg.nodes, 1, "formula transport should include the dirty node")
+
+    local page_path = vim.fn.tempname() .. ".png"
+    write_file(page_path, "png")
+    with_stubbed_extmark(function(calls)
+      feed_service_response(spawned[1].stdio[2], {
+        type = "formula_rendered",
+        request_id = request.request_id,
+        context_id = "project:transport",
+        context_rev = 1,
+        node_id = "node:transport:1",
+        node_rev = 1,
+        status = "ok",
+        path = page_path,
+        width_px = 20,
+        height_px = 10,
+        cached = false,
+        diagnostics = {},
+      })
+      wait_until_formula_batch_cleared(state, bufnr, request.request_id)
+      assert_eq(#calls.created, 1, "formula transport response should upload only the matching node")
+    end)
+    assert_eq(state.active_formula_batches[bufnr], nil, "completed formula batch should be removed")
+    session_mod.stop_compiler_service(bufnr)
+  end)
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_formula_transport_prunes_superseded_queued_batches()
+  make_service_response_harness("formula-queue-prune", { use_formula_service = true }, function(ctx)
+    local base_job = ctx.request.jobs[1]
+    local node = ctx.state.machine_state.buffers[ctx.bufnr].nodes[base_job.node_id]
+
+    local function make_request(request_id, overlay_id, render_epoch)
+      node.candidate_overlay_id = overlay_id
+      node.status = "pending"
+      ctx.state.machine_state.overlays[overlay_id] = {
+        overlay_id = overlay_id,
+        slot_id = base_job.slot_id,
+        owner_node_id = base_job.node_id,
+        owner_bufnr = ctx.bufnr,
+        owner_project_scope_id = base_job.project_scope_id,
+        request_id = request_id,
+        page_index = 1,
+        render_epoch = render_epoch,
+        node_rev = base_job.node_rev,
+        context_id = base_job.context_id,
+        context_rev = base_job.context_rev,
+        source_text_hash = base_job.source_text_hash,
+        buffer_version = base_job.buffer_version,
+        layout_version = base_job.layout_version,
+        status = "placeholder",
+      }
+
+      local job = vim.deepcopy(base_job)
+      job.overlay_id = overlay_id
+      job.request_id = request_id
+      job.render_epoch = render_epoch
+      job.request_page_index = 1
+      return {
+        request_id = request_id,
+        bufnr = ctx.bufnr,
+        project_scope_id = base_job.project_scope_id,
+        render_epoch = render_epoch,
+        buffer_version = base_job.buffer_version,
+        layout_version = base_job.layout_version,
+        jobs = { job },
+      }
+    end
+
+    local queued_request = make_request("formula:queued-stale", "overlay:queued-stale", 2)
+    ctx.session.render_formula_batch_via_service(ctx.bufnr, queued_request)
+    local service = ctx.state.compiler_services[ctx.bufnr].full
+    assert_eq(#service.pending_formula_requests, 1, "busy service should queue the second formula batch")
+    assert_truthy(
+      ctx.state.active_formula_batches[ctx.bufnr]["formula:queued-stale"] ~= nil,
+      "queued formula batch should be tracked until it is pruned"
+    )
+
+    ctx.state.machine_state.overlays["overlay:queued-stale"].status = "retiring"
+    local current_request = make_request("formula:queued-current", "overlay:queued-current", 3)
+    ctx.session.render_formula_batch_via_service(ctx.bufnr, current_request)
+
+    assert_eq(#service.pending_formula_requests, 1, "superseded queued formula batch should be dropped")
+    assert_eq(
+      service.pending_formula_requests[1].request_id,
+      "formula:queued-current",
+      "queue should keep only the current formula batch"
+    )
+    assert_eq(
+      ctx.state.active_formula_batches[ctx.bufnr]["formula:queued-stale"],
+      nil,
+      "pruning should remove stale formula batch bookkeeping"
+    )
+    assert_truthy(
+      ctx.state.active_formula_batches[ctx.bufnr]["formula:queued-current"] ~= nil,
+      "current queued formula batch should remain tracked"
+    )
+  end)
+end
+
+local function test_formula_transport_stale_response_reschedules_pending_node()
+  local root = make_temp_tree("formula-stale-converges")
+  local main_path = vim.fs.joinpath(root, "main.typ")
+  write_file(main_path, "$x$")
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_name(bufnr, main_path)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "$x$" })
+  local tick = vim.api.nvim_buf_get_changedtick(bufnr)
+  local state = fresh_state()
+  state.pid = 8200
+  state.buffer_render_state[bufnr] = { runtime_preludes = {} }
+
+  with_stubbed_uv(function(spawned)
+    package.loaded["typst-concealer"] = {
+      config = {
+        typst_location = "typst",
+        use_compiler_service = true,
+        use_formula_service = true,
+        formula_worker_count = 2,
+        service_binary = "typst-concealer-service-test",
+        ppi = 300,
+        compiler_args = {},
+        get_root = function()
+          return root
+        end,
+        get_inputs = nil,
+        get_preamble_file = nil,
+        do_diagnostics = false,
+        header = "",
+        math_baseline_pt = 11,
+      },
+      _styling_prelude = "",
+    }
+
+    local old_job = {
+      request_page_index = 1,
+      overlay_id = "overlay:stale:old",
+      node_id = "node:stale",
+      slot_id = "slot:1",
+      bufnr = bufnr,
+      project_scope_id = "project:stale",
+      render_epoch = 1,
+      node_rev = 1,
+      context_id = "project:stale",
+      context_rev = 1,
+      buffer_version = tick,
+      layout_version = 1,
+      item_idx = 1,
+      range = { 0, 0, 0, 3 },
+      display_range = { 0, 0, 0, 3 },
+      source_text = "$x$",
+      source_text_hash = "hash:x",
+      str = "$x$",
+      prelude_count = 0,
+      semantics = { display_kind = "inline", constraint_kind = "intrinsic" },
+    }
+    local request = {
+      request_id = "formula:stale:old",
+      bufnr = bufnr,
+      project_scope_id = "project:stale",
+      render_epoch = 1,
+      buffer_version = tick,
+      layout_version = 1,
+      jobs = { old_job },
+    }
+    state.machine_state.buffers[bufnr] = {
+      bufnr = bufnr,
+      project_scope_id = "project:stale",
+      buffer_version = tick,
+      layout_version = 1,
+      render_epoch = 1,
+      context_id = "project:stale",
+      context_rev = 1,
+      nodes = {
+        ["node:stale"] = {
+          node_id = "node:stale",
+          slot_id = "slot:1",
+          bufnr = bufnr,
+          project_scope_id = "project:stale",
+          item_idx = 1,
+          node_type = "math",
+          source_range = { 0, 0, 0, 3 },
+          display_range = { 0, 0, 0, 3 },
+          source_text = "$x$",
+          source_text_hash = "hash:x",
+          node_rev = 1,
+          context_hash = "ctx:1",
+          prelude_count = 0,
+          semantics = { display_kind = "inline", constraint_kind = "intrinsic" },
+          status = "pending",
+          candidate_overlay_id = "overlay:stale:old",
+        },
+      },
+      node_order = { "node:stale" },
+      slots = {
+        ["slot:1"] = {
+          slot_id = "slot:1",
+          node_id = "node:stale",
+          page_index = 1,
+          source_text = "$x$",
+          source_text_hash = "hash:x",
+          source_range = { 0, 0, 0, 3 },
+          source_rows = 1,
+          context_id = "project:stale",
+          context_rev = 1,
+          context_hash = "ctx:1",
+          prelude_count = 0,
+          node_type = "math",
+          semantics = { display_kind = "inline", constraint_kind = "intrinsic" },
+          display_range = { 0, 0, 0, 3 },
+          candidate_overlay_id = "overlay:stale:old",
+          pending_request_id = "formula:stale:old",
+          status = "dirty",
+          dirty = true,
+        },
+      },
+      slot_order = { "slot:1" },
+      next_slot_id = 2,
+    }
+    state.machine_state.overlays["overlay:stale:old"] = {
+      overlay_id = "overlay:stale:old",
+      slot_id = "slot:1",
+      owner_node_id = "node:stale",
+      owner_bufnr = bufnr,
+      owner_project_scope_id = "project:stale",
+      request_id = "formula:stale:old",
+      page_index = 1,
+      render_epoch = 1,
+      node_rev = 1,
+      context_id = "project:stale",
+      context_rev = 1,
+      source_text_hash = "hash:x",
+      buffer_version = tick,
+      layout_version = 1,
+      status = "rendering",
+    }
+
+    local session_mod = require("typst-concealer.session")
+    session_mod.render_formula_batch_via_service(bufnr, request)
+    assert_eq(#spawned[1].stdio[1].writes, 1, "old formula batch should be in flight")
+
+    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "$y$" })
+    local new_tick = vim.api.nvim_buf_get_changedtick(bufnr)
+    local buf = state.machine_state.buffers[bufnr]
+    buf.buffer_version = new_tick
+    buf.render_epoch = 2
+    local node = buf.nodes["node:stale"]
+    node.node_rev = 2
+    node.source_text = "$y$"
+    node.source_text_hash = "hash:y"
+    node.status = "pending"
+    node.candidate_overlay_id = nil
+    local slot = buf.slots["slot:1"]
+    slot.source_text = "$y$"
+    slot.source_text_hash = "hash:y"
+    slot.source_range = { 0, 0, 0, 3 }
+    slot.display_range = { 0, 0, 0, 3 }
+    slot.candidate_overlay_id = nil
+    slot.pending_request_id = nil
+    slot.status = "dirty"
+    slot.dirty = true
+    state.machine_state.overlays["overlay:stale:old"] = nil
+
+    local stale_path = vim.fn.tempname() .. ".png"
+    write_file(stale_path, "old png")
+    feed_service_response(spawned[1].stdio[2], {
+      type = "formula_rendered",
+      request_id = "formula:stale:old",
+      context_id = "project:stale",
+      context_rev = 1,
+      node_id = "node:stale",
+      node_rev = 1,
+      status = "ok",
+      path = stale_path,
+      width_px = 20,
+      height_px = 10,
+      diagnostics = {},
+    })
+
+    vim.wait(100, function()
+      return #spawned[1].stdio[1].writes >= 2
+    end)
+    assert_eq(vim.uv.fs_stat(stale_path), nil, "stale formula artifact should be cleaned")
+    assert_eq(#spawned[1].stdio[1].writes, 2, "stale response should trigger one converging formula batch")
+    local next_msg = vim.json.decode(vim.trim(spawned[1].stdio[1].writes[2]))
+    assert_eq(next_msg.type, "render_formulas", "convergence should stay on formula transport")
+    assert_eq(#next_msg.nodes, 1, "convergence should target the pending node")
+    assert_eq(next_msg.nodes[1].node_id, "node:stale", "convergence should keep node ownership")
+    assert_eq(next_msg.nodes[1].node_rev, 2, "convergence should render the current node revision")
+    assert_truthy(next_msg.nodes[1].source:find("$y$", 1, true) ~= nil, "convergence should render current source")
+
+    session_mod.stop_compiler_service(bufnr)
+  end)
+
+  if vim.api.nvim_buf_is_valid(bufnr) then
+    vim.api.nvim_buf_delete(bufnr, { force = true })
+  end
+end
+
+local function test_formula_manager_self_check_reschedules_lost_candidate()
+  local root = make_temp_tree("formula-self-check")
+  local main_path = vim.fs.joinpath(root, "main.typ")
+  write_file(main_path, "$x$")
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_name(bufnr, main_path)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "$x$" })
+  local tick = vim.api.nvim_buf_get_changedtick(bufnr)
+  local state = fresh_state()
+  state.pid = 8300
+  state.buffer_render_state[bufnr] = { runtime_preludes = {} }
+
+  with_stubbed_uv(function(spawned)
+    package.loaded["typst-concealer"] = {
+      config = {
+        typst_location = "typst",
+        use_compiler_service = true,
+        use_formula_service = true,
+        formula_worker_count = 2,
+        service_binary = "typst-concealer-service-test",
+        ppi = 300,
+        compiler_args = {},
+        get_root = function()
+          return root
+        end,
+        get_inputs = nil,
+        get_preamble_file = nil,
+        do_diagnostics = false,
+        header = "",
+        math_baseline_pt = 11,
+      },
+      _styling_prelude = "",
+    }
+
+    state.machine_state.buffers[bufnr] = {
+      bufnr = bufnr,
+      project_scope_id = "project:self-check",
+      buffer_version = tick,
+      layout_version = 1,
+      render_epoch = 1,
+      context_id = "project:self-check",
+      context_rev = 1,
+      nodes = {
+        ["node:self-check"] = {
+          node_id = "node:self-check",
+          slot_id = "slot:1",
+          bufnr = bufnr,
+          project_scope_id = "project:self-check",
+          item_idx = 1,
+          node_type = "math",
+          source_range = { 0, 0, 0, 3 },
+          display_range = { 0, 0, 0, 3 },
+          source_text = "$x$",
+          source_text_hash = "hash:x",
+          node_rev = 1,
+          context_hash = "ctx:1",
+          prelude_count = 0,
+          semantics = { display_kind = "inline", constraint_kind = "intrinsic" },
+          status = "pending",
+          candidate_overlay_id = "overlay:lost",
+        },
+      },
+      node_order = { "node:self-check" },
+      slots = {
+        ["slot:1"] = {
+          slot_id = "slot:1",
+          node_id = "node:self-check",
+          page_index = 1,
+          source_text = "$x$",
+          source_text_hash = "hash:x",
+          source_range = { 0, 0, 0, 3 },
+          source_rows = 1,
+          context_id = "project:self-check",
+          context_rev = 1,
+          context_hash = "ctx:1",
+          prelude_count = 0,
+          node_type = "math",
+          semantics = { display_kind = "inline", constraint_kind = "intrinsic" },
+          display_range = { 0, 0, 0, 3 },
+          candidate_overlay_id = "overlay:lost",
+          pending_request_id = "formula:lost",
+          status = "dirty",
+          dirty = true,
+        },
+      },
+      slot_order = { "slot:1" },
+      next_slot_id = 2,
+    }
+    state.machine_state.overlays["overlay:lost"] = {
+      overlay_id = "overlay:lost",
+      slot_id = "slot:1",
+      owner_node_id = "node:self-check",
+      owner_bufnr = bufnr,
+      owner_project_scope_id = "project:self-check",
+      request_id = "formula:lost",
+      page_index = 1,
+      render_epoch = 1,
+      node_rev = 1,
+      context_id = "project:self-check",
+      context_rev = 1,
+      source_text_hash = "hash:x",
+      buffer_version = tick,
+      layout_version = 1,
+      status = "rendering",
+    }
+
+    local manager = require("typst-concealer.formula.manager").get(bufnr)
+    local missing = manager:ensure_pending_nodes_rendering({ node_ids = { "node:self-check" } })
+
+    assert_eq(#missing, 1, "self-check should report the lost pending node")
+    assert_eq(missing[1], "node:self-check", "self-check should keep scheduling node-local")
+    assert_eq(state.machine_state.overlays["overlay:lost"], nil, "self-check should retire lost candidate overlay")
+    assert_truthy(
+      state.machine_state.buffers[bufnr].nodes["node:self-check"].candidate_overlay_id ~= nil,
+      "self-check should install a replacement candidate"
+    )
+    assert_eq(#spawned[1].stdio[1].writes, 1, "self-check should start one replacement formula request")
+    local msg = vim.json.decode(vim.trim(spawned[1].stdio[1].writes[1]))
+    assert_eq(msg.type, "render_formulas", "self-check replacement should stay on formula transport")
+    assert_eq(#msg.nodes, 1, "self-check replacement should render one node")
+    assert_eq(msg.nodes[1].node_id, "node:self-check", "self-check should render the lost node")
+
+    require("typst-concealer.session").stop_compiler_service(bufnr)
+  end)
+
+  if vim.api.nvim_buf_is_valid(bufnr) then
+    vim.api.nvim_buf_delete(bufnr, { force = true })
+  end
+end
+
+local function test_formula_service_stale_node_revision_is_discarded()
+  make_service_response_harness("formula-stale-node-rev", { use_formula_service = true }, function(ctx)
+    local page_path = vim.fn.tempname() .. ".png"
+    write_file(page_path, "png")
+    with_stubbed_extmark(function(calls)
+      feed_service_response(ctx.full_stdout, {
+        type = "formula_rendered",
+        request_id = ctx.request.request_id,
+        context_id = ctx.request.jobs[1].context_id,
+        context_rev = ctx.request.jobs[1].context_rev,
+        node_id = ctx.request.jobs[1].node_id,
+        node_rev = ctx.request.jobs[1].node_rev + 1,
+        status = "ok",
+        path = page_path,
+        width_px = 20,
+        height_px = 10,
+        diagnostics = {},
+      })
+      wait_until_service_request_cleared(ctx.state, ctx.bufnr)
+      assert_eq(#calls.created, 0, "stale formula response should not upload an image")
+    end)
+    assert_eq(vim.uv.fs_stat(page_path), nil, "stale formula artifact should be cleaned")
+    assert_eq(
+      ctx.state.machine_state.overlays[ctx.request.jobs[1].overlay_id],
+      nil,
+      "stale formula response should retire the candidate overlay"
+    )
+  end)
+end
+
+local function test_formula_diagnostics_replace_per_node()
+  make_service_response_harness(
+    "formula-diagnostics-replace",
+    { use_formula_service = true, do_diagnostics = true },
+    function(ctx)
+      local job = ctx.request.jobs[1]
+      feed_service_response(ctx.full_stdout, {
+        type = "formula_rendered",
+        request_id = ctx.request.request_id,
+        context_id = job.context_id,
+        context_rev = job.context_rev,
+        node_id = job.node_id,
+        node_rev = job.node_rev,
+        status = "error",
+        diagnostics = {
+          { line = 1, column = 1, severity = "error", message = "formula failed" },
+        },
+      })
+      wait_until_service_request_cleared(ctx.state, ctx.bufnr)
+
+      local bucket = ctx.state.watch_diagnostics[ctx.bufnr]
+      assert_eq(#bucket.full, 1, "formula diagnostic should be published in the aggregate full bucket")
+      assert_eq(bucket.formula_by_node[job.node_id][1], bucket.full[1], "formula diagnostic should be stored by node")
+
+      local second_request_id = "formula:diagnostics-clean"
+      local second_overlay_id = "overlay:diagnostics-clean"
+      local node = ctx.state.machine_state.buffers[ctx.bufnr].nodes[job.node_id]
+      node.candidate_overlay_id = second_overlay_id
+      node.status = "pending"
+      ctx.state.machine_state.overlays[second_overlay_id] = {
+        overlay_id = second_overlay_id,
+        slot_id = job.slot_id,
+        owner_node_id = job.node_id,
+        owner_bufnr = ctx.bufnr,
+        owner_project_scope_id = job.project_scope_id,
+        request_id = second_request_id,
+        page_index = 1,
+        render_epoch = 2,
+        node_rev = job.node_rev,
+        context_id = job.context_id,
+        context_rev = job.context_rev,
+        source_text_hash = job.source_text_hash,
+        buffer_version = job.buffer_version,
+        layout_version = job.layout_version,
+        status = "rendering",
+      }
+
+      local clean_job = vim.deepcopy(job)
+      clean_job.overlay_id = second_overlay_id
+      clean_job.request_id = second_request_id
+      clean_job.render_epoch = 2
+      clean_job.request_page_index = 1
+      local clean_request = {
+        request_id = second_request_id,
+        bufnr = ctx.bufnr,
+        project_scope_id = job.project_scope_id,
+        render_epoch = 2,
+        buffer_version = job.buffer_version,
+        layout_version = job.layout_version,
+        jobs = { clean_job },
+      }
+      ctx.session.render_formula_batch_via_service(ctx.bufnr, clean_request)
+
+      local page_path = vim.fn.tempname() .. ".png"
+      write_file(page_path, "png")
+      with_stubbed_extmark(function()
+        feed_service_response(ctx.full_stdout, {
+          type = "formula_rendered",
+          request_id = second_request_id,
+          context_id = job.context_id,
+          context_rev = job.context_rev,
+          node_id = job.node_id,
+          node_rev = job.node_rev,
+          status = "ok",
+          path = page_path,
+          width_px = 20,
+          height_px = 10,
+          diagnostics = {},
+        })
+        wait_until_formula_batch_cleared(ctx.state, ctx.bufnr, second_request_id)
+      end)
+
+      bucket = ctx.state.watch_diagnostics[ctx.bufnr]
+      assert_eq(bucket.formula_by_node[job.node_id], nil, "clean formula response should clear that node's diagnostics")
+      assert_eq(#bucket.full, 0, "clean formula response should remove stale aggregate diagnostics")
+
+      bucket.formula_by_node[job.node_id] = {
+        { filename = ctx.main_path, lnum = 1, col = 1, text = "[service/formula] stale", type = "E" },
+      }
+      require("typst-concealer.session")
+      ctx.state.machine_state.buffers[ctx.bufnr].nodes[job.node_id] = nil
+      ctx.session.render_formula_batch_via_service(ctx.bufnr, {
+        request_id = "formula:diagnostics-delete",
+        bufnr = ctx.bufnr,
+        project_scope_id = job.project_scope_id,
+        render_epoch = 3,
+        buffer_version = job.buffer_version,
+        layout_version = job.layout_version,
+        jobs = {},
+      })
+      assert_eq(
+        bucket.formula_by_node[job.node_id],
+        nil,
+        "formula batch scheduling should drop diagnostics for deleted nodes"
+      )
+    end
+  )
 end
 
 function _G.test_service_error_diagnostics_clear_candidate_placeholder()
@@ -1994,6 +2807,120 @@ local function test_live_preview_keeps_old_highlight_until_replacement_commits()
   end)
 
   vim.treesitter.get_parser = original_get_parser
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+  if not ok_run then
+    error(err)
+  end
+end
+
+local function test_preview_cleanup_reattaches_only_source_item()
+  local state = fresh_state()
+  local apply = require("typst-concealer.apply")
+  local runtime = require("typst-concealer.machine.runtime")
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "$x$", "$y$" })
+
+  local source_item = make_render_item({
+    bufnr = bufnr,
+    range = { 0, 0, 0, 3 },
+    display_range = { 0, 0, 0, 3 },
+    image_id = 101,
+    extmark_id = 201,
+    page_path = "/tmp/source-x.png",
+    page_stamp = "source-x",
+    natural_cols = 2,
+    natural_rows = 1,
+    source_rows = 1,
+  })
+  local other_item = make_render_item({
+    bufnr = bufnr,
+    item_idx = 2,
+    range = { 1, 0, 1, 3 },
+    display_range = { 1, 0, 1, 3 },
+    str = "$y$",
+    image_id = 102,
+    extmark_id = 202,
+    page_path = "/tmp/source-y.png",
+    page_stamp = "source-y",
+    natural_cols = 2,
+    natural_rows = 1,
+    source_rows = 1,
+  })
+  local preview_item = make_render_item({
+    bufnr = bufnr,
+    range = { 0, 0, 0, 3 },
+    display_range = { 0, 0, 0, 3 },
+    str = "$#text(red)[$x$]$",
+    source_str = "$x$",
+    image_id = 301,
+    extmark_id = 401,
+    page_path = "/tmp/preview-x.png",
+    page_stamp = "preview-x",
+    natural_cols = 3,
+    natural_rows = 1,
+    source_rows = 1,
+    render_target = "preview_float",
+    source_image_id = source_item.image_id,
+  })
+
+  state.buffer_render_state[bufnr] = {
+    full_items = { source_item, other_item },
+    lingering_items = {},
+    line_to_items = {
+      [0] = { source_item },
+      [1] = { other_item },
+    },
+    extmark_to_item = {
+      [source_item.extmark_id] = source_item,
+      [other_item.extmark_id] = other_item,
+    },
+  }
+  state.item_by_image_id[source_item.image_id] = source_item
+  state.item_by_image_id[other_item.image_id] = other_item
+  state.item_by_image_id[preview_item.image_id] = preview_item
+  state.image_id_to_extmark[source_item.image_id] = source_item.extmark_id
+  state.image_id_to_extmark[other_item.image_id] = other_item.extmark_id
+  state.image_id_to_extmark[preview_item.image_id] = preview_item.extmark_id
+  state.image_ids_in_use[source_item.image_id] = bufnr
+  state.image_ids_in_use[other_item.image_id] = bufnr
+  state.image_ids_in_use[preview_item.image_id] = bufnr
+
+  local bs = state.get_buf_state(bufnr)
+  bs.preview_image = {
+    extmark_id = preview_item.extmark_id,
+    target_bufnr = bufnr,
+    natural_cols = preview_item.natural_cols,
+    natural_rows = preview_item.natural_rows,
+    image_id = preview_item.image_id,
+  }
+  bs.preview_item = preview_item
+  bs.preview_last_rendered_item = preview_item
+  bs.preview_source_image_id = source_item.image_id
+  bs.preview_source_page_stamp = source_item.page_stamp
+  bs.preview_source_range = vim.deepcopy(source_item.range)
+
+  local invalidations = 0
+  local old_invalidate = runtime.invalidate_terminal_uploads
+  runtime.invalidate_terminal_uploads = function()
+    invalidations = invalidations + 1
+  end
+
+  local ok_run, err = pcall(function()
+    with_stubbed_extmark(function(calls)
+      apply.cleanup_preview_image(bufnr)
+
+      assert_eq(invalidations, 0, "preview cleanup should not invalidate the whole buffer")
+      assert_eq(#calls.created, 1, "preview cleanup should re-upload only the source image")
+      assert_eq(calls.created[1].image_id, source_item.image_id, "preview cleanup should reattach source node")
+      assert_eq(#calls.concealed, 1, "preview cleanup should rewrite only the source placeholder")
+      assert_eq(calls.concealed[1].image_id, source_item.image_id, "conceal repair should target source node")
+      assert_eq(calls.flushed, 1, "targeted source reattach should flush once")
+      assert_eq(state.item_by_image_id[other_item.image_id], other_item, "other rendered nodes should remain untouched")
+    end)
+  end)
+
+  runtime.invalidate_terminal_uploads = old_invalidate
   vim.api.nvim_buf_delete(bufnr, { force = true })
   if not ok_run then
     error(err)
@@ -3552,6 +4479,264 @@ local function test_machine_reducer_failed_request_cleans_candidates_and_active_
   assert_eq(count_effects(effects, "retire_overlay"), 2, "failed request should retire non-visible candidates")
 end
 
+local function test_machine_reducer_formula_batch_keeps_node_request_state_independent()
+  reset_modules()
+  local types = require("typst-concealer.machine.types")
+  local reducer = require("typst-concealer.machine.reducer")
+
+  local state = types.initial_state()
+  local effects
+  state, effects = reducer.reduce(
+    state,
+    scan_event({
+      make_scanned_node({ stable_key = "a", source_text = "$a$", source_text_hash = "hash:a" }),
+      make_scanned_node({
+        stable_key = "b",
+        item_idx = 2,
+        source_range = { 1, 0, 1, 3 },
+        display_range = { 1, 0, 1, 3 },
+        source_text = "$b$",
+        source_text_hash = "hash:b",
+      }),
+    })
+  )
+  assert_eq(#effects, 0, "scan should only reconcile nodes")
+
+  state, effects = reducer.reduce(state, { type = "formula_renders_requested", bufnr = 1 })
+  local request = first_effect(effects, "request_formula_render_batch")
+  assert_truthy(request, "formula render should use formula batch effect")
+  assert_eq(#request.request.jobs, 2, "formula batch should include both dirty nodes")
+  assert_eq(state.buffers[1].active_request_id, nil, "formula batch should not become buffer active request")
+
+  local first_job = request.request.jobs[1]
+  local second_job = request.request.jobs[2]
+  state, effects = reducer.reduce(state, {
+    type = "overlay_render_failed",
+    request_id = request.request.request_id,
+    overlay_id = first_job.overlay_id,
+    node_rev = first_job.node_rev,
+    context_id = first_job.context_id,
+    context_rev = first_job.context_rev,
+    reason = "failed first formula",
+  })
+
+  assert_eq(
+    state.overlays[second_job.overlay_id].status,
+    "placeholder",
+    "failed first formula should not touch the second formula candidate"
+  )
+  assert_eq(
+    state.buffers[1].nodes[second_job.node_id].candidate_overlay_id,
+    second_job.overlay_id,
+    "second formula should keep its pending candidate"
+  )
+  assert_eq(count_effects(effects, "retire_overlay"), 1, "only failed formula candidate should retire")
+end
+
+local function test_machine_reducer_scan_retires_cleared_formula_candidates()
+  reset_modules()
+  local types = require("typst-concealer.machine.types")
+  local reducer = require("typst-concealer.machine.reducer")
+
+  local state = types.initial_state()
+  local effects
+  state, effects = reducer.reduce(
+    state,
+    scan_event({
+      make_scanned_node({ stable_key = "a", source_text = "$a$", source_text_hash = "hash:a" }),
+      make_scanned_node({
+        stable_key = "b",
+        item_idx = 2,
+        source_range = { 1, 0, 1, 3 },
+        display_range = { 1, 0, 1, 3 },
+        source_text = "$b$",
+        source_text_hash = "hash:b",
+      }),
+    })
+  )
+  state, effects = reducer.reduce(state, { type = "formula_renders_requested", bufnr = 1 })
+  local request = first_effect(effects, "request_formula_render_batch")
+  assert_truthy(request, "initial formula render should create pending candidates")
+  local edited_job = request.request.jobs[1]
+  local removed_job = request.request.jobs[2]
+
+  state, effects = reducer.reduce(
+    state,
+    scan_event({
+      make_scanned_node({
+        stable_key = "a",
+        source_text = "$aa$",
+        source_text_hash = "hash:aa",
+      }),
+    }, { buffer_version = 2 })
+  )
+
+  assert_eq(
+    count_effects(effects, "retire_overlay"),
+    2,
+    "scan should retire candidates cleared by edited and removed formulas"
+  )
+  assert_eq(
+    state.overlays[edited_job.overlay_id].status,
+    "retiring",
+    "edited formula's in-flight candidate should be retiring"
+  )
+  assert_eq(
+    state.overlays[removed_job.overlay_id].status,
+    "retiring",
+    "removed formula's in-flight candidate should be retiring"
+  )
+  assert_eq(
+    state.buffers[1].nodes[edited_job.node_id].candidate_overlay_id,
+    nil,
+    "edited node should no longer point at the stale candidate"
+  )
+  assert_eq(
+    state.buffers[1].nodes[removed_job.node_id],
+    nil,
+    "removed node without visible overlay should be dropped after its candidate is retired"
+  )
+end
+
+local function test_machine_reducer_keeps_identical_pending_formula_candidate()
+  reset_modules()
+  local types = require("typst-concealer.machine.types")
+  local reducer = require("typst-concealer.machine.reducer")
+
+  local state = types.initial_state()
+  local effects
+  state, effects = reducer.reduce(state, scan_event({ make_scanned_node({ stable_key = "a" }) }))
+  state, effects = reducer.reduce(state, { type = "formula_renders_requested", bufnr = 1 })
+  local request = first_effect(effects, "request_formula_render_batch")
+  assert_truthy(request, "initial formula render should create a candidate")
+  local job = request.request.jobs[1]
+  local first_render_epoch = state.buffers[1].render_epoch
+
+  state, effects =
+    reducer.reduce(state, scan_event({ make_scanned_node({ stable_key = "a" }) }, { buffer_version = 2 }))
+  assert_eq(
+    state.buffers[1].nodes[job.node_id].candidate_overlay_id,
+    job.overlay_id,
+    "unchanged pending scan should keep the in-flight candidate"
+  )
+  assert_eq(
+    state.overlays[job.overlay_id].status,
+    "placeholder",
+    "unchanged pending scan should not retire the in-flight candidate"
+  )
+
+  state, effects = reducer.reduce(state, { type = "formula_renders_requested", bufnr = 1 })
+  assert_eq(
+    count_effects(effects, "request_formula_render_batch"),
+    0,
+    "identical pending formula should not schedule a duplicate render"
+  )
+  assert_eq(count_effects(effects, "retire_overlay"), 0, "identical pending formula should not supersede the candidate")
+  assert_eq(state.buffers[1].render_epoch, first_render_epoch, "skipping duplicate render should not bump render epoch")
+end
+
+local function test_machine_reducer_flow_nodes_rerender_when_layout_changes()
+  reset_modules()
+  local types = require("typst-concealer.machine.types")
+  local reducer = require("typst-concealer.machine.reducer")
+  local flow_node = make_scanned_node({
+    stable_key = "flow",
+    node_type = "code",
+    source_range = { 0, 0, 1, 0 },
+    display_range = { 0, 0, 1, 0 },
+    source_text = "#rect(width: 100%)",
+    source_text_hash = "hash:flow",
+    semantics = { display_kind = "block", constraint_kind = "flow" },
+  })
+
+  local state = types.initial_state()
+  local effects
+  state, effects = reducer.reduce(state, scan_event({ flow_node }, { layout_version = 80 }))
+  state, effects = reducer.reduce(state, { type = "formula_renders_requested", bufnr = 1 })
+  local request = first_effect(effects, "request_formula_render_batch")
+  assert_truthy(request, "initial flow node render should create a candidate")
+  state = commit_overlay_jobs(reducer, state, request)
+  local visible_overlay_id = state.buffers[1].nodes[request.request.jobs[1].node_id].visible_overlay_id
+
+  state, effects = reducer.reduce(state, scan_event({ flow_node }, { layout_version = 100 }))
+  assert_eq(
+    state.buffers[1].nodes[request.request.jobs[1].node_id].status,
+    "stale",
+    "flow node should become stale when columns change"
+  )
+  assert_eq(
+    state.overlays[visible_overlay_id].status,
+    "visible",
+    "layout-sensitive rerender should keep the old image visible until replacement commits"
+  )
+
+  state, effects = reducer.reduce(state, { type = "formula_renders_requested", bufnr = 1 })
+  assert_eq(
+    count_effects(effects, "request_formula_render_batch"),
+    1,
+    "flow node should schedule a formula rerender after columns change"
+  )
+end
+
+local function test_machine_reducer_layout_change_rebinds_without_formula_rerender()
+  reset_modules()
+  local types = require("typst-concealer.machine.types")
+  local reducer = require("typst-concealer.machine.reducer")
+
+  local state = types.initial_state()
+  state.buffers[1] = {
+    bufnr = 1,
+    project_scope_id = "project:1",
+    buffer_version = 1,
+    layout_version = 80,
+    render_epoch = 1,
+    nodes = {
+      ["node:1"] = {
+        node_id = "node:1",
+        bufnr = 1,
+        project_scope_id = "project:1",
+        item_idx = 1,
+        node_type = "math",
+        source_range = { 0, 0, 0, 3 },
+        display_range = { 0, 0, 0, 3 },
+        source_text = "$x$",
+        source_text_hash = "hash:x",
+        node_rev = 1,
+        context_hash = "ctx:0",
+        prelude_count = 0,
+        semantics = { display_kind = "inline", constraint_kind = "intrinsic" },
+        status = "stable",
+        visible_overlay_id = "overlay:1",
+      },
+    },
+    node_order = { "node:1" },
+  }
+  state.overlays["overlay:1"] = {
+    overlay_id = "overlay:1",
+    owner_node_id = "node:1",
+    owner_bufnr = 1,
+    owner_project_scope_id = "project:1",
+    request_id = "formula:1",
+    status = "visible",
+    image_id = 10,
+    extmark_id = 20,
+    page_path = "/tmp/formula.png",
+    natural_cols = 2,
+    natural_rows = 1,
+  }
+
+  local effects
+  state, effects = reducer.reduce(state, { type = "buffer_layout_changed", bufnr = 1, new_layout_version = 100 })
+  assert_eq(count_effects(effects, "rerender_buffer"), 0, "layout change should not request buffer rerender")
+  assert_eq(
+    count_effects(effects, "request_formula_render_batch"),
+    0,
+    "layout change should not request formula render"
+  )
+  assert_eq(count_effects(effects, "bind_overlay"), 1, "layout change should rebind visible placement")
+  assert_eq(state.buffers[1].nodes["node:1"].status, "stable", "layout change should keep formula clean")
+end
+
 local function test_machine_runtime_rebuilds_compat_read_model()
   local state = fresh_state()
   local types = require("typst-concealer.machine.types")
@@ -4148,6 +5333,30 @@ local function test_machine_runtime_tracks_ui_state()
   assert_eq(state.machine_state.ui.buffers[1], nil, "buffer reset should clear machine ui state")
 end
 
+local function test_machine_runtime_cursor_sync_renders_preview()
+  fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      cursor_hover_throttle_ms = 0,
+    },
+  }
+
+  local preview_calls = 0
+  local hover_calls = 0
+  package.loaded["typst-concealer.plan"] = {
+    render_live_typst_preview = function()
+      preview_calls = preview_calls + 1
+    end,
+    hide_extmarks_at_cursor = function()
+      hover_calls = hover_calls + 1
+    end,
+  }
+
+  require("typst-concealer.machine.runtime").sync_cursor_ui(1)
+  assert_eq(preview_calls, 1, "CursorMoved sync should render preview")
+  assert_eq(hover_calls, 1, "CursorMoved sync should still update conceal state")
+end
+
 local function test_machine_runtime_reconciles_visible_overlay_binding_from_extmark()
   local state = fresh_state()
   local runtime = require("typst-concealer.machine.runtime")
@@ -4279,7 +5488,438 @@ local function test_machine_runtime_refreshes_visible_overlays_without_render_re
     assert_eq(#calls.created, 1, "unchanged visible overlay should not re-upload every cursor move")
     assert_eq(calls.flushed, 1, "visible refresh should not flush when nothing was uploaded")
     assert_eq(#calls.concealed, 2, "unchanged visible overlay should still rewrite placeholders")
+
+    runtime.invalidate_terminal_uploads()
+    refreshed = runtime.refresh_visible_overlays(bufnr, { margin = 0 })
+    assert_eq(refreshed, 1, "terminal epoch invalidation should keep refresh lightweight")
+    assert_eq(#calls.created, 2, "terminal epoch invalidation should re-upload the existing artifact")
+    assert_eq(calls.flushed, 2, "terminal epoch repair should flush re-uploaded image data")
   end)
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_formula_manager_tracks_placement_indexes_and_read_model()
+  local state = fresh_state()
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "$x$", "$y$" })
+
+  state.machine_state.buffers[bufnr] = {
+    bufnr = bufnr,
+    project_scope_id = "p",
+    buffer_version = 3,
+    layout_version = 80,
+    render_epoch = 2,
+    context_id = "ctx",
+    context_rev = 4,
+    nodes = {
+      ["node:x"] = {
+        node_id = "node:x",
+        bufnr = bufnr,
+        project_scope_id = "p",
+        item_idx = 1,
+        node_type = "math",
+        source_range = { 0, 0, 0, 3 },
+        display_range = { 0, 0, 0, 3 },
+        source_text = "$x$",
+        source_text_hash = "hash:x",
+        node_rev = 7,
+        context_hash = "ctx:4",
+        prelude_count = 0,
+        semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "math" },
+        status = "stable",
+        visible_overlay_id = "overlay:x",
+      },
+      ["node:y"] = {
+        node_id = "node:y",
+        bufnr = bufnr,
+        project_scope_id = "p",
+        item_idx = 2,
+        node_type = "math",
+        source_range = { 1, 0, 1, 3 },
+        display_range = { 1, 0, 1, 3 },
+        source_text = "$y$",
+        source_text_hash = "hash:y",
+        node_rev = 8,
+        context_hash = "ctx:4",
+        prelude_count = 0,
+        semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "math" },
+        status = "pending",
+        candidate_overlay_id = "overlay:y",
+      },
+    },
+    node_order = { "node:x", "node:y" },
+  }
+  state.machine_state.overlays["overlay:x"] = {
+    overlay_id = "overlay:x",
+    owner_node_id = "node:x",
+    owner_bufnr = bufnr,
+    owner_project_scope_id = "p",
+    request_id = "request:x",
+    render_epoch = 2,
+    node_rev = 7,
+    context_id = "ctx",
+    context_rev = 4,
+    buffer_version = 3,
+    layout_version = 80,
+    image_id = 3001,
+    extmark_id = 4001,
+    page_path = "/tmp/x.png",
+    natural_cols = 2,
+    natural_rows = 1,
+    source_rows = 1,
+    terminal_upload_epoch = 9,
+    status = "visible",
+  }
+  state.machine_state.overlays["overlay:y"] = {
+    overlay_id = "overlay:y",
+    owner_node_id = "node:y",
+    owner_bufnr = bufnr,
+    owner_project_scope_id = "p",
+    request_id = "request:y",
+    render_epoch = 2,
+    node_rev = 8,
+    context_id = "ctx",
+    context_rev = 4,
+    buffer_version = 3,
+    layout_version = 80,
+    image_id = 3002,
+    status = "rendering",
+  }
+
+  local manager = require("typst-concealer.formula.manager").get(bufnr):sync_from_machine()
+  assert_truthy(manager.by_node_id["node:x"] ~= nil, "manager should index visible placement by node")
+  assert_truthy(manager.by_node_id["node:y"] ~= nil, "manager should index pending placement by node")
+  assert_eq(manager.extmark_index[4001], manager.by_node_id["node:x"], "manager should index visible extmark")
+  assert_eq(manager.by_image_id[3001], manager.by_node_id["node:x"], "manager should index visible image")
+  assert_eq(
+    manager.by_node_id["node:y"].pending_render.request_id,
+    "request:y",
+    "placement should own pending render state"
+  )
+  assert_eq(manager.by_node_id["node:x"].image.sent_epoch, 9, "formula image should track terminal upload epoch")
+  assert_eq(state.buffer_render_state[bufnr].full_items[1].node_id, "node:x", "read model should come from placement")
+  assert_eq(state.item_by_image_id[3001].node_id, "node:x", "placement read model should index by image id")
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_formula_placement_show_clears_hidden_before_conceal()
+  local state = fresh_state()
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "$x$" })
+
+  state.machine_state.buffers[bufnr] = {
+    bufnr = bufnr,
+    project_scope_id = "p",
+    buffer_version = 1,
+    layout_version = 80,
+    render_epoch = 1,
+    context_id = "ctx",
+    context_rev = 1,
+    nodes = {
+      ["node:x"] = {
+        node_id = "node:x",
+        bufnr = bufnr,
+        project_scope_id = "p",
+        item_idx = 1,
+        node_type = "math",
+        source_range = { 0, 0, 0, 3 },
+        display_range = { 0, 0, 0, 3 },
+        source_text = "$x$",
+        source_text_hash = "hash:x",
+        node_rev = 1,
+        context_hash = "ctx",
+        prelude_count = 0,
+        semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "math" },
+        status = "stable",
+        visible_overlay_id = "overlay:x",
+      },
+    },
+    node_order = { "node:x" },
+  }
+  state.machine_state.overlays["overlay:x"] = {
+    overlay_id = "overlay:x",
+    owner_node_id = "node:x",
+    owner_bufnr = bufnr,
+    owner_project_scope_id = "p",
+    request_id = "request:x",
+    render_epoch = 1,
+    node_rev = 1,
+    context_id = "ctx",
+    context_rev = 1,
+    buffer_version = 1,
+    layout_version = 80,
+    image_id = 501,
+    extmark_id = 601,
+    page_path = "/tmp/x.png",
+    natural_cols = 2,
+    natural_rows = 1,
+    source_rows = 1,
+    status = "visible",
+  }
+
+  local manager = require("typst-concealer.formula.manager").get(bufnr):sync_from_machine()
+  local placement = manager.by_node_id["node:x"]
+  local bs = state.get_buf_state(bufnr)
+  bs.currently_hidden_extmark_ids[601] = true
+
+  local original = package.loaded["typst-concealer.extmark"]
+  local hidden_during_conceal = true
+  package.loaded["typst-concealer.extmark"] = {
+    conceal_for_image_id = function(target_bufnr)
+      hidden_during_conceal = state.get_buf_state(target_bufnr).currently_hidden_extmark_ids[601]
+    end,
+  }
+
+  local ok_run, err = pcall(function()
+    assert_eq(placement:show(), true, "show should restore a visible placement")
+    assert_eq(hidden_during_conceal, nil, "show should clear hidden state before redrawing the image")
+  end)
+  package.loaded["typst-concealer.extmark"] = original
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+  if not ok_run then
+    error(err)
+  end
+end
+
+local function test_formula_cursor_fast_boundary_switch_only_touches_previous_and_current()
+  local state = fresh_state()
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "$a$ and $b$ and $c$" })
+  package.loaded["typst-concealer"] = {
+    _enabled_buffers = { [bufnr] = true },
+    is_render_allowed = function()
+      return true
+    end,
+    config = {
+      use_compiler_service = true,
+      use_formula_service = true,
+      conceal_in_normal = false,
+    },
+  }
+
+  local nodes = {}
+  local overlays = {}
+  local specs = {
+    { "a", 0, 3, 101, 201 },
+    { "b", 8, 11, 102, 202 },
+    { "c", 16, 19, 103, 203 },
+  }
+  for i, spec in ipairs(specs) do
+    local name, start_col, end_col, image_id, extmark_id = spec[1], spec[2], spec[3], spec[4], spec[5]
+    local node_id = "node:" .. name
+    local overlay_id = "overlay:" .. name
+    nodes[node_id] = {
+      node_id = node_id,
+      bufnr = bufnr,
+      project_scope_id = "p",
+      item_idx = i,
+      node_type = "math",
+      source_range = { 0, start_col, 0, end_col },
+      display_range = { 0, start_col, 0, end_col },
+      source_text = "$" .. name .. "$",
+      source_text_hash = "hash:" .. name,
+      node_rev = 1,
+      context_hash = "ctx",
+      prelude_count = 0,
+      semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "math" },
+      status = "stable",
+      visible_overlay_id = overlay_id,
+    }
+    overlays[overlay_id] = {
+      overlay_id = overlay_id,
+      owner_node_id = node_id,
+      owner_bufnr = bufnr,
+      owner_project_scope_id = "p",
+      request_id = "request:" .. name,
+      render_epoch = 1,
+      node_rev = 1,
+      context_id = "ctx",
+      context_rev = 1,
+      buffer_version = 1,
+      layout_version = 80,
+      image_id = image_id,
+      extmark_id = extmark_id,
+      page_path = "/tmp/" .. name .. ".png",
+      natural_cols = 1,
+      natural_rows = 1,
+      source_rows = 1,
+      terminal_upload_epoch = state.terminal_upload_epoch,
+      status = "visible",
+    }
+  end
+  state.machine_state.buffers[bufnr] = {
+    bufnr = bufnr,
+    project_scope_id = "p",
+    buffer_version = 1,
+    layout_version = 80,
+    render_epoch = 1,
+    context_id = "ctx",
+    context_rev = 1,
+    nodes = nodes,
+    node_order = { "node:a", "node:b", "node:c" },
+  }
+  state.machine_state.overlays = overlays
+  local manager = require("typst-concealer.formula.manager").get(bufnr):sync_from_machine()
+
+  with_stubbed_extmark(function(calls)
+    vim.api.nvim_win_set_cursor(0, { 1, 1 })
+    manager:sync_cursor_conceal()
+    vim.api.nvim_win_set_cursor(0, { 1, 5 })
+    manager:sync_cursor_conceal()
+    vim.api.nvim_win_set_cursor(0, { 1, 9 })
+    manager:sync_cursor_conceal()
+
+    assert_eq(#calls.unconcealed, 2, "fast cursor movement should hide only entered formula placements")
+    assert_eq(calls.unconcealed[1].extmark_id, 201, "first formula should be hidden when entered")
+    assert_eq(calls.unconcealed[2].extmark_id, 202, "second formula should be hidden when entered")
+    assert_eq(#calls.concealed, 1, "leaving the first formula should restore only that source placement")
+    assert_eq(calls.concealed[1].image_id, 101, "restore should target the previous formula image")
+    for _, call in ipairs(calls.unconcealed) do
+      assert_truthy(call.extmark_id ~= 203, "unrelated formula extmark should not be hidden")
+    end
+    for _, call in ipairs(calls.concealed) do
+      assert_truthy(call.image_id ~= 103, "unrelated formula image should not be reattached")
+    end
+  end)
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_formula_cursor_preview_targets_single_placement()
+  local state = fresh_state()
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "$a$ $b$" })
+  vim.api.nvim_win_set_cursor(0, { 1, 5 })
+
+  package.loaded["typst-concealer"] = {
+    _enabled_buffers = { [bufnr] = true },
+    is_render_allowed = function()
+      return true
+    end,
+    config = {
+      use_compiler_service = true,
+      use_formula_service = true,
+      live_preview_enabled = true,
+      conceal_in_normal = false,
+    },
+  }
+
+  state.machine_state.buffers[bufnr] = {
+    bufnr = bufnr,
+    project_scope_id = "p",
+    buffer_version = 1,
+    layout_version = 80,
+    render_epoch = 1,
+    context_id = "ctx",
+    context_rev = 1,
+    nodes = {
+      ["node:a"] = {
+        node_id = "node:a",
+        bufnr = bufnr,
+        project_scope_id = "p",
+        item_idx = 1,
+        node_type = "math",
+        source_range = { 0, 0, 0, 3 },
+        display_range = { 0, 0, 0, 3 },
+        source_text = "$a$",
+        source_text_hash = "hash:a",
+        node_rev = 1,
+        context_hash = "ctx",
+        prelude_count = 0,
+        semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "math" },
+        status = "stable",
+        visible_overlay_id = "overlay:a",
+      },
+      ["node:b"] = {
+        node_id = "node:b",
+        bufnr = bufnr,
+        project_scope_id = "p",
+        item_idx = 2,
+        node_type = "math",
+        source_range = { 0, 4, 0, 7 },
+        display_range = { 0, 4, 0, 7 },
+        source_text = "$b$",
+        source_text_hash = "hash:b",
+        node_rev = 1,
+        context_hash = "ctx",
+        prelude_count = 0,
+        semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "math" },
+        status = "stable",
+        visible_overlay_id = "overlay:b",
+      },
+    },
+    node_order = { "node:a", "node:b" },
+  }
+  state.machine_state.overlays["overlay:a"] = {
+    overlay_id = "overlay:a",
+    owner_node_id = "node:a",
+    owner_bufnr = bufnr,
+    owner_project_scope_id = "p",
+    request_id = "request:a",
+    render_epoch = 1,
+    node_rev = 1,
+    context_id = "ctx",
+    context_rev = 1,
+    buffer_version = 1,
+    layout_version = 80,
+    image_id = 701,
+    extmark_id = 801,
+    page_path = "/tmp/a.png",
+    natural_cols = 1,
+    natural_rows = 1,
+    source_rows = 1,
+    status = "visible",
+  }
+  state.machine_state.overlays["overlay:b"] = {
+    overlay_id = "overlay:b",
+    owner_node_id = "node:b",
+    owner_bufnr = bufnr,
+    owner_project_scope_id = "p",
+    request_id = "request:b",
+    render_epoch = 1,
+    node_rev = 1,
+    context_id = "ctx",
+    context_rev = 1,
+    buffer_version = 1,
+    layout_version = 80,
+    image_id = 702,
+    extmark_id = 802,
+    page_path = "/tmp/b.png",
+    natural_cols = 1,
+    natural_rows = 1,
+    source_rows = 1,
+    status = "visible",
+  }
+
+  local preview_calls = {}
+  local clear_calls = 0
+  package.loaded["typst-concealer.plan"] = {
+    render_live_typst_preview_for_item = function(_, item)
+      preview_calls[#preview_calls + 1] = item
+      return true, { node_id = item.node_id }, "preview:" .. tostring(item.node_id)
+    end,
+    clear_live_typst_preview = function()
+      clear_calls = clear_calls + 1
+    end,
+  }
+
+  local manager = require("typst-concealer.formula.manager").get(bufnr)
+  assert_eq(manager:sync_cursor_preview(), true, "cursor preview should expand the current placement")
+  assert_eq(#preview_calls, 1, "cursor preview should target exactly one placement")
+  assert_eq(preview_calls[1].node_id, "node:b", "cursor preview should target the placement under cursor")
+  assert_eq(manager.preview_placement_id, "node:b", "manager should remember the preview placement")
+  assert_eq(manager.by_node_id["node:b"].preview_render_key, "preview:node:b", "placement should own preview key")
+  assert_eq(manager.by_node_id["node:a"].preview_render_key, nil, "unrelated placement should not enter preview")
+
+  vim.api.nvim_win_set_cursor(0, { 1, 3 })
+  manager:sync_cursor_preview()
+  assert_eq(clear_calls, 1, "leaving formula placement should clear only the active preview")
 
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
@@ -4517,12 +6157,32 @@ local tests = {
   { test_custom_markdown_filetypes_are_supported, "ok custom markdown filetypes are supported" },
   { test_markdown_adapter_collects_inline_and_block_math, "ok markdown adapter collects math" },
   { test_render_buf_scans_markdown_math_nodes, "ok render_buf scans markdown math nodes" },
+  { test_vim_resized_renders_on_column_change, "ok VimResized renders on column change" },
   { test_root_prefers_cwd_fallback, "ok root fallback uses cwd" },
   { test_get_root_overrides_fallback, "ok get_root overrides root base" },
   { test_session_render_request_tracks_current_request, "ok session tracks machine render requests" },
   { test_session_render_request_via_service_writes_json, "ok session writes compiler service requests" },
   { test_service_validates_page_contract, "ok service validates page contract" },
   { test_service_success_clears_active_meta, "ok service success clears active meta" },
+  { test_formula_service_success_routes_by_node_revision, "ok formula service routes by node revision" },
+  {
+    test_formula_transport_batch_does_not_install_buffer_active_request,
+    "ok formula transport batch does not install buffer active request",
+  },
+  {
+    test_formula_transport_prunes_superseded_queued_batches,
+    "ok formula transport prunes superseded queued batches",
+  },
+  {
+    test_formula_transport_stale_response_reschedules_pending_node,
+    "ok formula transport stale responses converge pending nodes",
+  },
+  {
+    test_formula_manager_self_check_reschedules_lost_candidate,
+    "ok formula manager self-check reschedules lost candidates",
+  },
+  { test_formula_service_stale_node_revision_is_discarded, "ok formula service discards stale node revision" },
+  { test_formula_diagnostics_replace_per_node, "ok formula diagnostics replace per node" },
   {
     _G.test_service_error_diagnostics_clear_candidate_placeholder,
     "ok service error diagnostics clear candidate placeholder",
@@ -4542,6 +6202,10 @@ local tests = {
   {
     test_live_preview_keeps_old_highlight_until_replacement_commits,
     "ok live preview keeps old highlight until replacement commits",
+  },
+  {
+    test_preview_cleanup_reattaches_only_source_item,
+    "ok preview cleanup reattaches only source item",
   },
   { test_service_artifact_cleanup_preserves_live_paths, "ok service artifact cleanup preserves live paths" },
   { test_wrapper_cache_tracks_root_signature, "ok wrapper cache keys include root signature" },
@@ -4629,6 +6293,26 @@ local tests = {
     test_machine_reducer_failed_request_cleans_candidates_and_active_id,
     "ok machine reducer failed request cleans candidates",
   },
+  {
+    test_machine_reducer_formula_batch_keeps_node_request_state_independent,
+    "ok machine reducer formula batch keeps node state independent",
+  },
+  {
+    test_machine_reducer_scan_retires_cleared_formula_candidates,
+    "ok machine reducer scan retires cleared formula candidates",
+  },
+  {
+    test_machine_reducer_keeps_identical_pending_formula_candidate,
+    "ok machine reducer keeps identical pending formula candidates",
+  },
+  {
+    test_machine_reducer_flow_nodes_rerender_when_layout_changes,
+    "ok machine reducer flow nodes rerender when layout changes",
+  },
+  {
+    test_machine_reducer_layout_change_rebinds_without_formula_rerender,
+    "ok machine reducer layout change rebinds without formula rerender",
+  },
   { test_machine_runtime_rebuilds_compat_read_model, "ok machine runtime rebuilds compat read model" },
   {
     test_machine_runtime_rebinds_overlay_without_terminal_image_refresh,
@@ -4665,12 +6349,32 @@ local tests = {
   },
   { test_machine_runtime_tracks_ui_state, "ok machine runtime tracks ui state" },
   {
+    test_machine_runtime_cursor_sync_renders_preview,
+    "ok machine runtime cursor sync renders preview",
+  },
+  {
     test_machine_runtime_reconciles_visible_overlay_binding_from_extmark,
     "ok machine runtime reconciles visible overlay bindings from extmarks",
   },
   {
     test_machine_runtime_refreshes_visible_overlays_without_render_request,
     "ok machine runtime refreshes visible overlays without render requests",
+  },
+  {
+    test_formula_manager_tracks_placement_indexes_and_read_model,
+    "ok formula manager tracks placement indexes and read model",
+  },
+  {
+    test_formula_placement_show_clears_hidden_before_conceal,
+    "ok formula placement restores hidden image before conceal",
+  },
+  {
+    test_formula_cursor_fast_boundary_switch_only_touches_previous_and_current,
+    "ok formula cursor boundary switches stay placement-local",
+  },
+  {
+    test_formula_cursor_preview_targets_single_placement,
+    "ok formula cursor preview targets one placement",
   },
   {
     test_machine_runtime_scroll_refresh_reuploads_blocks_only,

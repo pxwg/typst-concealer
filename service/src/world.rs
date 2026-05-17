@@ -23,6 +23,7 @@ pub struct ConcealerWorld {
     book: LazyHash<FontBook>,
     fonts: Vec<FontSlot>,
     packages: PackageStorage,
+    virtual_sources: Mutex<HashMap<FileId, Source>>,
     sources: Mutex<HashMap<FileId, Source>>,
     files: Mutex<HashMap<FileId, Bytes>>,
     prev_inputs: HashMap<String, String>,
@@ -31,7 +32,7 @@ pub struct ConcealerWorld {
 
 impl ConcealerWorld {
     pub fn new() -> Self {
-        let entry_id = FileId::new_fake(VirtualPath::new("/main.typ"));
+        let entry_id = FileId::new(None, VirtualPath::new("/main.typ"));
         let fonts = Fonts::searcher().search();
         Self {
             entry_id,
@@ -45,6 +46,7 @@ impl ConcealerWorld {
                 std::env::var_os("TYPST_PACKAGE_PATH").map(PathBuf::from),
                 Downloader::new("typst-concealer-service"),
             ),
+            virtual_sources: Mutex::new(HashMap::new()),
             sources: Mutex::new(HashMap::new()),
             files: Mutex::new(HashMap::new()),
             prev_inputs: HashMap::new(),
@@ -53,7 +55,26 @@ impl ConcealerWorld {
     }
 
     pub fn update(&mut self, source_text: String, root: PathBuf, inputs: HashMap<String, String>) {
-        self.source.replace(&source_text);
+        self.update_with_virtuals(source_text, "/main.typ", root, inputs, Vec::new());
+    }
+
+    pub fn update_with_virtuals(
+        &mut self,
+        source_text: String,
+        entry_path: &str,
+        root: PathBuf,
+        inputs: HashMap<String, String>,
+        virtual_sources: Vec<(String, String)>,
+    ) {
+        self.entry_id = FileId::new(None, VirtualPath::new(entry_path));
+        self.source = Source::new(self.entry_id, source_text);
+
+        let mut next_virtuals = HashMap::new();
+        for (path, text) in virtual_sources {
+            let id = FileId::new(None, VirtualPath::new(&path));
+            next_virtuals.insert(id, Source::new(id, text));
+        }
+        *self.virtual_sources.lock().unwrap() = next_virtuals;
 
         // Phase 1: Only rebuild library when inputs change
         if inputs != self.prev_inputs {
@@ -108,6 +129,12 @@ impl ConcealerWorld {
         (file, Some(line + 1), Some(column + 1))
     }
 
+    pub fn cached_external_files_fresh(&self) -> bool {
+        let ids: Vec<_> = self.file_mtimes.lock().unwrap().keys().cloned().collect();
+        ids.into_iter()
+            .all(|id| id.package().is_some() || !self.is_stale(id))
+    }
+
     /// Check if a cached file's mtime has changed since we last read it.
     fn is_stale(&self, id: FileId) -> bool {
         let mtimes = self.file_mtimes.lock().unwrap();
@@ -135,6 +162,10 @@ impl ConcealerWorld {
     fn real_path(&self, id: FileId) -> FileResult<PathBuf> {
         if id == self.entry_id {
             return Err(FileError::NotFound(PathBuf::from("/main.typ")));
+        }
+
+        if self.virtual_sources.lock().unwrap().contains_key(&id) {
+            return Ok(id.vpath().as_rooted_path().into());
         }
 
         if let Some(spec) = id.package() {
@@ -170,6 +201,10 @@ impl World for ConcealerWorld {
             return Ok(self.source.clone());
         }
 
+        if let Some(source) = self.virtual_sources.lock().unwrap().get(&id).cloned() {
+            return Ok(source);
+        }
+
         let is_package = id.package().is_some();
 
         if let Some(source) = self.sources.lock().unwrap().get(&id).cloned() {
@@ -194,6 +229,10 @@ impl World for ConcealerWorld {
     fn file(&self, id: FileId) -> FileResult<Bytes> {
         if id == self.entry_id {
             return Ok(Bytes::new(self.source.text().as_bytes().to_vec()));
+        }
+
+        if let Some(source) = self.virtual_sources.lock().unwrap().get(&id).cloned() {
+            return Ok(Bytes::new(source.text().as_bytes().to_vec()));
         }
 
         let is_package = id.package().is_some();

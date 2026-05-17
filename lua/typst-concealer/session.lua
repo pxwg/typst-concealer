@@ -22,7 +22,7 @@ local M = {}
 --- @param bufnr integer
 --- @return string
 local function qf_title(bufnr)
-  local name = vim.api.nvim_buf_get_name(bufnr)
+  local name = vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_get_name(bufnr) or nil
   if name == nil or name == "" then
     name = ("buf:%d"):format(bufnr)
   end
@@ -47,13 +47,41 @@ local function rebuild_quickfix(bufnr)
   end)
 end
 
+local function rebuild_full_diagnostics_bucket(bufnr)
+  state.watch_diagnostics[bufnr] = state.watch_diagnostics[bufnr] or {}
+  local bucket = state.watch_diagnostics[bufnr]
+  local items = {}
+  for _, item in ipairs(bucket.full_base or {}) do
+    items[#items + 1] = item
+  end
+
+  local node_ids = {}
+  for node_id in pairs(bucket.formula_by_node or {}) do
+    node_ids[#node_ids + 1] = node_id
+  end
+  table.sort(node_ids)
+  for _, node_id in ipairs(node_ids) do
+    for _, item in ipairs(bucket.formula_by_node[node_id] or {}) do
+      items[#items + 1] = item
+    end
+  end
+
+  bucket.full = items
+end
+
 --- Clear quickfix diagnostics for one session kind and rebuild the aggregated
 --- buffer quickfix list.
 --- @param bufnr integer
 --- @param kind  'full'
 local function clear_quickfix(bufnr, kind)
   state.watch_diagnostics[bufnr] = state.watch_diagnostics[bufnr] or {}
-  state.watch_diagnostics[bufnr][kind] = {}
+  if kind == "full" then
+    state.watch_diagnostics[bufnr].full_base = {}
+    state.watch_diagnostics[bufnr].formula_by_node = {}
+    state.watch_diagnostics[bufnr].full = {}
+  else
+    state.watch_diagnostics[bufnr][kind] = {}
+  end
   rebuild_quickfix(bufnr)
 end
 
@@ -755,6 +783,7 @@ local function build_render_request_meta(request)
   local page_to_slot = {}
   local slot_to_node = {}
   local slot_to_overlay = {}
+  local node_to_job = {}
 
   for i, job in ipairs(jobs) do
     local page_index = job.request_page_index or i
@@ -765,10 +794,13 @@ local function build_render_request_meta(request)
       page_to_slot[page_index] = job.slot_id
       if job.node_id ~= nil then
         slot_to_node[job.slot_id] = job.node_id
+        node_to_job[job.node_id] = job
       end
       if job.overlay_id ~= nil then
         slot_to_overlay[job.slot_id] = job.overlay_id
       end
+    elseif job.node_id ~= nil then
+      node_to_job[job.node_id] = job
     end
   end
 
@@ -784,6 +816,7 @@ local function build_render_request_meta(request)
     page_to_slot = page_to_slot,
     slot_to_node = slot_to_node,
     slot_to_overlay = slot_to_overlay,
+    node_to_job = node_to_job,
     page_count = #jobs,
     status = "active",
   }
@@ -1360,6 +1393,20 @@ local function stable_hash(text)
   return string.format("%08x", h)
 end
 
+--- @param text string|nil
+--- @return integer
+local function count_lines(text)
+  text = text or ""
+  if text == "" then
+    return 0
+  end
+  local _, n = text:gsub("\n", "\n")
+  if text:sub(-1) ~= "\n" then
+    n = n + 1
+  end
+  return n
+end
+
 --- @param item table
 --- @return integer
 local function item_source_rows(item)
@@ -1406,6 +1453,18 @@ end
 
 local function root_relative(path, effective_root)
   return require("typst-concealer.path-rewrite").encode_root_relative(path, effective_root)
+end
+
+local function virtual_path_id(value)
+  local out = tostring(value or ""):gsub("[^%w%-_]", "-")
+  if out == "" then
+    return "node"
+  end
+  return out
+end
+
+local function formula_virtual_node_path(node_id)
+  return "/__typst_concealer__/nodes/" .. virtual_path_id(node_id) .. ".typ"
 end
 
 --- @param request RenderRequest
@@ -1521,12 +1580,99 @@ local function build_full_service_spec(request, project_scope, prelude_chunks, p
   }
 end
 
+--- @param request RenderRequest
+--- @param project_scope table
+--- @param prelude_chunks string[]
+--- @param preamble_include_line string
+--- @param config table
+--- @return table
+local function build_formula_service_spec(request, project_scope, prelude_chunks, preamble_include_line, config)
+  local wrapper = require("typst-concealer.wrapper")
+  local workspace_mod = require("typst-concealer.workspace")
+  local workspace = workspace_mod.for_buffer(request.bufnr, project_scope.source_root)
+  local context_source = wrapper.build_context_document(
+    request.bufnr,
+    project_scope.buf_dir,
+    project_scope.source_root,
+    project_scope.effective_root,
+    preamble_include_line
+  )
+  local context_line_offset = context_source ~= "" and (count_lines(context_source) + 1) or 0
+  local context_id = nil
+  local context_rev = nil
+  local nodes = {}
+  local formula_line_maps = {}
+  local formula_line_offsets = {}
+  local generated_slot_paths = {}
+  local generated_node_paths = {}
+
+  for _, job in ipairs(request.jobs or {}) do
+    if job.is_stub or job.is_tombstone or job.overlay_id == nil then
+      goto continue_job
+    end
+
+    context_id = context_id or job.context_id or project_scope.project_scope_id
+    context_rev = context_rev or job.context_rev or 1
+
+    local slot_path = workspace_mod.slot_path(workspace, job.slot_id)
+    generated_slot_paths[job.slot_id] = slot_path
+    generated_node_paths[job.node_id] = formula_virtual_node_path(job.node_id)
+    local slot_text, slot_map = wrapper.build_slot_document(
+      job,
+      project_scope.buf_dir,
+      project_scope.source_root,
+      project_scope.effective_root,
+      prelude_chunks
+    )
+    if slot_map ~= nil then
+      slot_map.filename = vim.api.nvim_buf_get_name(job.bufnr)
+      formula_line_maps[job.node_id] = slot_map
+      formula_line_offsets[job.node_id] = context_line_offset
+    end
+
+    nodes[#nodes + 1] = {
+      node_id = job.node_id,
+      node_rev = job.node_rev or 1,
+      source_hash = job.source_text_hash or stable_hash(slot_text),
+      kind = job.node_type,
+      source = slot_text,
+    }
+
+    ::continue_job::
+  end
+
+  context_id = context_id or project_scope.project_scope_id or ("ctx:" .. stable_hash(context_source))
+  context_rev = context_rev or 1
+
+  return {
+    workspace = workspace,
+    context_id = context_id,
+    context_rev = context_rev,
+    context_source = context_source,
+    nodes = nodes,
+    formula_line_maps = formula_line_maps,
+    formula_line_offsets = formula_line_offsets,
+    generated_slot_paths = generated_slot_paths,
+    generated_node_paths = generated_node_paths,
+    generated_input_path = workspace.main_path,
+    generated_context_path = workspace.context_path,
+    output_dir = workspace.outputs_dir,
+    cache_key = service_cache_key(project_scope, "formula") .. ":" .. stable_hash(context_source),
+  }
+end
+
 --- @param resp table
 local function cleanup_request_artifacts(resp)
   for _, page in ipairs(resp.pages or {}) do
     if type(page.path) == "string" and page.path ~= "" then
       safe_unlink_service_artifact(page.path)
     end
+  end
+end
+
+local function cleanup_formula_artifact(resp)
+  if type(resp.path) == "string" and resp.path ~= "" then
+    safe_unlink_service_artifact(resp.path)
   end
 end
 
@@ -1717,6 +1863,50 @@ local function supersede_full_service_request(bufnr, meta, reason)
   dispatch_request_cleanup(bufnr, meta, reason, "render_request_superseded")
 end
 
+local function active_formula_batches(bufnr)
+  state.active_formula_batches = state.active_formula_batches or {}
+  state.active_formula_batches[bufnr] = state.active_formula_batches[bufnr] or {}
+  return state.active_formula_batches[bufnr]
+end
+
+local function get_formula_batch_meta(bufnr, request_id)
+  local batches = state.active_formula_batches and state.active_formula_batches[bufnr] or nil
+  return batches and batches[request_id] or nil
+end
+
+local function remove_formula_batch_meta(bufnr, request_id, meta)
+  local batches = state.active_formula_batches and state.active_formula_batches[bufnr] or nil
+  if batches == nil then
+    return
+  end
+  if meta == nil or batches[request_id] == meta then
+    batches[request_id] = nil
+  end
+  if next(batches) == nil then
+    state.active_formula_batches[bufnr] = nil
+  end
+end
+
+local function fail_formula_batch(bufnr, meta, reason)
+  if meta == nil then
+    return
+  end
+  meta.status = "failed"
+  remove_formula_batch_meta(bufnr, meta.request_id, meta)
+  for _, job in pairs(meta.node_to_job or {}) do
+    if job.overlay_id ~= nil then
+      require("typst-concealer.formula.manager").render_failed(bufnr, {
+        request_id = meta.request_id,
+        overlay_id = job.overlay_id,
+        node_rev = job.node_rev,
+        context_id = job.context_id,
+        context_rev = job.context_rev,
+        reason = reason or "formula batch failed",
+      })
+    end
+  end
+end
+
 M._validate_service_pages = validate_service_pages
 
 --- @param bufnr integer
@@ -1797,8 +1987,398 @@ local function handle_compile_diagnostics(bufnr, meta, diagnostics)
   end
 
   state.watch_diagnostics[bufnr] = state.watch_diagnostics[bufnr] or {}
-  state.watch_diagnostics[bufnr].full = items
+  state.watch_diagnostics[bufnr].full_base = items
+  rebuild_full_diagnostics_bucket(bufnr)
   rebuild_quickfix(bufnr)
+end
+
+local function note_formula_service_response(bufnr, service_kind, request_id)
+  local service = get_compiler_service(bufnr, service_kind)
+  if service == nil or service.inflight == nil or service.inflight.request_id ~= request_id then
+    return false
+  end
+  if service.inflight.formula_remaining == nil then
+    return true
+  end
+  service.inflight.formula_remaining = math.max(0, service.inflight.formula_remaining - 1)
+  return service.inflight.formula_remaining == 0
+end
+
+--- @param bufnr integer
+--- @param meta RenderRequestMeta
+--- @param resp table
+--- @param job RenderJob
+local function handle_formula_diagnostics(bufnr, meta, resp, job)
+  local config = require("typst-concealer").config
+  if not config.do_diagnostics then
+    return
+  end
+
+  state.watch_diagnostics[bufnr] = state.watch_diagnostics[bufnr] or {}
+  local bucket = state.watch_diagnostics[bufnr]
+  bucket.formula_by_node = bucket.formula_by_node or {}
+  local node_id = resp.node_id or (job and job.node_id)
+  if node_id == nil then
+    return
+  end
+
+  local items = {}
+  bucket.formula_by_node[node_id] = nil
+  local formula_map = meta.formula_line_maps and meta.formula_line_maps[node_id] or nil
+  local line_offset = (meta.formula_line_offsets and meta.formula_line_offsets[node_id]) or 0
+  local generated_node_path = meta.generated_node_paths and meta.generated_node_paths[node_id] or nil
+
+  if type(resp.diagnostics) ~= "table" or #resp.diagnostics == 0 then
+    rebuild_full_diagnostics_bucket(bufnr)
+    rebuild_quickfix(bufnr)
+    return
+  end
+
+  for _, diag in ipairs(resp.diagnostics or {}) do
+    local line = tonumber(diag.line) or 1
+    local column = tonumber(diag.column) or 1
+    local filename = diag.file
+    local prefix = "[service/formula]"
+
+    if filename == nil or filename == "" then
+      if formula_map ~= nil and line > line_offset then
+        local mapped = map_generated_pos({ formula_map }, line - line_offset, column)
+        if mapped ~= nil and mapped.exact == true then
+          filename = mapped.filename
+          line = mapped.lnum
+          column = mapped.col
+        else
+          filename = meta.generated_slot_paths and meta.generated_slot_paths[job.slot_id]
+          prefix = "[service/generated]"
+        end
+      else
+        filename = meta.generated_context_path or meta.generated_input_path or vim.api.nvim_buf_get_name(bufnr)
+        prefix = "[service/generated]"
+      end
+    else
+      if generated_node_path ~= nil and filename == generated_node_path and formula_map ~= nil then
+        local mapped = map_generated_pos({ formula_map }, line, column)
+        if mapped ~= nil and mapped.exact == true then
+          filename = mapped.filename
+          line = mapped.lnum
+          column = mapped.col
+        else
+          filename = generated_node_path
+          prefix = "[service/generated]"
+        end
+      elseif tostring(filename):find("/__typst_concealer__/", 1, true) ~= nil then
+        prefix = "[service/generated]"
+      else
+        local resolved_filename = resolve_typst_source_path({
+          bufnr = bufnr,
+          buf_dir = meta and meta.buf_dir or nil,
+          source_root = meta and meta.source_root or nil,
+          effective_root = meta and meta.effective_root or nil,
+        }, filename)
+        filename = resolved_filename
+        prefix = "[service/external]"
+      end
+    end
+
+    items[#items + 1] = {
+      filename = filename or vim.api.nvim_buf_get_name(bufnr),
+      lnum = line,
+      col = column,
+      text = ("%s %s"):format(prefix, diag.message or "typst formula error"),
+      type = diag.severity == "warning" and "W" or "E",
+      _formula_node_id = node_id,
+    }
+  end
+
+  bucket.formula_by_node[node_id] = items
+  rebuild_full_diagnostics_bucket(bufnr)
+  rebuild_quickfix(bufnr)
+end
+
+local function reconcile_formula_diagnostics_for_request(bufnr)
+  local ok_main, main = pcall(require, "typst-concealer")
+  if not ok_main or not main.config or not main.config.do_diagnostics then
+    return
+  end
+
+  local bucket = state.watch_diagnostics[bufnr]
+  if bucket == nil or bucket.formula_by_node == nil then
+    return
+  end
+
+  local machine_state = state.machine_state
+  local buf = machine_state and machine_state.buffers and machine_state.buffers[bufnr] or nil
+  local active_nodes = {}
+  if buf ~= nil then
+    for node_id, node in pairs(buf.nodes or {}) do
+      if node ~= nil and node.status ~= "deleted_confirmed" then
+        active_nodes[node_id] = true
+      end
+    end
+  end
+
+  local changed = false
+  for node_id in pairs(bucket.formula_by_node or {}) do
+    if not active_nodes[node_id] then
+      bucket.formula_by_node[node_id] = nil
+      changed = true
+    end
+  end
+
+  if changed then
+    rebuild_full_diagnostics_bucket(bufnr)
+    rebuild_quickfix(bufnr)
+  end
+end
+
+local function validate_formula_response_fresh(bufnr, meta, resp, job)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return false, "buffer is no longer valid"
+  end
+  if meta == nil or meta.request_id ~= resp.request_id or meta.status ~= "active" then
+    return false, "request is no longer active"
+  end
+  if job == nil or job.overlay_id == nil then
+    return false, "formula job is no longer active"
+  end
+  if tostring(job.node_rev or "") ~= tostring(resp.node_rev or "") then
+    return false, "node revision changed"
+  end
+  if tostring(job.context_id or "") ~= tostring(resp.context_id or "") then
+    return false, "context id changed"
+  end
+  if tostring(job.context_rev or "") ~= tostring(resp.context_rev or "") then
+    return false, "context revision changed"
+  end
+
+  local ms = state.machine_state
+  local buf = ms and ms.buffers and ms.buffers[bufnr] or nil
+  if buf == nil then
+    return false, "machine buffer is gone"
+  end
+  if meta.formula_transport_only ~= true and buf.active_request_id ~= meta.request_id then
+    return false, "active request changed"
+  end
+  local node = buf.nodes and buf.nodes[resp.node_id] or nil
+  if node == nil or tostring(node.node_rev or "") ~= tostring(resp.node_rev or "") then
+    return false, "node revision is no longer current"
+  end
+  if node.candidate_overlay_id ~= job.overlay_id then
+    return false, "formula candidate changed"
+  end
+  if tostring(buf.context_id or "") ~= tostring(resp.context_id or "") then
+    return false, "buffer context id is no longer current"
+  end
+  if tostring(buf.context_rev or "") ~= tostring(resp.context_rev or "") then
+    return false, "buffer context revision is no longer current"
+  end
+  return true
+end
+
+local function formula_response_was_superseded_locally(reason)
+  return reason == "active request changed"
+    or reason == "node revision is no longer current"
+    or reason == "formula candidate changed"
+    or reason == "buffer context id is no longer current"
+    or reason == "buffer context revision is no longer current"
+end
+
+local function note_formula_convergence(meta, stale_reason, job)
+  if meta == nil or meta.formula_transport_only ~= true then
+    return
+  end
+  if not formula_response_was_superseded_locally(stale_reason) then
+    return
+  end
+  meta.needs_formula_convergence = true
+  if job ~= nil and job.node_id ~= nil then
+    meta.convergence_node_ids = meta.convergence_node_ids or {}
+    meta.convergence_node_ids[job.node_id] = true
+  end
+end
+
+local function formula_convergence_node_ids(meta)
+  if meta == nil or meta.convergence_node_ids == nil then
+    return nil
+  end
+  local node_ids = {}
+  for node_id in pairs(meta.convergence_node_ids) do
+    node_ids[#node_ids + 1] = node_id
+  end
+  if #node_ids == 0 then
+    return nil
+  end
+  table.sort(node_ids, function(a, b)
+    return tostring(a) < tostring(b)
+  end)
+  return node_ids
+end
+
+local function schedule_formula_convergence(bufnr, meta)
+  if meta == nil or meta.needs_formula_convergence ~= true then
+    return
+  end
+  require("typst-concealer.formula.manager").ensure_pending_nodes_rendering(bufnr, {
+    node_ids = formula_convergence_node_ids(meta),
+  })
+end
+
+local function complete_formula_request_if_done(bufnr, service_kind, meta, request_id)
+  if meta ~= nil and meta.pending_formula_count ~= nil then
+    meta.pending_formula_count = math.max(0, meta.pending_formula_count - 1)
+  end
+  local service_done = note_formula_service_response(bufnr, service_kind, request_id)
+  if meta ~= nil and (meta.pending_formula_count or 0) == 0 then
+    require("typst-concealer.machine.runtime").dispatch({
+      type = "render_request_completed",
+      bufnr = bufnr,
+      request_id = request_id,
+    })
+    if state.active_service_requests[bufnr] == meta then
+      meta.status = "completed"
+      state.active_service_requests[bufnr] = nil
+    end
+    state._last_service_bench = {
+      request_id = request_id,
+      total_formulas = meta.formula_response_count or 0,
+      dispatched = meta.formula_dispatched or 0,
+      failed = meta.formula_failed or 0,
+      cached = meta.formula_cached or 0,
+      request_sent_at = meta.sent_at,
+      response_at = vim.uv.hrtime(),
+      service_engine = "formula",
+    }
+  end
+  if service_done then
+    finish_service_response(bufnr, service_kind, request_id)
+  end
+end
+
+local function complete_formula_batch_if_done(bufnr, service_kind, meta, request_id)
+  if meta ~= nil and meta.pending_formula_count ~= nil then
+    meta.pending_formula_count = math.max(0, meta.pending_formula_count - 1)
+  end
+  local service_done = note_formula_service_response(bufnr, service_kind, request_id)
+  local should_converge = meta ~= nil
+    and meta.formula_transport_only == true
+    and (meta.pending_formula_count or 0) == 0
+    and meta.needs_formula_convergence == true
+  if meta ~= nil and (meta.pending_formula_count or 0) == 0 then
+    meta.status = "completed"
+    remove_formula_batch_meta(bufnr, request_id, meta)
+    state._last_service_bench = {
+      request_id = request_id,
+      total_formulas = meta.formula_response_count or 0,
+      dispatched = meta.formula_dispatched or 0,
+      failed = meta.formula_failed or 0,
+      cached = meta.formula_cached or 0,
+      request_sent_at = meta.sent_at,
+      response_at = vim.uv.hrtime(),
+      service_engine = "formula",
+    }
+  end
+  if service_done then
+    finish_service_response(bufnr, service_kind, request_id)
+  end
+  if should_converge then
+    schedule_formula_convergence(bufnr, meta)
+  end
+end
+
+--- @param bufnr integer
+--- @param service_kind '"full"'|'"preview"'
+--- @param resp table
+--- @return boolean true if this was a formula-render response
+local function try_handle_formula_service_response(bufnr, service_kind, resp)
+  if type(resp) ~= "table" or resp.type ~= "formula_rendered" then
+    return false
+  end
+  if service_kind ~= "full" then
+    cleanup_formula_artifact(resp)
+    if note_formula_service_response(bufnr, service_kind, resp.request_id) then
+      finish_service_response(bufnr, service_kind, resp.request_id)
+    end
+    return true
+  end
+
+  local meta = get_formula_batch_meta(bufnr, resp.request_id)
+  if meta == nil then
+    meta = state.active_service_requests and state.active_service_requests[bufnr]
+  end
+  if meta == nil or meta.request_id ~= resp.request_id then
+    cleanup_formula_artifact(resp)
+    if note_formula_service_response(bufnr, service_kind, resp.request_id) then
+      finish_service_response(bufnr, service_kind, resp.request_id)
+    end
+    return true
+  end
+
+  local complete = meta.formula_transport_only == true and complete_formula_batch_if_done
+    or complete_formula_request_if_done
+  meta.formula_response_count = (meta.formula_response_count or 0) + 1
+  local job = meta.node_to_job and meta.node_to_job[resp.node_id] or nil
+  local fresh, stale_reason = validate_formula_response_fresh(bufnr, meta, resp, job)
+  if not fresh then
+    cleanup_formula_artifact(resp)
+    meta.formula_failed = (meta.formula_failed or 0) + 1
+    note_formula_convergence(meta, stale_reason, job)
+    if job ~= nil and job.overlay_id ~= nil then
+      require("typst-concealer.formula.manager").render_failed(bufnr, {
+        request_id = resp.request_id,
+        overlay_id = job.overlay_id,
+        node_rev = job.node_rev,
+        context_id = job.context_id,
+        context_rev = job.context_rev,
+        reason = stale_reason or "stale formula response",
+      })
+    end
+    complete(bufnr, service_kind, meta, resp.request_id)
+    return true
+  end
+
+  handle_formula_diagnostics(bufnr, meta, resp, job)
+  if resp.status ~= "ok" or type(resp.path) ~= "string" or resp.path == "" then
+    cleanup_formula_artifact(resp)
+    meta.formula_failed = (meta.formula_failed or 0) + 1
+    require("typst-concealer.formula.manager").render_failed(bufnr, {
+      request_id = resp.request_id,
+      overlay_id = job.overlay_id,
+      node_rev = tonumber(resp.node_rev),
+      context_id = resp.context_id,
+      context_rev = tonumber(resp.context_rev),
+      reason = resp.status or stale_reason or "formula render failed",
+    })
+    complete(bufnr, service_kind, meta, resp.request_id)
+    return true
+  end
+
+  local width_px = tonumber(resp.width_px) or 1
+  local height_px = tonumber(resp.height_px) or 1
+  meta.formula_dispatched = (meta.formula_dispatched or 0) + 1
+  if resp.cached then
+    meta.formula_cached = (meta.formula_cached or 0) + 1
+  end
+  require("typst-concealer.formula.manager").rendered(bufnr, {
+    request_id = resp.request_id,
+    request_page_index = job.request_page_index,
+    overlay_id = job.overlay_id,
+    owner_node_id = job.node_id,
+    owner_bufnr = job.bufnr,
+    owner_project_scope_id = job.project_scope_id,
+    render_epoch = job.render_epoch,
+    node_rev = job.node_rev,
+    context_id = job.context_id,
+    context_rev = job.context_rev,
+    buffer_version = job.buffer_version,
+    layout_version = job.layout_version,
+    page_path = resp.path,
+    page_stamp = nil,
+    natural_cols = compute_natural_cols(width_px, height_px, job),
+    natural_rows = compute_natural_rows(width_px, height_px, job),
+    source_rows = job.range[3] - job.range[1] + 1,
+  })
+  complete(bufnr, service_kind, meta, resp.request_id)
+  return true
 end
 
 --- Handle a preview compile response from the service.
@@ -1894,6 +2474,10 @@ end
 --- @param service_kind '"full"'|'"preview"'
 --- @param resp table  pre-decoded JSON response from the compiler service
 on_service_response = function(bufnr, service_kind, resp)
+  if try_handle_formula_service_response(bufnr, service_kind, resp) then
+    return
+  end
+
   if type(resp) ~= "table" or resp.type ~= "compile_result" then
     return
   end
@@ -2727,12 +3311,120 @@ mark_service_payload_failed = function(bufnr, payload, reason)
       end
     end
     fail_full_service_request(bufnr, meta, reason)
+  elseif payload.kind == "formula" then
+    fail_formula_batch(bufnr, payload.meta or get_formula_batch_meta(bufnr, payload.request_id), reason)
   elseif payload.kind == "preview" and payload.is_prewarm ~= true then
     local active = state.active_preview_service_requests and state.active_preview_service_requests[bufnr]
     if active ~= nil and active.request_id == payload.request_id then
       state.active_preview_service_requests[bufnr] = nil
     end
   end
+end
+
+local function formula_job_is_current(bufnr, job, request_id)
+  if job == nil or job.node_id == nil or job.overlay_id == nil then
+    return false
+  end
+  local ms = state.machine_state
+  local buf = ms and ms.buffers and ms.buffers[bufnr] or nil
+  local node = buf and buf.nodes and buf.nodes[job.node_id] or nil
+  local overlay = ms and ms.overlays and ms.overlays[job.overlay_id] or nil
+  if node == nil or overlay == nil then
+    return false
+  end
+  if node.candidate_overlay_id ~= job.overlay_id then
+    return false
+  end
+  if overlay.status == "retiring" or overlay.status == "retired" then
+    return false
+  end
+  if request_id ~= nil and overlay.request_id ~= request_id then
+    return false
+  end
+  if job.node_rev ~= nil and tonumber(overlay.node_rev) ~= tonumber(job.node_rev) then
+    return false
+  end
+  if job.context_id ~= nil and overlay.context_id ~= job.context_id then
+    return false
+  end
+  if job.context_rev ~= nil and tonumber(overlay.context_rev) ~= tonumber(job.context_rev) then
+    return false
+  end
+  if
+    job.source_text_hash ~= nil
+    and overlay.source_text_hash ~= nil
+    and overlay.source_text_hash ~= job.source_text_hash
+  then
+    return false
+  end
+  if job.layout_version ~= nil and tonumber(overlay.layout_version) ~= tonumber(job.layout_version) then
+    return false
+  end
+  return true
+end
+
+local function formula_payload_has_current_jobs(bufnr, payload)
+  local meta = payload and payload.meta or nil
+  if meta == nil or meta.node_to_job == nil then
+    return false
+  end
+  for _, job in pairs(meta.node_to_job) do
+    if formula_job_is_current(bufnr, job, payload.request_id or meta.request_id) then
+      return true
+    end
+  end
+  return false
+end
+
+--- Return whether a formula candidate is actually owned by the compiler
+--- transport, either currently in-flight or queued to be sent.
+--- @param bufnr integer
+--- @param candidate table
+--- @return boolean
+function M.formula_candidate_is_rendering(bufnr, candidate)
+  if type(candidate) ~= "table" or candidate.request_id == nil or candidate.node_id == nil then
+    return false
+  end
+
+  local meta = get_formula_batch_meta(bufnr, candidate.request_id)
+  if meta == nil or meta.status ~= "active" or meta.node_to_job == nil then
+    return false
+  end
+
+  local job = meta.node_to_job[candidate.node_id]
+  if not formula_job_is_current(bufnr, job or candidate, candidate.request_id) then
+    return false
+  end
+
+  local service = get_compiler_service(bufnr, "full")
+  if service == nil then
+    return false
+  end
+  if service.inflight ~= nil and service.inflight.request_id == candidate.request_id then
+    return true
+  end
+  for _, payload in ipairs(service.pending_formula_requests or {}) do
+    if (payload.request_id or (payload.meta and payload.meta.request_id)) == candidate.request_id then
+      return true
+    end
+  end
+  return false
+end
+
+local function prune_pending_formula_requests(bufnr, service, reason)
+  if service == nil or service.pending_formula_requests == nil then
+    return
+  end
+
+  local kept = {}
+  for _, pending in ipairs(service.pending_formula_requests) do
+    if formula_payload_has_current_jobs(bufnr, pending) then
+      kept[#kept + 1] = pending
+    else
+      mark_service_payload_failed(bufnr, pending, reason or "formula request superseded before send")
+    end
+  end
+  service.pending_formula_requests = #kept > 0 and kept or nil
 end
 
 --- @param bufnr integer
@@ -2745,6 +3437,10 @@ mark_inflight_service_request_failed = function(bufnr, request_id, reason)
   local meta = state.active_service_requests and state.active_service_requests[bufnr]
   if meta ~= nil and meta.request_id == request_id then
     fail_full_service_request(bufnr, meta, reason)
+  end
+  local formula_meta = get_formula_batch_meta(bufnr, request_id)
+  if formula_meta ~= nil then
+    fail_formula_batch(bufnr, formula_meta, reason)
   end
   local preview = state.active_preview_service_requests and state.active_preview_service_requests[bufnr]
   if preview ~= nil and preview.request_id == request_id then
@@ -2778,6 +3474,7 @@ local function write_service_payload(service, payload)
     request_id = payload.request_id,
     is_prewarm = payload.is_prewarm == true,
     preview_context_hash = payload.preview_context_hash,
+    formula_remaining = payload.formula_count,
   }
   if payload.meta ~= nil then
     payload.meta.sent_at = sent_at
@@ -2822,6 +3519,14 @@ local function send_or_queue_service_payload(bufnr, service, payload)
       service.pending_prewarm_requests[#service.pending_prewarm_requests + 1] = payload
     elseif payload.kind == "preview" then
       service.pending_preview_request = payload
+    elseif payload.kind == "formula" then
+      prune_pending_formula_requests(bufnr, service)
+      if not formula_payload_has_current_jobs(bufnr, payload) then
+        mark_service_payload_failed(bufnr, payload, "formula request superseded before send")
+        return true
+      end
+      service.pending_formula_requests = service.pending_formula_requests or {}
+      service.pending_formula_requests[#service.pending_formula_requests + 1] = payload
     else
       if service.pending_full_request ~= nil then
         supersede_full_service_request(bufnr, service.pending_full_request.meta, "pending full request superseded")
@@ -2841,9 +3546,26 @@ send_next_service_payload = function(service)
   if service == nil then
     return
   end
-  local payload = service.pending_full_request or service.pending_preview_request
+  local payload = service.pending_full_request
   service.pending_full_request = nil
-  service.pending_preview_request = nil
+  if payload == nil and service.pending_formula_requests ~= nil then
+    prune_pending_formula_requests(service.bufnr, service)
+    while payload == nil and service.pending_formula_requests ~= nil do
+      local candidate = table.remove(service.pending_formula_requests, 1)
+      if #service.pending_formula_requests == 0 then
+        service.pending_formula_requests = nil
+      end
+      if formula_payload_has_current_jobs(service.bufnr, candidate) then
+        payload = candidate
+      else
+        mark_service_payload_failed(service.bufnr, candidate, "formula request superseded before send")
+      end
+    end
+  end
+  if payload == nil then
+    payload = service.pending_preview_request
+    service.pending_preview_request = nil
+  end
   if payload == nil and service.pending_prewarm_requests ~= nil then
     payload = table.remove(service.pending_prewarm_requests, 1)
     if #service.pending_prewarm_requests == 0 then
@@ -2970,14 +3692,24 @@ function M.stop_compiler_service(bufnr, kind)
       if service_kind == "full" and state.active_service_requests and state.active_service_requests[bufnr] then
         supersede_full_service_request(bufnr, state.active_service_requests[bufnr], "compiler service stopped")
       end
+      if service_kind == "full" and state.active_formula_batches and state.active_formula_batches[bufnr] then
+        local batches = vim.deepcopy(state.active_formula_batches[bufnr])
+        for _, meta in pairs(batches or {}) do
+          fail_formula_batch(bufnr, meta, "compiler service stopped")
+        end
+      end
       if service_kind == "preview" and state.active_preview_service_requests then
         state.active_preview_service_requests[bufnr] = nil
       end
 
       mark_service_payload_failed(bufnr, service.pending_full_request, "compiler service stopped")
+      for _, payload in ipairs(service.pending_formula_requests or {}) do
+        mark_service_payload_failed(bufnr, payload, "compiler service stopped")
+      end
       mark_service_payload_failed(bufnr, service.pending_preview_request, "compiler service stopped")
       service.inflight = nil
       service.pending_full_request = nil
+      service.pending_formula_requests = nil
       service.pending_preview_request = nil
       service.pending_prewarm_requests = nil
 
@@ -3037,6 +3769,121 @@ function M.render_items_via_watch(bufnr, items)
   refresh_session_poll_interval(session)
 end
 
+--- Send per-node formula jobs as a transport batch to the compiler service.
+--- Unlike render_request_via_service(), this does not install a buffer-global
+--- active request.  The batch is only IO bookkeeping; each job remains owned by
+--- its node/candidate overlay in the machine state.
+--- @param bufnr integer
+--- @param request RenderRequest
+function M.render_formula_batch_via_service(bufnr, request)
+  local meta = build_render_request_meta(request)
+  meta.formula_transport_only = true
+  meta.pending_formula_count = #((request and request.jobs) or {})
+  meta.formula_response_count = 0
+  meta.formula_dispatched = 0
+  meta.formula_failed = 0
+  meta.formula_cached = 0
+
+  local service = M.ensure_compiler_service(bufnr, "full")
+  if service == nil or service.stdin == nil or service.stdin:is_closing() then
+    fail_formula_batch(bufnr, meta, "compiler service unavailable")
+    return
+  end
+
+  local project_scope = require("typst-concealer.project-scope").resolve(bufnr, "full")
+  local main = require("typst-concealer")
+  local config = main.config
+  reconcile_formula_diagnostics_for_request(bufnr)
+  local prelude_chunks = snapshot_full_context_preludes(bufnr)
+  local preamble_include_line = resolve_preamble_include_line(bufnr, project_scope.effective_root, "full")
+  local spec = build_formula_service_spec(request, project_scope, prelude_chunks, preamble_include_line, config)
+  local preview_service = M.ensure_compiler_service(bufnr, "preview")
+
+  service.cache_dir = spec.output_dir
+  state.service_cache_dirs = state.service_cache_dirs or {}
+  state.service_cache_dirs[bufnr] = spec.output_dir
+  state.service_workspace_dirs = state.service_workspace_dirs or {}
+  state.service_workspace_dirs[bufnr] = spec.workspace.root
+
+  meta.slot_line_maps = spec.slot_line_maps
+  meta.formula_line_maps = spec.formula_line_maps
+  meta.formula_line_offsets = spec.formula_line_offsets
+  meta.generated_slot_paths = spec.generated_slot_paths
+  meta.generated_node_paths = spec.generated_node_paths
+  meta.project_scope_id = project_scope.project_scope_id or meta.project_scope_id
+  meta.buf_dir = project_scope.buf_dir
+  meta.source_root = project_scope.source_root
+  meta.effective_root = project_scope.effective_root
+  meta.generated_input_path = spec.generated_input_path
+  meta.generated_context_path = spec.generated_context_path
+  meta.context_id = spec.context_id
+  meta.context_rev = spec.context_rev
+  meta.service_engine = "formula"
+  meta.pending_formula_count = #(spec.nodes or {})
+
+  active_formula_batches(bufnr)[request.request_id] = meta
+
+  if #(spec.nodes or {}) == 0 then
+    remove_formula_batch_meta(bufnr, request.request_id, meta)
+    prewarm_preview_service(
+      bufnr,
+      preview_service,
+      request.jobs,
+      project_scope,
+      config,
+      prelude_chunks,
+      preamble_include_line
+    )
+    return
+  end
+
+  local inputs = extract_service_inputs(config, project_scope)
+  local formula_worker_count = math.max(1, math.floor(tonumber(config.formula_worker_count) or 1))
+  local ok, msg = pcall(vim.json.encode, {
+    type = "render_formulas",
+    request_id = request.request_id,
+    cache_key = spec.cache_key,
+    context_id = spec.context_id,
+    context_rev = spec.context_rev,
+    context_source = spec.context_source,
+    root = project_scope.effective_root,
+    inputs = inputs,
+    output_dir = spec.output_dir,
+    ppi = state._render_ppi or config.ppi,
+    worker_count = formula_worker_count,
+    nodes = spec.nodes,
+  })
+  if not ok then
+    fail_formula_batch(bufnr, meta, "failed to encode formula request")
+    vim.schedule(function()
+      vim.notify("[typst-concealer] failed to encode formula request: " .. tostring(msg), vim.log.levels.ERROR)
+    end)
+    return
+  end
+
+  local sent = send_or_queue_service_payload(bufnr, service, {
+    kind = "formula",
+    request_id = request.request_id,
+    message = msg,
+    meta = meta,
+    formula_count = #(spec.nodes or {}),
+  })
+  if not sent then
+    fail_formula_batch(bufnr, meta, "failed to send formula request")
+    return
+  end
+
+  prewarm_preview_service(
+    bufnr,
+    preview_service,
+    request.jobs,
+    project_scope,
+    config,
+    prelude_chunks,
+    preamble_include_line
+  )
+end
+
 --- Send a machine-owned full render request to the compiler service.
 --- @param bufnr integer
 --- @param request RenderRequest
@@ -3054,7 +3901,13 @@ function M.render_request_via_service(bufnr, request)
   local config = main.config
   local prelude_chunks = snapshot_full_context_preludes(bufnr)
   local preamble_include_line = resolve_preamble_include_line(bufnr, project_scope.effective_root, "full")
-  local spec = build_full_service_spec(request, project_scope, prelude_chunks, preamble_include_line, config)
+  local use_formula_service = config.use_formula_service ~= false
+  if use_formula_service then
+    reconcile_formula_diagnostics_for_request(bufnr)
+  end
+  local spec = use_formula_service
+      and build_formula_service_spec(request, project_scope, prelude_chunks, preamble_include_line, config)
+    or build_full_service_spec(request, project_scope, prelude_chunks, preamble_include_line, config)
   -- Start the preview backend with the same buffer/project lifetime so the
   -- first cursor preview does not pay process startup while full rendering is
   -- busy. It compiles only preview requests, so it cannot block full updates.
@@ -3068,14 +3921,24 @@ function M.render_request_via_service(bufnr, request)
   local current_request = build_render_request_meta(request)
   current_request.line_map = nil
   current_request.slot_line_maps = spec.slot_line_maps
+  current_request.formula_line_maps = spec.formula_line_maps
+  current_request.formula_line_offsets = spec.formula_line_offsets
   current_request.generated_slot_paths = spec.generated_slot_paths
+  current_request.generated_node_paths = spec.generated_node_paths
   current_request.project_scope_id = project_scope.project_scope_id or current_request.project_scope_id
   current_request.buf_dir = project_scope.buf_dir
   current_request.source_root = project_scope.source_root
   current_request.effective_root = project_scope.effective_root
   current_request.generated_input_path = spec.generated_input_path
   current_request.generated_context_path = spec.generated_context_path
-  current_request.service_engine = "typst"
+  current_request.service_engine = use_formula_service and "formula" or "typst"
+  if use_formula_service then
+    current_request.pending_formula_count = #(spec.nodes or {})
+    current_request.formula_response_count = 0
+    current_request.formula_dispatched = 0
+    current_request.formula_failed = 0
+    current_request.formula_cached = 0
+  end
 
   local old = state.active_service_requests and state.active_service_requests[bufnr]
   if old ~= nil then
@@ -3091,16 +3954,56 @@ function M.render_request_via_service(bufnr, request)
 
   local inputs = extract_service_inputs(config, project_scope)
 
-  local ok, msg = pcall(vim.json.encode, {
-    type = "compile",
-    request_id = request.request_id,
-    cache_key = spec.cache_key,
-    source_text = spec.source_text,
-    root = project_scope.effective_root,
-    inputs = inputs,
-    output_dir = spec.output_dir,
-    ppi = state._render_ppi or config.ppi,
-  })
+  if use_formula_service and #(spec.nodes or {}) == 0 then
+    require("typst-concealer.machine.runtime").dispatch({
+      type = "render_request_completed",
+      bufnr = bufnr,
+      request_id = request.request_id,
+    })
+    if state.active_service_requests[bufnr] == current_request then
+      current_request.status = "completed"
+      state.active_service_requests[bufnr] = nil
+    end
+    prewarm_preview_service(
+      bufnr,
+      preview_service,
+      request.jobs,
+      project_scope,
+      config,
+      prelude_chunks,
+      preamble_include_line
+    )
+    return
+  end
+
+  local formula_worker_count = math.max(1, math.floor(tonumber(config.formula_worker_count) or 1))
+  local message = use_formula_service
+      and {
+        type = "render_formulas",
+        request_id = request.request_id,
+        cache_key = spec.cache_key,
+        context_id = spec.context_id,
+        context_rev = spec.context_rev,
+        context_source = spec.context_source,
+        root = project_scope.effective_root,
+        inputs = inputs,
+        output_dir = spec.output_dir,
+        ppi = state._render_ppi or config.ppi,
+        worker_count = formula_worker_count,
+        nodes = spec.nodes,
+      }
+    or {
+      type = "compile",
+      request_id = request.request_id,
+      cache_key = spec.cache_key,
+      source_text = spec.source_text,
+      root = project_scope.effective_root,
+      inputs = inputs,
+      output_dir = spec.output_dir,
+      ppi = state._render_ppi or config.ppi,
+    }
+
+  local ok, msg = pcall(vim.json.encode, message)
   if not ok then
     fail_full_service_request(bufnr, current_request, "failed to encode compiler request")
     vim.schedule(function()
@@ -3114,7 +4017,8 @@ function M.render_request_via_service(bufnr, request)
     request_id = request.request_id,
     message = msg,
     meta = current_request,
-    prepare = make_full_sidecar_prepare(service, spec.writes),
+    formula_count = use_formula_service and #(spec.nodes or {}) or nil,
+    prepare = (not use_formula_service) and make_full_sidecar_prepare(service, spec.writes) or nil,
     on_prepare_failed = function(err)
       fail_full_service_request(bufnr, current_request, "failed to prepare sidecars: " .. tostring(err))
     end,

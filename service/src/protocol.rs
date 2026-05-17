@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 pub enum IncomingMessage {
     #[serde(rename = "compile")]
     Compile(CompileRequest),
+    #[serde(rename = "render_formulas")]
+    RenderFormulas(RenderFormulasRequest),
     #[serde(rename = "shutdown")]
     Shutdown,
 }
@@ -25,11 +27,43 @@ pub struct CompileRequest {
     pub ppi: u32,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct RenderFormulasRequest {
+    pub request_id: String,
+    #[serde(default)]
+    pub cache_key: Option<String>,
+    pub context_id: String,
+    pub context_rev: u64,
+    #[serde(default)]
+    pub context_source: String,
+    pub root: PathBuf,
+    #[serde(default)]
+    pub inputs: HashMap<String, String>,
+    pub output_dir: PathBuf,
+    pub ppi: u32,
+    #[serde(default)]
+    pub worker_count: Option<usize>,
+    pub nodes: Vec<FormulaNodeRequest>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct FormulaNodeRequest {
+    pub node_id: String,
+    pub node_rev: u64,
+    #[serde(default)]
+    pub source_hash: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    pub source: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 pub enum OutgoingMessage {
     #[serde(rename = "compile_result")]
     CompileResult(CompileResponse),
+    #[serde(rename = "formula_rendered")]
+    FormulaRendered(FormulaRenderResponse),
 }
 
 #[derive(Debug, Serialize)]
@@ -75,4 +109,27 @@ pub struct DiagnosticInfo {
     pub file: Option<PathBuf>,
     pub line: Option<usize>,
     pub column: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FormulaRenderResponse {
+    pub request_id: String,
+    pub context_id: String,
+    pub context_rev: u64,
+    pub node_id: String,
+    pub node_rev: u64,
+    pub status: CompileStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width_px: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height_px: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cached: bool,
+    pub diagnostics: Vec<DiagnosticInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compile_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub render_us: Option<u64>,
 }

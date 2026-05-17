@@ -143,10 +143,47 @@ end
 
 M.find_matching_prev_item = find_matching_prev_item
 
+local function reattach_item_image(image_id)
+  if image_id == nil then
+    return
+  end
+
+  local ok_manager, manager = pcall(require, "typst-concealer.formula.manager")
+  if ok_manager and manager.reattach_image(image_id) then
+    return
+  end
+
+  local item = state.get_item_by_image_id(image_id)
+  if
+    item == nil
+    or item.page_path == nil
+    or item.natural_cols == nil
+    or item.natural_rows == nil
+    or state.image_id_to_extmark[image_id] == nil
+  then
+    return
+  end
+
+  local target_bufnr = item.render_target == "float" and (item.target_bufnr or item.bufnr) or item.bufnr
+  if target_bufnr == nil or not vim.api.nvim_buf_is_valid(target_bufnr) then
+    return
+  end
+
+  local extmark_mod = require("typst-concealer.extmark")
+  extmark_mod.create_image(item.page_path, image_id, item.natural_cols, item.natural_rows)
+  item.terminal_upload_epoch = state.terminal_upload_epoch
+  extmark_mod.conceal_for_image_id(target_bufnr, image_id, item.natural_cols, item.natural_rows, item.source_rows or 1)
+  extmark_mod.flush_terminal_data()
+end
+
 local function cleanup_preview_image(bufnr)
   local bs = state.get_buf_state(bufnr)
   local preview = bs.preview_image
   local last_rendered = bs.preview_last_rendered_item
+  local had_preview_resources = preview ~= nil or bs.preview_item ~= nil or last_rendered ~= nil
+  local source_image_id = bs.preview_source_image_id
+    or (bs.preview_item and bs.preview_item.source_image_id)
+    or (last_rendered and last_rendered.source_image_id)
   if preview == nil then
     if bs.preview_item ~= nil then
       if bs.preview_item.extmark_id ~= nil then
@@ -168,6 +205,9 @@ local function cleanup_preview_image(bufnr)
     bs.preview_source_image_id = nil
     bs.preview_source_page_stamp = nil
     bs.preview_source_range = nil
+    if had_preview_resources then
+      reattach_item_image(source_image_id)
+    end
     return
   end
 
@@ -197,6 +237,9 @@ local function cleanup_preview_image(bufnr)
   bs.preview_source_image_id = nil
   bs.preview_source_page_stamp = nil
   bs.preview_source_range = nil
+  if had_preview_resources then
+    reattach_item_image(source_image_id)
+  end
 end
 
 M.cleanup_preview_image = cleanup_preview_image
@@ -514,6 +557,8 @@ function M.allocate_preview_item(bufnr, source_item, preview_str, source_str, re
     bufnr = bufnr,
     image_id = new_image_id(bufnr),
     extmark_id = extmark_id,
+    node_id = source_item.node_id,
+    overlay_id = source_item.overlay_id,
     range = vim.deepcopy(source_item.range),
     str = preview_str,
     source_str = source_str,
@@ -597,6 +642,9 @@ function M.accept_page_update(update)
   end
 
   extmark_mod.create_image(page_path, image_id, natural_cols, natural_rows)
+  if item ~= nil then
+    item.terminal_upload_epoch = state.terminal_upload_epoch
+  end
   extmark_mod.flush_terminal_data()
   if item ~= nil and item.render_target == "preview_float" then
     if state.hooks.present_rendered_preview_item then
