@@ -257,7 +257,7 @@ local function with_stubbed_extmark(fn)
   return result
 end
 
-local function test_extmark_flushes_kitty_graphics_to_stdout()
+local function test_extmark_flushes_kitty_graphics_through_ui_send()
   reset_modules()
   local original_new_tty = vim.loop.new_tty
   local original_ui_send = vim.api.nvim_ui_send
@@ -288,11 +288,45 @@ local function test_extmark_flushes_kitty_graphics_to_stdout()
   if not ok_run then
     error(err)
   end
-  assert_eq(#ui_writes, 0, "kitty graphics payload should not use nvim_ui_send")
-  assert_eq(#stdout_writes, 1, "kitty graphics payload should flush to stdout")
+  assert_eq(#ui_writes, 1, "kitty graphics payload should flush through nvim_ui_send")
+  assert_eq(#stdout_writes, 0, "kitty graphics payload should not write directly to stdout when nvim_ui_send works")
+  assert_truthy(ui_writes[1]:find("\27_G", 1, true) ~= nil, "kitty graphics payload should contain an escape sequence")
+end
+
+local function test_extmark_flushes_kitty_graphics_to_stdout_when_ui_send_fails()
+  reset_modules()
+  local original_new_tty = vim.loop.new_tty
+  local original_ui_send = vim.api.nvim_ui_send
+  local stdout_writes = {}
+
+  vim.loop.new_tty = function()
+    return {
+      write = function(_, data)
+        stdout_writes[#stdout_writes + 1] = data
+      end,
+    }
+  end
+  vim.api.nvim_ui_send = function()
+    error("no attached UI")
+  end
+
+  local ok_run, err = pcall(function()
+    local extmark = require("typst-concealer.extmark")
+    extmark.create_image("/tmp/kitty-placeholder.png", 42, 3, 2)
+    extmark.flush_terminal_data()
+  end)
+
+  package.loaded["typst-concealer.extmark"] = nil
+  vim.loop.new_tty = original_new_tty
+  vim.api.nvim_ui_send = original_ui_send
+
+  if not ok_run then
+    error(err)
+  end
+  assert_eq(#stdout_writes, 1, "kitty graphics payload should fall back to stdout when nvim_ui_send fails")
   assert_truthy(
     stdout_writes[1]:find("\27_G", 1, true) ~= nil,
-    "kitty graphics payload should contain an escape sequence"
+    "fallback kitty graphics payload should contain an escape sequence"
   )
 end
 
@@ -566,8 +600,10 @@ local function test_vim_resized_renders_on_column_change()
 end
 
 _G.__typst_concealer_regression_tests = function()
-  test_extmark_flushes_kitty_graphics_to_stdout()
-  ok("ok extmark flushes kitty graphics through stdout")
+  test_extmark_flushes_kitty_graphics_through_ui_send()
+  ok("ok extmark flushes kitty graphics through nvim_ui_send")
+  test_extmark_flushes_kitty_graphics_to_stdout_when_ui_send_fails()
+  ok("ok extmark falls back to stdout when nvim_ui_send fails")
   test_render_buf_suppresses_stale_parser_warning()
   ok("ok render_buf suppresses stale parser warnings")
 end

@@ -169,7 +169,6 @@ from external files keep the external path.
 ## Known issues
 - A temporary render workspace is created under `<root-base>/.typst-concealer/`, where `<root-base>` is the directory returned by `get_root` or the fallback root. The plugin removes active session files when disabled, but the directory may remain after crashes and is safe to delete.
 - Breaks sometimes, pls report if any errors happen
-- Sometimes the message sent to the kitty image protocol gets displayed on the screen as colourful garbage text. It's difficult to reproduce, and I have no idea what to do about this.
 
 ## Helpful tips
 

@@ -9,7 +9,7 @@ local kitty_codes = require("typst-concealer.kitty-codes")
 local M = {}
 
 local is_tmux = vim.env.TMUX ~= nil
-local vim_stdout = assert(vim.loop.new_tty(1, false))
+local vim_stdout
 local display_size_for_image
 
 --- Pending terminal data buffer.  All kitty escape sequences are accumulated
@@ -26,6 +26,18 @@ local function send_terminal_data(data)
   pending_terminal_buf[#pending_terminal_buf + 1] = data
 end
 
+local function write_terminal_data(data)
+  if vim.api.nvim_ui_send ~= nil then
+    local ok = pcall(vim.api.nvim_ui_send, data)
+    if ok then
+      return
+    end
+  end
+
+  vim_stdout = vim_stdout or assert(vim.loop.new_tty(1, false))
+  vim_stdout:write(data)
+end
+
 --- Flush all pending kitty escape data to the terminal in one write.
 function M.flush_terminal_data()
   if #pending_terminal_buf == 0 then
@@ -33,7 +45,7 @@ function M.flush_terminal_data()
   end
   local data = table.concat(pending_terminal_buf)
   pending_terminal_buf = {}
-  vim_stdout:write(data)
+  write_terminal_data(data)
 end
 
 local function encode_kitty_escape(message)
@@ -554,7 +566,7 @@ local function conceal_extmark_with_image(
   end
 
   local hl_group = "typst-concealer-image-id-" .. tostring(render_image_id)
-  vim.api.nvim_set_hl(0, hl_group, { fg = string.format("#%06X", render_image_id) })
+  vim.api.nvim_set_hl(0, hl_group, { fg = string.format("#%06X", render_image_id), nocombine = true })
 
   local config = require("typst-concealer").config
   local pad = 0
@@ -700,7 +712,7 @@ function M.show_virtual_image(bufnr, extmark_id, anchor_row, render_image_id, na
   local left_pad_cols = math.max(0, opts.left_pad_cols or 0)
   local pad_str = left_pad_cols > 0 and string.rep(" ", left_pad_cols) or nil
   local hl_group = "typst-concealer-image-id-" .. tostring(render_image_id)
-  vim.api.nvim_set_hl(0, hl_group, { fg = string.format("#%06X", render_image_id) })
+  vim.api.nvim_set_hl(0, hl_group, { fg = string.format("#%06X", render_image_id), nocombine = true })
 
   local lines = {}
   local too_tall_msg = "This image attempted to render taller than "
