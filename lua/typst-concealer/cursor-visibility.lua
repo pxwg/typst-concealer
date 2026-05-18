@@ -147,6 +147,13 @@ function M.should_unconceal_item_for_row(item, row, cursor_row, cursor_col, mode
     return M.cursor_engages_inline_item(trigger_range, cursor_row, cursor_col, mode)
   end
 
+  if source_kind == "code" and sr == er then
+    if row ~= cursor_row then
+      return false
+    end
+    return M.cursor_engages_inline_item(effective_range, cursor_row, cursor_col, mode)
+  end
+
   if math_like or source_kind == "code" then
     return row >= sr and row <= er
   end

@@ -6300,6 +6300,48 @@ local function test_cursor_visibility_does_not_expand_to_adjacent_formula()
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
+local function test_cursor_visibility_inline_code_only_expands_inside_range()
+  fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+    },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "A #text(red)[x] tail" })
+
+  local cursor_visibility = require("typst-concealer.cursor-visibility")
+  local item = {
+    bufnr = bufnr,
+    range = { 0, 2, 0, 15 },
+    display_range = { 0, 2, 0, 15 },
+    node_type = "code",
+    semantics = {
+      source_kind = "code",
+      display_kind = "inline",
+      constraint_kind = "intrinsic",
+    },
+  }
+
+  vim.api.nvim_win_set_cursor(0, { 1, 17 })
+  assert_eq(
+    cursor_visibility.should_preserve_source_at_cursor(bufnr, item, "n"),
+    false,
+    "inline code should not expand merely because the cursor is on the same row"
+  )
+
+  vim.api.nvim_win_set_cursor(0, { 1, 8 })
+  assert_eq(
+    cursor_visibility.should_preserve_source_at_cursor(bufnr, item, "n"),
+    true,
+    "inline code should expand when the cursor enters its source range"
+  )
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
 local function test_machine_runtime_builds_service_render_job()
   local state = fresh_state()
   local reducer = require("typst-concealer.machine.reducer")
@@ -7530,6 +7572,10 @@ local tests = {
   {
     test_cursor_visibility_does_not_expand_to_adjacent_formula,
     "ok cursor visibility does not expand across adjacent formulas",
+  },
+  {
+    test_cursor_visibility_inline_code_only_expands_inside_range,
+    "ok cursor visibility expands inline code only inside its range",
   },
   { test_machine_runtime_builds_service_render_job, "ok machine runtime builds service render job" },
   { test_machine_runtime_resets_buffer_snapshot, "ok machine runtime resets buffer snapshot" },
