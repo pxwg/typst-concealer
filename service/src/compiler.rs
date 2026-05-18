@@ -498,6 +498,7 @@ mod tests {
         .unwrap();
 
         let req = RenderFormulasRequest {
+            backend: None,
             request_id: "formula:test".to_string(),
             cache_key: None,
             context_id: "ctx".to_string(),
@@ -508,6 +509,9 @@ mod tests {
             output_dir: output_dir.clone(),
             ppi: 72,
             worker_count: None,
+            compiler: None,
+            converter: None,
+            compiler_args: Vec::new(),
             nodes: Vec::new(),
         };
         let node = FormulaNodeRequest {
@@ -548,6 +552,7 @@ mod tests {
         fs::create_dir_all(&output_dir).unwrap();
 
         let req = RenderFormulasRequest {
+            backend: None,
             request_id: "formula:test".to_string(),
             cache_key: None,
             context_id: "ctx".to_string(),
@@ -560,6 +565,9 @@ mod tests {
             output_dir: output_dir.clone(),
             ppi: 72,
             worker_count: None,
+            compiler: None,
+            converter: None,
+            compiler_args: Vec::new(),
             nodes: Vec::new(),
         };
         let node = FormulaNodeRequest {

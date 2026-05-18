@@ -1,4 +1,5 @@
 mod compiler;
+mod latex;
 mod protocol;
 mod world;
 
@@ -8,6 +9,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use compiler::Compiler;
+use latex::LatexRenderer;
 use protocol::{FormulaRenderResponse, IncomingMessage, OutgoingMessage, RenderFormulasRequest};
 
 const MAX_COMPILERS: usize = 16;
@@ -22,6 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
     let mut stdout = io::BufWriter::new(io::stdout());
     let mut compilers: HashMap<String, CachedCompiler> = HashMap::new();
+    let mut latex_renderer = LatexRenderer::new();
     let mut use_clock: u64 = 0;
 
     for line in stdin.lock().lines() {
@@ -60,7 +63,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stdout.flush()?;
             }
             IncomingMessage::RenderFormulas(req) => {
-                if formula_worker_count(&req) <= 1 {
+                if req.backend.as_deref() == Some("latex") {
+                    render_latex_formulas(&mut stdout, req, &mut latex_renderer)?;
+                } else if formula_worker_count(&req) <= 1 {
                     render_formulas_sequential(&mut stdout, req, &mut compilers, &mut use_clock)?;
                 } else {
                     render_formulas_parallel(&mut stdout, req)?;
@@ -70,6 +75,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    Ok(())
+}
+
+fn render_latex_formulas(
+    stdout: &mut impl Write,
+    req: RenderFormulasRequest,
+    renderer: &mut LatexRenderer,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for node in &req.nodes {
+        let resp = renderer.render_formula(&req, node);
+        write_formula_response(stdout, resp)?;
+    }
     Ok(())
 }
 

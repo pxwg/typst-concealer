@@ -127,9 +127,10 @@ function M.should_unconceal_item_for_row(item, row, cursor_row, cursor_col, mode
 
   local sem = item.semantics or {}
   local source_kind = sem.source_kind or item.node_type
+  local math_like = source_kind == "math" or source_kind == "latex"
   local sr, _, er, _ = effective_range[1], effective_range[2], effective_range[3], effective_range[4]
 
-  if sr == er and source_kind == "math" then
+  if sr == er and math_like then
     if row ~= cursor_row then
       return false
     end
@@ -146,7 +147,7 @@ function M.should_unconceal_item_for_row(item, row, cursor_row, cursor_col, mode
     return M.cursor_engages_inline_item(trigger_range, cursor_row, cursor_col, mode)
   end
 
-  if source_kind == "math" or source_kind == "code" then
+  if math_like or source_kind == "code" then
     return row >= sr and row <= er
   end
 

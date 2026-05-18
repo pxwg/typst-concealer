@@ -393,7 +393,7 @@ local function wrap_inline_chunks(chunks, max_cols)
   return lines
 end
 
-local function row_has_conceal_lines(bufnr, row)
+local function row_can_anchor_inline_line(bufnr, row)
   local ok, marks = pcall(
     vim.api.nvim_buf_get_extmarks,
     bufnr,
@@ -407,25 +407,27 @@ local function row_has_conceal_lines(bufnr, row)
   end
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
-    if details.conceal_lines ~= nil then
-      return true
+    if details.conceal_lines ~= nil or details.virt_lines ~= nil or details.virt_text ~= nil then
+      return false
     end
   end
-  return false
+  return true
 end
 
 local function choose_inline_line_anchor(bufnr, row)
   local line_count = vim.api.nvim_buf_line_count(bufnr)
-  for anchor = row - 1, 0, -1 do
-    if not row_has_conceal_lines(bufnr, anchor) then
-      return anchor, false
-    end
+  -- The compact carrier replaces only this source row visually; crossing a
+  -- concealed block would reorder inline text around block formula displays.
+  local previous_row = row - 1
+  if previous_row >= 0 and row_can_anchor_inline_line(bufnr, previous_row) then
+    return previous_row, false
   end
-  for anchor = row + 1, line_count - 1 do
-    if not row_has_conceal_lines(bufnr, anchor) then
-      return anchor, true
-    end
+
+  local next_row = row + 1
+  if next_row < line_count and row_can_anchor_inline_line(bufnr, next_row) then
+    return next_row, true
   end
+
   return nil, nil
 end
 

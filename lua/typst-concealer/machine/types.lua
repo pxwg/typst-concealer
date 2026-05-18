@@ -66,6 +66,7 @@ local M = {}
 --- @field project_scope_id string
 --- @field item_idx integer
 --- @field node_type NodeType
+--- @field backend_node_type string|nil
 --- @field source_range Range4
 --- @field display_range Range4
 --- @field display_prefix string|nil
@@ -240,6 +241,7 @@ local M = {}
 --- @field display_range Range4
 --- @field source_text string
 --- @field source_text_hash string|nil
+--- @field backend_node_type string|nil
 --- @field str string
 --- @field prelude_count integer
 --- @field semantics NodeSemantics

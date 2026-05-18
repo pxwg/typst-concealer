@@ -201,6 +201,8 @@ local function buffer_source_kind(bufnr)
     return "typst"
   elseif ft == "markdown" or name:match("%.md$") or name:match("%.markdown$") then
     return "markdown"
+  elseif ft == "tex" or ft == "plaintex" or ft == "latex" or name:match("%.tex$") then
+    return "latex"
   end
   return nil
 end
@@ -1105,7 +1107,7 @@ scan_formula_matches = function(bufnr, main)
   local bs = state.get_buf_state(bufnr)
   local prev_state = state.buffer_render_state[bufnr] or {}
   local source_kind = buffer_source_kind(bufnr)
-  if source_kind ~= "typst" and source_kind ~= "markdown" then
+  if source_kind ~= "typst" and source_kind ~= "markdown" and source_kind ~= "latex" then
     return nil, "unsupported"
   end
 
@@ -1128,9 +1130,23 @@ scan_formula_matches = function(bufnr, main)
       units = collect_full_units(bufnr, tree, main._typst_query)
     end
     sorted_entries = build_render_entries_from_units(bufnr, units)
-  else
+  elseif source_kind == "markdown" then
     units = require("typst-concealer.source-adapters.markdown").collect(bufnr)
     sorted_entries = units
+  else
+    local parser, parser_err = get_buffer_parser(bufnr, "latex")
+    if parser == nil then
+      schedule_parser_retry(bufnr, "latex", bs, parser_err)
+      return nil, "parser"
+    end
+    if bs.parser_retry_counts then
+      bs.parser_retry_counts.latex = nil
+    end
+    sorted_entries, units = require("typst-concealer.source-adapters.latex").collect(bufnr, {
+      parser = parser,
+      prev_units = prev_state.full_units,
+      pending_change = bs.pending_change,
+    })
   end
 
   bs.pending_change = nil
@@ -1169,6 +1185,7 @@ scan_formula_matches = function(bufnr, main)
       context_hash = context_hash(prelude_count),
       prelude_count = prelude_count,
       node_type = node_type,
+      backend_node_type = entry.backend_node_type,
       semantics = sem,
       requires_mitex = entry.requires_mitex == true,
     }

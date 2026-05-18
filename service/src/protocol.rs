@@ -29,6 +29,8 @@ pub struct CompileRequest {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct RenderFormulasRequest {
+    #[serde(default)]
+    pub backend: Option<String>,
     pub request_id: String,
     #[serde(default)]
     pub cache_key: Option<String>,
@@ -43,6 +45,12 @@ pub struct RenderFormulasRequest {
     pub ppi: u32,
     #[serde(default)]
     pub worker_count: Option<usize>,
+    #[serde(default)]
+    pub compiler: Option<String>,
+    #[serde(default)]
+    pub converter: Option<String>,
+    #[serde(default)]
+    pub compiler_args: Vec<String>,
     pub nodes: Vec<FormulaNodeRequest>,
 }
 
@@ -132,4 +140,42 @@ pub struct FormulaRenderResponse {
     pub compile_us: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub render_us: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_latex_formula_request() {
+        let req: IncomingMessage = serde_json::from_str(
+            r#"{
+              "type":"render_formulas",
+              "backend":"latex",
+              "request_id":"r1",
+              "context_id":"ctx",
+              "context_rev":1,
+              "context_source":"\\documentclass{article}\n",
+              "root":"/tmp",
+              "output_dir":"/tmp/out",
+              "ppi":144,
+              "compiler":"pdflatex",
+              "converter":"pdftocairo",
+              "compiler_args":["-shell-escape"],
+              "nodes":[{"node_id":"n1","node_rev":1,"kind":"inline_formula","source":"$x$"}]
+            }"#,
+        )
+        .unwrap();
+
+        match req {
+            IncomingMessage::RenderFormulas(req) => {
+                assert_eq!(req.backend.as_deref(), Some("latex"));
+                assert_eq!(req.compiler.as_deref(), Some("pdflatex"));
+                assert_eq!(req.converter.as_deref(), Some("pdftocairo"));
+                assert_eq!(req.compiler_args, vec!["-shell-escape"]);
+                assert_eq!(req.nodes[0].kind.as_deref(), Some("inline_formula"));
+            }
+            _ => panic!("expected render_formulas request"),
+        }
+    }
 }

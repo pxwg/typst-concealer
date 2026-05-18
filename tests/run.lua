@@ -57,8 +57,10 @@ local function reset_modules()
   package.loaded["typst-concealer.formula.manager"] = nil
   package.loaded["typst-concealer.formula.placement"] = nil
   package.loaded["typst-concealer.wrapper"] = nil
+  package.loaded["typst-concealer.latex-wrapper"] = nil
   package.loaded["typst-concealer.path-rewrite"] = nil
   package.loaded["typst-concealer.source-adapters.markdown"] = nil
+  package.loaded["typst-concealer.source-adapters.latex"] = nil
 end
 
 local function with_stubbed_uv(fn, opts)
@@ -464,6 +466,109 @@ local function test_custom_markdown_filetypes_are_supported()
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
+local function test_latex_buffers_require_enabled_backend()
+  reset_modules()
+  local concealer = require("typst-concealer")
+  concealer.config = {
+    markdown_filetypes = { "markdown" },
+    backends = {
+      latex = { enabled = false },
+    },
+  }
+
+  local disabled_bufnr = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(disabled_bufnr, "disabled.tex")
+  vim.bo[disabled_bufnr].filetype = "tex"
+  assert_eq(concealer.source_kind_for_bufnr(disabled_bufnr), nil, "latex buffers should be ignored when disabled")
+
+  concealer.config.backends.latex.enabled = true
+  assert_eq(concealer.source_kind_for_bufnr(disabled_bufnr), "latex", "tex buffers should use latex source rules")
+
+  local plaintex_bufnr = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(plaintex_bufnr, "plain")
+  vim.bo[plaintex_bufnr].filetype = "plaintex"
+  assert_eq(concealer.source_kind_for_bufnr(plaintex_bufnr), "latex", "plaintex buffers should use latex rules")
+
+  local latex_bufnr = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(latex_bufnr, "latex")
+  vim.bo[latex_bufnr].filetype = "latex"
+  assert_eq(concealer.source_kind_for_bufnr(latex_bufnr), "latex", "latex filetype buffers should use latex rules")
+
+  vim.api.nvim_buf_delete(disabled_bufnr, { force = true })
+  vim.api.nvim_buf_delete(plaintex_bufnr, { force = true })
+  vim.api.nvim_buf_delete(latex_bufnr, { force = true })
+end
+
+local function test_latex_wrapper_applies_configured_color_to_math_modes()
+  reset_modules()
+  local wrapper = require("typst-concealer.latex-wrapper")
+  local context = wrapper.build_context_document({ preamble_source = "" }, { color = "#a1b2c3" })
+
+  assert_truthy(
+    context:find("\\color[HTML]{A1B2C3}", 1, true) ~= nil,
+    "latex context should apply the configured foreground color"
+  )
+  assert_truthy(
+    context:find("\\everymath\\expandafter{\\the\\everymath\\color[HTML]{A1B2C3}}", 1, true) ~= nil,
+    "latex context should apply the configured foreground color to inline math"
+  )
+  assert_truthy(
+    context:find("\\everydisplay\\expandafter{\\the\\everydisplay\\color[HTML]{A1B2C3}}", 1, true) ~= nil,
+    "latex context should apply the configured foreground color to display math"
+  )
+end
+
+local function fake_ts_node(id, node_type, range, children)
+  children = children or {}
+  return {
+    id = function()
+      return id
+    end,
+    type = function()
+      return node_type
+    end,
+    range = function()
+      return range[1], range[2], range[3], range[4]
+    end,
+    named = function()
+      return true
+    end,
+    iter_children = function()
+      local idx = 0
+      return function()
+        idx = idx + 1
+        return children[idx]
+      end
+    end,
+  }
+end
+
+local function with_fake_latex_query(matches, fn)
+  local original_parse = vim.treesitter.query.parse
+  vim.treesitter.query.parse = function(lang)
+    assert_eq(lang, "latex", "latex adapter should parse a latex query")
+    return {
+      iter_matches = function()
+        local idx = 0
+        return function()
+          idx = idx + 1
+          local node = matches[idx]
+          if node == nil then
+            return nil
+          end
+          return idx, { [1] = { node } }, nil
+        end
+      end,
+    }
+  end
+
+  local ok_run, err = pcall(fn)
+  vim.treesitter.query.parse = original_parse
+  if not ok_run then
+    error(err)
+  end
+end
+
 local function test_markdown_adapter_collects_inline_and_block_math()
   reset_modules()
   local bufnr = vim.api.nvim_create_buf(false, true)
@@ -488,6 +593,65 @@ local function test_markdown_adapter_collects_inline_and_block_math()
   assert_eq(entries[2].source_text, "$$\n\\frac{1}{2}\n$$", "block source text should preserve markdown delimiters")
   assert_eq(entries[2].render_text, '#mitex("\\\\frac{1}{2}")', "block math should render through MiTeX mitex")
   assert_eq(entries[2].semantics.display_kind, "block", "block math should use block display semantics")
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_latex_adapter_collects_top_level_math()
+  reset_modules()
+  local env_line = "\\begin{equation} z $nested$ \\end{equation}"
+  local bufnr = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
+    "Inline $x$ text.",
+    "\\[",
+    "y^2",
+    "\\]",
+    env_line,
+  })
+
+  local inline = fake_ts_node(2, "inline_formula", { 0, 7, 0, 10 })
+  local display = fake_ts_node(3, "displayed_equation", { 1, 0, 3, 2 })
+  local nested = fake_ts_node(5, "inline_formula", { 4, 19, 4, 27 })
+  local env = fake_ts_node(4, "math_environment", { 4, 0, 4, #env_line }, { nested })
+  local root = fake_ts_node(1, "source_file", { 0, 0, 4, #env_line }, { inline, display, env })
+  local parser = {
+    parse = function()
+      return {
+        {
+          root = function()
+            return root
+          end,
+        },
+      }
+    end,
+  }
+
+  with_fake_latex_query({ inline, display, env, nested }, function()
+    local entries = require("typst-concealer.source-adapters.latex").collect(bufnr, { parser = parser })
+    assert_eq(#entries, 3, "latex adapter should collect only top-level math nodes")
+    assert_eq(entries[1].source_text, "$x$", "inline source should preserve delimiters")
+    assert_eq(entries[1].backend_node_type, "inline_formula", "inline backend node type should be preserved")
+    assert_eq(entries[1].semantics.source_kind, "latex", "latex semantics should route as latex")
+    assert_eq(entries[1].semantics.display_kind, "inline", "inline formula should use inline semantics")
+    assert_eq(entries[2].source_text, "\\[\ny^2\n\\]", "display source should preserve delimiters")
+    assert_eq(entries[2].semantics.display_kind, "block", "display formula should use block semantics")
+    assert_eq(entries[3].backend_node_type, "math_environment", "math environments should be preserved")
+
+    local stable_key = entries[1].stable_key
+    vim.api.nvim_buf_set_lines(bufnr, 0, 1, false, { "Inline $z$ text." })
+    local next_entries = require("typst-concealer.source-adapters.latex").collect(bufnr, {
+      parser = parser,
+      prev_units = select(2, require("typst-concealer.source-adapters.latex").collect(bufnr, { parser = parser })),
+      pending_change = {
+        start_row = 0,
+        old_end_row = 0,
+        new_end_row = 0,
+        line_delta = 0,
+        requires_full = false,
+      },
+    })
+    assert_eq(next_entries[1].stable_key, stable_key, "same-range latex edits should keep stable keys")
+  end)
 
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
@@ -551,6 +715,179 @@ local function test_render_buf_scans_markdown_math_nodes()
   assert_eq(scanned.scanned_nodes[1].requires_mitex, true, "inline node should request MiTeX import")
   assert_eq(scanned.scanned_nodes[2].source_text, '#mitex("z^2")', "block node should carry MiTeX render text")
   assert_eq(scanned.scanned_nodes[2].semantics.display_kind, "block", "block node should keep block semantics")
+
+  vim.wait(10)
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_render_buf_scans_latex_math_nodes()
+  reset_modules()
+  local state = require("typst-concealer.state")
+  state.machine_state = require("typst-concealer.machine.types").initial_state()
+
+  local bufnr = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(bufnr, "render-latex.tex")
+  vim.bo[bufnr].filetype = "tex"
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "Inline $x$." })
+
+  local inline = fake_ts_node(2, "inline_formula", { 0, 7, 0, 10 })
+  local root = fake_ts_node(1, "source_file", { 0, 0, 0, 11 }, { inline })
+  local parser = {
+    parse = function()
+      return {
+        {
+          root = function()
+            return root
+          end,
+        },
+      }
+    end,
+  }
+
+  local original_get_parser = vim.treesitter.get_parser
+  local dispatched = {}
+  package.loaded["typst-concealer"] = {
+    _enabled_buffers = { [bufnr] = true },
+    config = {
+      do_diagnostics = false,
+      live_preview_enabled = false,
+      use_formula_service = false,
+      header = "",
+      ppi = 300,
+      compiler_args = {},
+      backends = {
+        latex = { enabled = true, compiler_args = {} },
+      },
+    },
+    _styling_prelude = "",
+    is_render_allowed = function()
+      return true
+    end,
+    source_kind_for_bufnr = function()
+      return "latex"
+    end,
+  }
+  package.loaded["typst-concealer.machine.runtime"] = {
+    reconcile_visible_overlay_bindings = function()
+      return 0
+    end,
+    dispatch = function(event)
+      dispatched[#dispatched + 1] = event
+    end,
+    invalidate_hover = function() end,
+    get_ui_buffer = function()
+      return {
+        hover = {},
+        preview = {},
+      }
+    end,
+  }
+
+  with_fake_latex_query({ inline }, function()
+    vim.treesitter.get_parser = function(_, lang)
+      assert_eq(lang, "latex", "latex render should request the latex parser")
+      return parser
+    end
+    require("typst-concealer.plan").render_buf(bufnr)
+  end)
+  vim.treesitter.get_parser = original_get_parser
+
+  local scanned = dispatched[1]
+  assert_eq(scanned.type, "nodes_scanned", "latex render should dispatch scanned nodes")
+  assert_eq(#scanned.scanned_nodes, 1, "latex render should scan inline math")
+  assert_eq(scanned.scanned_nodes[1].source_text, "$x$", "latex node should carry raw source")
+  assert_eq(scanned.scanned_nodes[1].source_str, "$x$", "latex node should keep original source")
+  assert_eq(scanned.scanned_nodes[1].backend_node_type, "inline_formula", "latex node should keep backend type")
+  assert_eq(scanned.scanned_nodes[1].semantics.source_kind, "latex", "latex node should keep latex semantics")
+
+  vim.wait(10)
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_render_buf_routes_latex_scan_through_formula_manager()
+  reset_modules()
+  local state = require("typst-concealer.state")
+  state.machine_state = require("typst-concealer.machine.types").initial_state()
+
+  local bufnr = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(bufnr, "render-latex-manager.tex")
+  vim.bo[bufnr].filetype = "tex"
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "Inline $x$." })
+
+  local inline = fake_ts_node(2, "inline_formula", { 0, 7, 0, 10 })
+  local root = fake_ts_node(1, "source_file", { 0, 0, 0, 11 }, { inline })
+  local parser = {
+    parse = function()
+      return {
+        {
+          root = function()
+            return root
+          end,
+        },
+      }
+    end,
+  }
+
+  local original_get_parser = vim.treesitter.get_parser
+  local manager_event = nil
+  package.loaded["typst-concealer"] = {
+    _enabled_buffers = { [bufnr] = true },
+    config = {
+      do_diagnostics = false,
+      live_preview_enabled = false,
+      use_formula_service = true,
+      header = "",
+      ppi = 300,
+      compiler_args = {},
+      backends = {
+        latex = { enabled = true, compiler_args = {} },
+      },
+    },
+    _styling_prelude = "",
+    is_render_allowed = function()
+      return true
+    end,
+    source_kind_for_bufnr = function()
+      return "latex"
+    end,
+  }
+  package.loaded["typst-concealer.formula.manager"] = {
+    update_from_scan = function(event)
+      manager_event = event
+    end,
+    sync_cursor_conceal = function() end,
+  }
+  package.loaded["typst-concealer.machine.runtime"] = {
+    reconcile_visible_overlay_bindings = function()
+      return 0
+    end,
+    dispatch = function() end,
+    invalidate_hover = function() end,
+    get_ui_buffer = function()
+      return {
+        hover = {},
+        preview = {},
+      }
+    end,
+  }
+
+  with_fake_latex_query({ inline }, function()
+    vim.treesitter.get_parser = function(_, lang)
+      assert_eq(lang, "latex", "latex render should request the latex parser")
+      return parser
+    end
+    require("typst-concealer.plan").render_buf(bufnr)
+  end)
+  vim.treesitter.get_parser = original_get_parser
+
+  assert_truthy(manager_event ~= nil, "latex scans should be handed to formula manager")
+  assert_eq(manager_event.type, "nodes_scanned", "formula manager should receive nodes_scanned")
+  assert_eq(#manager_event.scanned_nodes, 1, "formula manager should receive latex node")
+  assert_eq(
+    manager_event.scanned_nodes[1].semantics.source_kind,
+    "latex",
+    "manager event should preserve latex semantics"
+  )
 
   vim.wait(10)
   vim.api.nvim_buf_delete(bufnr, { force = true })
@@ -1109,6 +1446,231 @@ local function test_session_render_request_via_service_writes_json()
     )
 
     session_mod.stop_compiler_service(bufnr)
+  end)
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_latex_service_request_writes_backend_json()
+  local root = make_temp_tree("latex-service-request")
+  local main_path = vim.fs.joinpath(root, "main.tex")
+  write_file(main_path, "\\begin{document}\n$x$\n\\end{document}\n")
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(bufnr, main_path)
+  vim.bo[bufnr].filetype = "tex"
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
+    "\\begin{document}",
+    "$x$",
+    "\\end{document}",
+  })
+  local state = fresh_state()
+  state.buffer_render_state[bufnr] = { runtime_preludes = {} }
+
+  with_stubbed_uv(function(spawned)
+    package.loaded["typst-concealer"] = {
+      config = {
+        use_formula_service = true,
+        formula_worker_count = 2,
+        service_binary = "typst-concealer-service-test",
+        ppi = 300,
+        compiler_args = {},
+        do_diagnostics = false,
+        header = "",
+        backends = {
+          latex = {
+            enabled = true,
+            compiler = "pdflatex",
+            converter = "pdftocairo",
+            compiler_args = { "-shell-escape" },
+            header = "\\usepackage{bm}",
+            get_root = function()
+              return root
+            end,
+          },
+        },
+      },
+      _styling_prelude = "",
+      source_kind_for_bufnr = function()
+        return "latex"
+      end,
+    }
+
+    local session_mod = require("typst-concealer.session")
+    local scope = require("typst-concealer.project-scope").resolve(bufnr, "full")
+    assert_eq(scope.backend_id, "latex", "latex buffers should resolve latex project scope")
+    local request = {
+      request_id = "request:latex:1",
+      bufnr = bufnr,
+      project_scope_id = "project:latex",
+      render_epoch = 1,
+      buffer_version = 1,
+      layout_version = 1,
+      jobs = {
+        {
+          request_page_index = 1,
+          overlay_id = "overlay:latex",
+          node_id = "node:latex",
+          bufnr = bufnr,
+          project_scope_id = "project:latex",
+          render_epoch = 1,
+          node_rev = 1,
+          context_id = "project:latex",
+          context_rev = 1,
+          buffer_version = 1,
+          layout_version = 1,
+          item_idx = 1,
+          range = { 1, 0, 1, 3 },
+          display_range = { 1, 0, 1, 3 },
+          source_text = "$x$",
+          source_str = "$x$",
+          str = "$x$",
+          source_text_hash = "hash:x",
+          backend_node_type = "inline_formula",
+          prelude_count = 0,
+          semantics = {
+            backend_id = "latex",
+            backend_node_type = "inline_formula",
+            display_kind = "inline",
+            constraint_kind = "intrinsic",
+            source_kind = "latex",
+          },
+          image_id = 101,
+        },
+      },
+    }
+
+    session_mod.render_request_via_service(bufnr, request)
+    assert_eq(#spawned, 1, "latex full render should not prewarm a Typst preview service")
+    local stdin = spawned[1].stdio[1]
+    assert_eq(#stdin.writes, 1, "latex service request should be written to stdin")
+    local msg = vim.json.decode(vim.trim(stdin.writes[1]))
+    assert_eq(msg.type, "render_formulas", "latex should still use formula batch transport")
+    assert_eq(msg.backend, "latex", "latex service message should carry backend id")
+    assert_eq(msg.compiler, "pdflatex", "latex service message should carry compiler")
+    assert_eq(msg.converter, "pdftocairo", "latex service message should carry converter")
+    assert_eq(msg.compiler_args[1], "-shell-escape", "latex service message should carry compiler args")
+    assert_eq(msg.root, root, "latex service message should carry effective root")
+    assert_truthy(msg.context_source:find("\\usepackage{bm}", 1, true) ~= nil, "latex context should include header")
+    assert_truthy(msg.context_source:find("$x$", 1, true) == nil, "latex context should not inline formula source")
+    assert_eq(#msg.nodes, 1, "latex request should include one formula node")
+    assert_eq(msg.nodes[1].source, "$x$", "latex node source should stay raw LaTeX")
+    assert_eq(msg.nodes[1].kind, "inline_formula", "latex node kind should preserve backend node type")
+    assert_eq(state.active_service_requests[bufnr].service_engine, "latex", "latex request meta should record engine")
+  end)
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_latex_preview_uses_preview_service_and_accepts_formula_response()
+  local root = make_temp_tree("latex-preview")
+  local main_path = vim.fs.joinpath(root, "main.tex")
+  write_file(main_path, "\\begin{document}\n$x$\n\\end{document}\n")
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(bufnr, main_path)
+  vim.bo[bufnr].filetype = "tex"
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
+    "\\begin{document}",
+    "$x$",
+    "\\end{document}",
+  })
+  local state = fresh_state()
+  state.buffer_render_state[bufnr] = { runtime_preludes = {} }
+
+  with_stubbed_uv(function(spawned)
+    package.loaded["typst-concealer"] = {
+      config = {
+        service_binary = "typst-concealer-service-test",
+        ppi = 300,
+        compiler_args = {},
+        do_diagnostics = false,
+        header = "",
+        backends = {
+          latex = {
+            enabled = true,
+            compiler = "pdflatex",
+            converter = "pdftocairo",
+            compiler_args = {},
+            get_root = function()
+              return root
+            end,
+          },
+        },
+      },
+      _styling_prelude = "",
+      source_kind_for_bufnr = function()
+        return "latex"
+      end,
+    }
+
+    package.loaded["typst-concealer.png-lua"] = function()
+      return { width = 24, height = 12 }
+    end
+
+    local accepted_update = nil
+    package.loaded["typst-concealer.machine.runtime"] = {
+      accept_preview_page_update = function(update)
+        accepted_update = update
+        return true
+      end,
+    }
+
+    local session_mod = require("typst-concealer.session")
+    local item = {
+      bufnr = bufnr,
+      node_id = "node:latex-preview",
+      node_rev = 1,
+      context_id = "project:latex-preview",
+      context_rev = 1,
+      preview_request_id = "preview:latex:1",
+      range = { 1, 0, 1, 3 },
+      source_text = "$x$",
+      source_str = "$x$",
+      str = "$x$",
+      source_text_hash = "hash:x",
+      backend_node_type = "inline_formula",
+      semantics = {
+        backend_id = "latex",
+        backend_node_type = "inline_formula",
+        display_kind = "inline",
+        constraint_kind = "intrinsic",
+        source_kind = "latex",
+      },
+    }
+
+    session_mod.render_preview_tail_via_service(bufnr, item)
+    assert_eq(#spawned, 1, "latex preview should use the preview service only")
+    local stdin = spawned[1].stdio[1]
+    local stdout = spawned[1].stdio[2]
+    assert_eq(#stdin.writes, 1, "latex preview request should be written")
+    local msg = vim.json.decode(vim.trim(stdin.writes[1]))
+    assert_eq(msg.type, "render_formulas", "latex preview should use formula transport")
+    assert_eq(msg.backend, "latex", "latex preview request should carry backend id")
+    assert_eq(msg.request_id, "preview:latex:1", "latex preview request should carry preview id")
+    assert_eq(msg.nodes[1].source, "$x$", "latex preview node should use raw source")
+
+    stdout:feed(vim.json.encode({
+      type = "formula_rendered",
+      request_id = "preview:latex:1",
+      context_id = msg.context_id,
+      context_rev = msg.context_rev,
+      node_id = msg.nodes[1].node_id,
+      node_rev = msg.nodes[1].node_rev,
+      status = "ok",
+      path = vim.fs.joinpath(root, "preview.png"),
+      width_px = 24,
+      height_px = 12,
+      diagnostics = {},
+    }) .. "\n")
+
+    vim.wait(10, function()
+      return accepted_update ~= nil
+    end)
+    assert_truthy(accepted_update ~= nil, "latex preview formula response should update preview")
+    assert_eq(accepted_update.preview_request_id, "preview:latex:1", "preview update should keep request id")
+    assert_eq(accepted_update.page_path, vim.fs.joinpath(root, "preview.png"), "preview update should use response PNG")
+    assert_eq(state.active_preview_service_requests[bufnr], nil, "latex preview response should clear active preview")
   end)
 
   vim.api.nvim_buf_delete(bufnr, { force = true })
@@ -5187,6 +5749,74 @@ local function test_extmark_compacts_inline_images_by_display_width()
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
+local function test_extmark_inline_carrier_does_not_anchor_across_block_conceal()
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+      block_padding_cols = 0,
+    },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
+    "\\[",
+    "x",
+    "\\]",
+    "Inline $y$",
+    "after",
+    "tail",
+  })
+  vim.api.nvim_win_set_cursor(0, { 6, 0 })
+
+  local extmark = require("typst-concealer.extmark")
+  local block_semantics = { display_kind = "block", constraint_kind = "intrinsic", source_kind = "math" }
+  local block_id = 1415
+  local block_range = { 0, 0, 2, 2 }
+  local block_extmark = extmark.place_render_extmark(bufnr, block_id, block_range, nil, true, block_semantics)
+  state.item_by_image_id[block_id] = {
+    bufnr = bufnr,
+    image_id = block_id,
+    extmark_id = block_extmark,
+    range = block_range,
+    display_range = block_range,
+    node_type = "math",
+    semantics = block_semantics,
+    natural_cols = 6,
+    natural_rows = 2,
+  }
+
+  extmark.conceal_for_image_id(bufnr, block_id, 6, 2, 3)
+
+  local inline_semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "math" }
+  local inline_id = 1416
+  local inline_range = { 3, 7, 3, 10 }
+  local inline_extmark = extmark.place_render_extmark(bufnr, inline_id, inline_range, nil, true, inline_semantics)
+  state.item_by_image_id[inline_id] = {
+    bufnr = bufnr,
+    image_id = inline_id,
+    extmark_id = inline_extmark,
+    range = inline_range,
+    display_range = inline_range,
+    node_type = "math",
+    semantics = inline_semantics,
+    natural_cols = 2,
+    natural_rows = 1,
+  }
+
+  extmark.conceal_for_image_id(bufnr, inline_id, 2, 1, 1)
+
+  local bs = state.get_buf_state(bufnr)
+  local inline = bs.inline_line_marks[3]
+  assert_truthy(inline ~= nil, "inline row following a concealed block should still get a compact carrier")
+  local carrier = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, inline.carrier_id, { details = true })
+  assert_eq(carrier[1], 4, "inline carrier should anchor below the inline row instead of above the block")
+  assert_eq(carrier[3].virt_lines_above, true, "inline carrier below the row should render above its anchor")
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
 local function test_extmark_compact_inline_image_chunks_wrap()
   local state = fresh_state()
   package.loaded["typst-concealer"] = {
@@ -6368,13 +6998,26 @@ end
 local tests = {
   { test_supports_typst_and_markdown_buffers, "ok typst and markdown buffers are supported" },
   { test_custom_markdown_filetypes_are_supported, "ok custom markdown filetypes are supported" },
+  { test_latex_buffers_require_enabled_backend, "ok latex buffers require enabled backend" },
+  { test_latex_wrapper_applies_configured_color_to_math_modes, "ok latex wrapper applies color to math modes" },
   { test_markdown_adapter_collects_inline_and_block_math, "ok markdown adapter collects math" },
+  { test_latex_adapter_collects_top_level_math, "ok latex adapter collects top-level math" },
   { test_render_buf_scans_markdown_math_nodes, "ok render_buf scans markdown math nodes" },
+  { test_render_buf_scans_latex_math_nodes, "ok render_buf scans latex math nodes" },
+  {
+    test_render_buf_routes_latex_scan_through_formula_manager,
+    "ok render_buf routes latex scans through formula manager",
+  },
   { test_vim_resized_renders_on_column_change, "ok VimResized renders on column change" },
   { test_root_prefers_cwd_fallback, "ok root fallback uses cwd" },
   { test_get_root_overrides_fallback, "ok get_root overrides root base" },
   { test_session_render_request_tracks_active_service_request, "ok session tracks machine render requests" },
   { test_session_render_request_via_service_writes_json, "ok session writes compiler service requests" },
+  { test_latex_service_request_writes_backend_json, "ok session writes latex backend requests" },
+  {
+    test_latex_preview_uses_preview_service_and_accepts_formula_response,
+    "ok latex preview uses preview service",
+  },
   { test_service_validates_page_contract, "ok service validates page contract" },
   { test_service_success_clears_active_meta, "ok service success clears active meta" },
   { test_formula_service_success_routes_by_node_revision, "ok formula service routes by node revision" },
@@ -6548,6 +7191,10 @@ local tests = {
   {
     test_extmark_compacts_inline_images_by_display_width,
     "ok extmark compacts inline images by display width",
+  },
+  {
+    test_extmark_inline_carrier_does_not_anchor_across_block_conceal,
+    "ok extmark inline carriers do not anchor across blocks",
   },
   {
     test_extmark_compact_inline_image_chunks_wrap,

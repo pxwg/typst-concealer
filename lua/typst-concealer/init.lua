@@ -124,6 +124,7 @@ end
 --- @field header?                string    Custom Typst code prepended to every rendered document.
 --- @field mitex_package?         string    Typst package spec used for Markdown LaTeX math. Default "@preview/mitex:0.2.7".
 --- @field markdown_filetypes?    string[]  Filetypes treated as Markdown math sources. Default { "markdown" }.
+--- @field backends?              { latex?: latexbackendconfig }
 --- @field block_padding_cols?    integer   Terminal columns reserved as outer padding for code blocks.
 --- @field block_preview_margin_pt? number  Extra Typst-side inner margin for code block previews.
 --- @field live_preview_enabled?  boolean   Enable inline live preview around the active math node. Default true.
@@ -142,6 +143,16 @@ end
 ---                                     batch document for this buffer. Use this to inject project-level context
 ---                                     (bibliography, imports, show rules) so that snippets compile under the correct
 ---                                     project scope. The file must be within `--root`. `nil` skips injection.
+---
+--- @class latexbackendconfig
+--- @field enabled?               boolean   Enable LaTeX math rendering support. Default false.
+--- @field compiler?              string    LaTeX compiler executable. Default "pdflatex".
+--- @field converter?             string    PDF-to-PNG converter executable. Default "pdftocairo".
+--- @field compiler_args?         string[]  Extra compiler arguments.
+--- @field header?                string    Custom LaTeX preamble inserted before project preamble.
+--- @field get_root?              fun(bufnr: integer, path: string, cwd: string, kind: "full"): string|nil
+--- @field get_main_file?         fun(bufnr: integer, path: string, cwd: string, kind: "full"): string|nil
+--- @field get_preamble_file?     fun(bufnr: integer, path: string, cwd: string, kind: "full"): string|nil
 
 local function default(val, default_val)
   if val == nil then
@@ -159,12 +170,23 @@ local function normalize_path(path)
   return vim.fs.normalize(path)
 end
 
+local function latex_config()
+  return M.config and M.config.backends and M.config.backends.latex or nil
+end
+
+local function latex_enabled()
+  local cfg = latex_config()
+  return cfg ~= nil and cfg.enabled == true
+end
+
 local function source_kind_from_path(path)
   path = path or ""
   if path:match("%.typ$") then
     return "typst"
   elseif path:match("%.md$") or path:match("%.markdown$") then
     return "markdown"
+  elseif latex_enabled() and path:match("%.tex$") then
+    return "latex"
   end
   return nil
 end
@@ -194,6 +216,8 @@ function M.source_kind_for_bufnr(bufnr)
   local ft = vim.bo[bufnr].filetype
   if ft == "typst" then
     return "typst"
+  elseif latex_enabled() and vim.list_contains({ "tex", "plaintex", "latex" }, ft) then
+    return "latex"
   elseif filetype_in(markdown_filetypes(), ft) then
     return "markdown"
   end
@@ -402,6 +426,9 @@ function M.setup(cfg)
     error("typst-concealer's setup function may only be run once")
   end
   M._setup_ran = true
+  cfg = cfg or {}
+
+  local latex_cfg = (cfg.backends and cfg.backends.latex) or {}
 
   M.config = {
     use_formula_service = default(cfg.use_formula_service, true),
@@ -427,6 +454,18 @@ function M.setup(cfg)
     get_root = cfg.get_root,
     get_inputs = cfg.get_inputs,
     get_preamble_file = cfg.get_preamble_file,
+    backends = {
+      latex = {
+        enabled = default(latex_cfg.enabled, false),
+        compiler = default(latex_cfg.compiler, "pdflatex"),
+        converter = default(latex_cfg.converter, "pdftocairo"),
+        compiler_args = default(latex_cfg.compiler_args, {}),
+        header = default(latex_cfg.header, ""),
+        get_root = latex_cfg.get_root,
+        get_main_file = latex_cfg.get_main_file,
+        get_preamble_file = latex_cfg.get_preamble_file,
+      },
+    },
   }
 
   if not vim.list_contains({ "none", "simple", "colorscheme" }, M.config.styling_type) then
@@ -439,6 +478,21 @@ function M.setup(cfg)
 
   if M.config.get_root ~= nil and type(M.config.get_root) ~= "function" then
     error("typst get_root must be a function when provided")
+  end
+
+  local latex_backend_cfg = M.config.backends.latex
+  if type(latex_backend_cfg.compiler_args) ~= "table" then
+    error("backends.latex.compiler_args must be a list of strings")
+  end
+  for _, arg in ipairs(latex_backend_cfg.compiler_args) do
+    if type(arg) ~= "string" then
+      error("backends.latex.compiler_args must be a list of strings")
+    end
+  end
+  for _, key in ipairs({ "get_root", "get_main_file", "get_preamble_file" }) do
+    if latex_backend_cfg[key] ~= nil and type(latex_backend_cfg[key]) ~= "function" then
+      error("backends.latex." .. key .. " must be a function when provided")
+    end
   end
 
   if type(M.config.markdown_filetypes) ~= "table" then
@@ -457,6 +511,35 @@ function M.setup(cfg)
   local typst_parser_installed = pcall(vim.treesitter.get_parser, 0, "typst")
   if typst_parser_installed == false then
     error("Typst treesitter parser not found, typst-concealer will not work")
+  end
+
+  if latex_backend_cfg.enabled == true then
+    local latex_parser_ok = false
+    if vim.treesitter.language and type(vim.treesitter.language.inspect) == "function" then
+      latex_parser_ok = pcall(vim.treesitter.language.inspect, "latex")
+    else
+      latex_parser_ok = pcall(vim.treesitter.query.parse, "latex", "(inline_formula) @math")
+    end
+    if not latex_parser_ok then
+      vim.notify(
+        "[typst-concealer] LaTeX backend enabled but 'latex' tree-sitter parser is unavailable",
+        vim.log.levels.WARN
+      )
+    end
+    if vim.fn.executable(latex_backend_cfg.compiler) ~= 1 then
+      vim.notify(
+        ("[typst-concealer] LaTeX backend enabled but compiler '%s' is unavailable"):format(latex_backend_cfg.compiler),
+        vim.log.levels.WARN
+      )
+    end
+    if vim.fn.executable(latex_backend_cfg.converter) ~= 1 then
+      vim.notify(
+        ("[typst-concealer] LaTeX backend enabled but converter '%s' is unavailable"):format(
+          latex_backend_cfg.converter
+        ),
+        vim.log.levels.WARN
+      )
+    end
   end
 
   M._typst_query = vim.treesitter.query.parse(
@@ -565,8 +648,20 @@ function M.setup(cfg)
 
   -- ── Autocmds ──────────────────────────────────────────────────────────────
 
+  local managed_patterns = { "*.typ", "*.md", "*.markdown" }
+  if latex_backend_cfg.enabled == true then
+    managed_patterns[#managed_patterns + 1] = "*.tex"
+  end
+
+  local managed_filetypes = vim.list_extend({ "typst" }, vim.deepcopy(M.config.markdown_filetypes))
+  if latex_backend_cfg.enabled == true then
+    managed_filetypes[#managed_filetypes + 1] = "tex"
+    managed_filetypes[#managed_filetypes + 1] = "plaintex"
+    managed_filetypes[#managed_filetypes + 1] = "latex"
+  end
+
   vim.api.nvim_create_autocmd("BufReadPost", {
-    pattern = { "*.typ", "*.md", "*.markdown" },
+    pattern = managed_patterns,
     group = augroup,
     desc = "render file on enter",
     callback = function(ev)
@@ -577,7 +672,7 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd({ "BufNew", "VimEnter" }, {
-    pattern = { "*.typ", "*.md", "*.markdown" },
+    pattern = managed_patterns,
     group = augroup,
     desc = "enable file on creation if the option is set",
     callback = function(ev)
@@ -586,7 +681,7 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd("BufWritePost", {
-    pattern = { "*.typ", "*.md", "*.markdown" },
+    pattern = managed_patterns,
     group = augroup,
     desc = "render file on write",
     callback = function(ev)
@@ -597,7 +692,7 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd("TextChanged", {
-    pattern = { "*.typ", "*.md", "*.markdown" },
+    pattern = managed_patterns,
     group = augroup,
     desc = "re-render on normal-mode text changes so block anchors stay correct",
     callback = function(ev)
@@ -610,7 +705,7 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd("CursorMoved", {
-    pattern = { "*.typ", "*.md", "*.markdown" },
+    pattern = managed_patterns,
     group = augroup,
     desc = "unconceal on line hover",
     callback = function(ev)
@@ -631,7 +726,7 @@ function M.setup(cfg)
 
   vim.api.nvim_create_autocmd("CursorMovedI", {
     group = augroup,
-    pattern = { "*.typ", "*.md", "*.markdown" },
+    pattern = managed_patterns,
     desc = "keep float preview synced while moving in insert mode",
     callback = function(ev)
       require("typst-concealer.machine.runtime").schedule_live_preview_sync(ev.buf, { immediate = true })
@@ -640,8 +735,8 @@ function M.setup(cfg)
 
   vim.api.nvim_create_autocmd("BufEnter", {
     group = augroup,
-    pattern = "*.typ",
-    desc = "sync float preview when entering a typst buffer",
+    pattern = managed_patterns,
+    desc = "sync float preview when entering a supported buffer",
     callback = function(ev)
       vim.schedule(function()
         maybe_resume_visible_compiler_service(ev.buf)
@@ -654,8 +749,8 @@ function M.setup(cfg)
 
   vim.api.nvim_create_autocmd("WinEnter", {
     group = augroup,
-    pattern = "*.typ",
-    desc = "resume compiler service when a typst buffer becomes visible",
+    pattern = managed_patterns,
+    desc = "resume compiler service when a supported buffer becomes visible",
     callback = function(ev)
       vim.schedule(function()
         maybe_resume_visible_compiler_service(ev.buf)
@@ -664,7 +759,7 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd("TextChangedI", {
-    pattern = "*.typ",
+    pattern = managed_patterns,
     group = augroup,
     desc = "render live preview float when insert-mode text changes",
     callback = function(ev)
@@ -687,7 +782,7 @@ function M.setup(cfg)
   end
 
   vim.api.nvim_create_autocmd("FileType", {
-    pattern = vim.list_extend({ "typst" }, vim.deepcopy(M.config.markdown_filetypes)),
+    pattern = managed_filetypes,
     callback = function(ev)
       init_buf(ev.buf)
       if M._enabled_buffers[ev.buf] == true and M.is_render_allowed(ev.buf) then
@@ -703,7 +798,7 @@ function M.setup(cfg)
   })
 
   vim.api.nvim_create_autocmd({ "BufLeave", "BufWinLeave", "BufHidden", "BufDelete" }, {
-    pattern = "*.typ",
+    pattern = managed_patterns,
     group = augroup,
     desc = "clear live preview when leaving a typst buffer",
     callback = function(ev)
@@ -728,7 +823,7 @@ function M.setup(cfg)
 
   vim.api.nvim_create_autocmd({ "BufWipeout", "BufUnload" }, {
     group = augroup,
-    pattern = "*.typ",
+    pattern = managed_patterns,
     desc = "stop compiler service for dead buffers",
     callback = function(ev)
       local session = require("typst-concealer.session")

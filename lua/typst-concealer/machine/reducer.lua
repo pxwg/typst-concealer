@@ -111,6 +111,10 @@ local function semantics_key(semantics)
   return table.concat({
     tostring(semantics.constraint_kind or ""),
     tostring(semantics.display_kind or ""),
+    tostring(semantics.source_kind or ""),
+    tostring(semantics.backend_id or ""),
+    tostring(semantics.backend_node_type or ""),
+    tostring(semantics.markdown_math == true),
     tostring(semantics.render_whole_line == true),
   }, "\0")
 end
@@ -188,6 +192,7 @@ local function allocate_slot(buf, node)
     source_text = node.source_text,
     source_str = node.source_str,
     source_text_hash = node.source_text_hash,
+    backend_node_type = node.backend_node_type,
     requires_mitex = node.requires_mitex,
     source_range = copy_range(node.source_range),
     source_rows = source_rows_from_range(node.source_range),
@@ -235,6 +240,7 @@ local function sync_slot_from_node(buf, node, force_dirty)
   slot.source_text = node.source_text
   slot.source_str = node.source_str
   slot.source_text_hash = node.source_text_hash
+  slot.backend_node_type = node.backend_node_type
   slot.requires_mitex = node.requires_mitex
   slot.source_range = copy_range(node.source_range)
   slot.source_rows = source_rows_from_range(node.source_range)
@@ -280,6 +286,7 @@ local function tombstone_slot(buf, slot_id, request_dirty)
   slot.context_hash = nil
   slot.prelude_count = 0
   slot.node_type = nil
+  slot.backend_node_type = nil
   slot.semantics = nil
   slot.display_range = nil
   slot.visible_overlay_id = nil
@@ -579,6 +586,7 @@ local function patch_node(prev, scanned, buffer_version, layout_version)
   node.source_text = scanned.source_text
   node.source_str = scanned.source_str
   node.source_text_hash = scanned.source_text_hash
+  node.backend_node_type = scanned.backend_node_type
   node.requires_mitex = scanned.requires_mitex
   node.context_hash = scanned.context_hash
   node.prelude_count = scanned.prelude_count or 0
@@ -597,6 +605,7 @@ local function new_node(state, bufnr, project_scope_id, scanned, buffer_version,
     project_scope_id = project_scope_id,
     item_idx = scanned.item_idx,
     node_type = scanned.node_type,
+    backend_node_type = scanned.backend_node_type,
     source_range = copy_range(scanned.source_range),
     display_range = copy_range(scanned.display_range),
     display_prefix = scanned.display_prefix,
@@ -634,6 +643,7 @@ local function new_overlay(state, buf, node, request_id, page_index, slot_id)
     context_id = buf.context_id,
     context_rev = buf.context_rev,
     source_text_hash = node.source_text_hash,
+    backend_node_type = node.backend_node_type,
     buffer_version = buf.buffer_version,
     layout_version = buf.layout_version,
     extmark_id = nil,
@@ -675,6 +685,7 @@ local function render_job_from_node(node, overlay)
     display_suffix = node.display_suffix,
     source_text = node.source_text,
     source_text_hash = node.source_text_hash,
+    backend_node_type = node.backend_node_type,
     source_str = node.source_str,
     str = node.source_text,
     requires_mitex = node.requires_mitex,
@@ -753,6 +764,7 @@ local function render_stub_from_node(node, slot)
     display_suffix = node.display_suffix,
     source_text = node.source_text,
     source_text_hash = node.source_text_hash,
+    backend_node_type = node.backend_node_type,
     source_str = node.source_str,
     str = node.source_text,
     requires_mitex = node.requires_mitex,
@@ -780,6 +792,7 @@ local function render_tombstone_stub(slot)
     source_str = slot.source_str,
     str = slot.source_text or "[]",
     requires_mitex = slot.requires_mitex,
+    backend_node_type = slot.backend_node_type,
     prelude_count = 0,
     semantics = nil,
     is_stub = true,

@@ -332,6 +332,7 @@ function M:build_render_job(overlay_id)
     display_suffix = node.display_suffix,
     source_text = node.source_text,
     source_text_hash = node.source_text_hash,
+    backend_node_type = node.backend_node_type,
     source_str = node.source_str,
     str = node.source_text,
     requires_mitex = node.requires_mitex,
