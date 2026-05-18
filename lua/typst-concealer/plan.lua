@@ -916,6 +916,8 @@ function M.hide_extmarks_at_cursor(bufnr)
     return
   end
 
+  require("typst-concealer.extmark").sync_inline_line_carriers(bufnr, lo, hi)
+
   -- Collect items to hide from line index (no nvim_buf_get_extmarks call)
   local brs = state.buffer_render_state[bufnr]
   local line_to_items = (brs and brs.line_to_items) or {}

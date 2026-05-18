@@ -550,6 +550,8 @@ function Manager:sync_cursor_conceal()
     return true
   end
 
+  require("typst-concealer.extmark").sync_inline_line_carriers(self.bufnr, lo, hi)
+
   local should_hide = {}
   for row = lo, hi do
     for _, placement in pairs(self:placements_for_row(row)) do

@@ -244,6 +244,7 @@ local function with_stubbed_extmark(fn)
       }
       return id
     end,
+    sync_inline_line_carriers = function() end,
     flush_terminal_data = function()
       calls.flushed = calls.flushed + 1
     end,
@@ -5109,6 +5110,191 @@ local function test_extmark_scales_wide_block_images_to_window_width()
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
+local function virt_line_text(line)
+  local parts = {}
+  for _, chunk in ipairs(line or {}) do
+    parts[#parts + 1] = chunk[1] or ""
+  end
+  return table.concat(parts)
+end
+
+local function test_extmark_compacts_inline_images_by_display_width()
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+      block_padding_cols = 0,
+    },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  local line = "A " .. string.rep("x", 60) .. " B " .. string.rep("y", 60) .. " C end"
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { line, "after" })
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+
+  local extmark = require("typst-concealer.extmark")
+  local semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "code" }
+  local first_range = { 0, 2, 0, 62 }
+  local second_range = { 0, 65, 0, 125 }
+  local first_id = 1400
+  local second_id = 1401
+  local first_extmark = extmark.place_render_extmark(bufnr, first_id, first_range, nil, true, semantics)
+  local second_extmark = extmark.place_render_extmark(bufnr, second_id, second_range, nil, true, semantics)
+
+  state.item_by_image_id[first_id] = {
+    bufnr = bufnr,
+    image_id = first_id,
+    extmark_id = first_extmark,
+    range = first_range,
+    display_range = first_range,
+    node_type = "code",
+    semantics = semantics,
+    natural_cols = 2,
+    natural_rows = 1,
+  }
+  state.item_by_image_id[second_id] = {
+    bufnr = bufnr,
+    image_id = second_id,
+    extmark_id = second_extmark,
+    range = second_range,
+    display_range = second_range,
+    node_type = "code",
+    semantics = semantics,
+    natural_cols = 2,
+    natural_rows = 1,
+  }
+
+  extmark.conceal_for_image_id(bufnr, first_id, 2, 1, 1)
+  extmark.conceal_for_image_id(bufnr, second_id, 2, 1, 1)
+
+  local bs = state.get_buf_state(bufnr)
+  local inline = bs.inline_line_marks[0]
+  assert_truthy(inline ~= nil, "inline line should get a compact carrier")
+  local carrier = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, inline.carrier_id, { details = true })
+  assert_truthy(carrier[1] ~= 0, "compact inline carrier should not be attached to the concealed source row")
+  local virt_lines = carrier[3].virt_lines or {}
+  assert_eq(#virt_lines, 1, "compact inline carrier should wrap by rendered width, not source width")
+  local rendered = virt_line_text(virt_lines[1])
+  assert_startswith(rendered, "A ", "compact inline carrier should keep source text before the first image")
+  assert_truthy(rendered:find(" B ", 1, true) ~= nil, "compact inline carrier should keep text between images")
+  assert_truthy(rendered:find(" C end", 1, true) ~= nil, "compact inline carrier should keep text after images")
+  assert_eq(vim.fn.strdisplaywidth(rendered), 15, "compact inline carrier width should use image display cells")
+
+  local conceal = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, inline.conceal_id, { details = true })
+  assert_eq(conceal[3].conceal_lines, "", "compact inline carrier should hide the original source line")
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_extmark_compact_inline_image_chunks_wrap()
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+      block_padding_cols = 0,
+    },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  local line = "A " .. string.rep("x", 60) .. " B"
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { line, "after" })
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+
+  local info = vim.fn.getwininfo(0)[1]
+  local text_cols = vim.api.nvim_win_get_width(0) - ((info and info.textoff) or 0)
+  local natural_cols = text_cols + 7
+
+  local extmark = require("typst-concealer.extmark")
+  local semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "code" }
+  local range = { 0, 2, 0, 62 }
+  local image_id = 1405
+  local extmark_id = extmark.place_render_extmark(bufnr, image_id, range, nil, true, semantics)
+  state.item_by_image_id[image_id] = {
+    bufnr = bufnr,
+    image_id = image_id,
+    extmark_id = extmark_id,
+    range = range,
+    display_range = range,
+    node_type = "code",
+    semantics = semantics,
+    natural_cols = natural_cols,
+    natural_rows = 1,
+  }
+
+  extmark.conceal_for_image_id(bufnr, image_id, natural_cols, 1, 1)
+
+  local bs = state.get_buf_state(bufnr)
+  local inline = bs.inline_line_marks[0]
+  assert_truthy(inline ~= nil, "wide inline image should get a compact carrier")
+  local carrier = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, inline.carrier_id, { details = true })
+  local virt_lines = carrier[3].virt_lines or {}
+  assert_truthy(#virt_lines >= 2, "wide inline image should wrap across compact virtual lines")
+
+  local hl_group = "typst-concealer-image-id-" .. tostring(image_id)
+  local image_cols = 0
+  for _, virt_line in ipairs(virt_lines) do
+    assert_truthy(
+      vim.fn.strdisplaywidth(virt_line_text(virt_line)) <= text_cols,
+      "compact wrapped line should fit within the text viewport"
+    )
+    for _, chunk in ipairs(virt_line) do
+      if chunk[2] == hl_group then
+        image_cols = image_cols + vim.fn.strdisplaywidth(chunk[1] or "")
+      end
+    end
+  end
+  assert_eq(image_cols, natural_cols, "wide inline image placeholders should not be truncated")
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_extmark_inline_compact_carrier_follows_cursor_row()
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+      block_padding_cols = 0,
+    },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  local line = "A " .. string.rep("x", 60) .. " B"
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { line, "after" })
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+
+  local extmark = require("typst-concealer.extmark")
+  local semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "code" }
+  local range = { 0, 2, 0, 62 }
+  local image_id = 1410
+  local extmark_id = extmark.place_render_extmark(bufnr, image_id, range, nil, true, semantics)
+  state.item_by_image_id[image_id] = {
+    bufnr = bufnr,
+    image_id = image_id,
+    extmark_id = extmark_id,
+    range = range,
+    display_range = range,
+    node_type = "code",
+    semantics = semantics,
+    natural_cols = 2,
+    natural_rows = 1,
+  }
+
+  extmark.conceal_for_image_id(bufnr, image_id, 2, 1, 1)
+  local bs = state.get_buf_state(bufnr)
+  assert_truthy(bs.inline_line_marks[0] ~= nil, "compact carrier should exist before cursor enters the row")
+
+  extmark.sync_inline_line_carriers(bufnr, 0)
+  assert_eq(bs.inline_line_marks[0], nil, "compact carrier should clear while the cursor is on its row")
+
+  extmark.sync_inline_line_carriers(bufnr, 1)
+  assert_truthy(bs.inline_line_marks[0] ~= nil, "compact carrier should restore after cursor leaves its row")
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
 local function test_cursor_visibility_preserves_insert_math_after_stale_range()
   fresh_state()
   package.loaded["typst-concealer"] = {
@@ -6311,6 +6497,18 @@ local tests = {
   {
     test_extmark_scales_wide_block_images_to_window_width,
     "ok extmark scales wide block images to window width",
+  },
+  {
+    test_extmark_compacts_inline_images_by_display_width,
+    "ok extmark compacts inline images by display width",
+  },
+  {
+    test_extmark_compact_inline_image_chunks_wrap,
+    "ok extmark compact inline image chunks wrap",
+  },
+  {
+    test_extmark_inline_compact_carrier_follows_cursor_row,
+    "ok extmark inline compact carrier follows cursor row",
   },
   {
     test_cursor_visibility_preserves_insert_math_after_stale_range,

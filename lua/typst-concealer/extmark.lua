@@ -146,6 +146,307 @@ local function center_padding(natural_cols, bufnr)
   return math.floor((win_width - natural_cols) / 2)
 end
 
+local refresh_inline_line
+
+local function get_win_text_cols(bufnr)
+  local winid = vim.fn.bufwinid(bufnr)
+  local width = get_win_cols(bufnr)
+  if winid == -1 then
+    return width
+  end
+
+  local info = vim.fn.getwininfo(winid)[1]
+  local textoff = info and tonumber(info.textoff) or 0
+  return math.max(1, width - textoff)
+end
+
+local function cursor_row_for_buf(bufnr)
+  local winid = vim.fn.bufwinid(bufnr)
+  if winid == -1 then
+    return nil
+  end
+  local ok, cursor = pcall(vim.api.nvim_win_get_cursor, winid)
+  if not ok or cursor == nil then
+    return nil
+  end
+  return cursor[1] - 1
+end
+
+local function clear_inline_line_mark(bufnr, row)
+  local bs = state.get_buf_state(bufnr)
+  local marks = bs.inline_line_marks or {}
+  local mark = marks[row]
+  if mark == nil then
+    return false
+  end
+
+  if mark.carrier_id ~= nil then
+    pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id2, mark.carrier_id)
+  end
+  if mark.conceal_id ~= nil then
+    pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id2, mark.conceal_id)
+  end
+  marks[row] = nil
+  bs.inline_line_marks = marks
+  return true
+end
+
+local function image_placeholder_text(row, cols, start_col)
+  start_col = start_col or 0
+  local line = ""
+  for col = start_col, start_col + cols - 1 do
+    line = line .. kitty_codes.placeholder .. kitty_codes.diacritics[row] .. kitty_codes.diacritics[col + 1]
+  end
+  return line
+end
+
+local function image_hl_group(image_id)
+  local hl_group = "typst-concealer-image-id-" .. tostring(image_id)
+  vim.api.nvim_set_hl(0, hl_group, { fg = string.format("#%06X", image_id), nocombine = true })
+  return hl_group
+end
+
+local function inline_line_item_ready(item, bufnr, row)
+  if item == nil or item.render_target == "float" or item.render_target == "preview_float" then
+    return false
+  end
+  if item_display_bufnr(item) ~= bufnr then
+    return false
+  end
+  if item.range == nil or item.range[1] ~= row or item.range[3] ~= row then
+    return false
+  end
+  if item.semantics == nil or item.semantics.display_kind ~= "inline" then
+    return false
+  end
+  return item.image_id ~= nil and item.natural_cols ~= nil and item.natural_rows ~= nil
+end
+
+local function collect_inline_line_items(bufnr, row)
+  local items = {}
+  for _, item in pairs(state.item_by_image_id) do
+    if inline_line_item_ready(item, bufnr, row) then
+      items[#items + 1] = item
+    end
+  end
+  table.sort(items, function(a, b)
+    if a.range[2] == b.range[2] then
+      return a.range[4] < b.range[4]
+    end
+    return a.range[2] < b.range[2]
+  end)
+
+  local last_end = 0
+  for _, item in ipairs(items) do
+    if item.range[2] < last_end then
+      return {}
+    end
+    last_end = item.range[4]
+  end
+  return items
+end
+
+local function append_wrapped_text(lines, line_idx, col, text, hl_group, max_cols)
+  local char_count = vim.fn.strchars(text)
+  for idx = 0, char_count - 1 do
+    local ch = vim.fn.strcharpart(text, idx, 1)
+    local width = vim.fn.strdisplaywidth(ch)
+    if width > 0 and col > 0 and col + width > max_cols then
+      line_idx = line_idx + 1
+      lines[line_idx] = {}
+      col = 0
+    end
+    lines[line_idx][#lines[line_idx] + 1] = { ch, hl_group or "" }
+    col = col + width
+  end
+  return line_idx, col
+end
+
+local function append_wrapped_image(lines, line_idx, col, chunk, max_cols)
+  local offset = 0
+  local remaining = chunk.width or 0
+  local hl_group = chunk.hl_group or chunk[2] or chunk[1] or ""
+
+  while remaining > 0 do
+    if col >= max_cols then
+      line_idx = line_idx + 1
+      lines[line_idx] = {}
+      col = 0
+    end
+
+    local available = max_cols - col
+    if available <= 0 then
+      available = max_cols
+    end
+    local take = math.min(remaining, available)
+    lines[line_idx][#lines[line_idx] + 1] = {
+      image_placeholder_text(chunk.image_row or 1, take, offset),
+      hl_group,
+    }
+    offset = offset + take
+    remaining = remaining - take
+    col = col + take
+  end
+
+  return line_idx, col
+end
+
+local function append_wrapped_chunk(lines, line_idx, col, chunk, max_cols)
+  local text = chunk[1] or ""
+  if chunk.image then
+    return append_wrapped_image(lines, line_idx, col, chunk, max_cols)
+  end
+  if text == "" then
+    return line_idx, col
+  end
+
+  local hl_group = chunk[2] or ""
+  local width = chunk.width or vim.fn.strdisplaywidth(text)
+  if chunk.atomic then
+    if col > 0 and col + width > max_cols then
+      line_idx = line_idx + 1
+      lines[line_idx] = {}
+      col = 0
+    end
+    lines[line_idx][#lines[line_idx] + 1] = { text, hl_group }
+    return line_idx, col + width
+  end
+
+  return append_wrapped_text(lines, line_idx, col, text, hl_group, max_cols)
+end
+
+local function wrap_inline_chunks(chunks, max_cols)
+  local lines = { {} }
+  local line_idx = 1
+  local col = 0
+  for _, chunk in ipairs(chunks) do
+    line_idx, col = append_wrapped_chunk(lines, line_idx, col, chunk, max_cols)
+  end
+  if #lines[#lines] == 0 then
+    lines[#lines][1] = { "", "" }
+  end
+  return lines
+end
+
+local function row_has_conceal_lines(bufnr, row)
+  local ok, marks = pcall(
+    vim.api.nvim_buf_get_extmarks,
+    bufnr,
+    state.ns_id2,
+    { row, 0 },
+    { row, -1 },
+    { details = true }
+  )
+  if not ok then
+    return false
+  end
+  for _, mark in ipairs(marks) do
+    local details = mark[4] or {}
+    if details.conceal_lines ~= nil then
+      return true
+    end
+  end
+  return false
+end
+
+local function choose_inline_line_anchor(bufnr, row)
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+  for anchor = row - 1, 0, -1 do
+    if not row_has_conceal_lines(bufnr, anchor) then
+      return anchor, false
+    end
+  end
+  for anchor = row + 1, line_count - 1 do
+    if not row_has_conceal_lines(bufnr, anchor) then
+      return anchor, true
+    end
+  end
+  return nil, nil
+end
+
+local function build_inline_line_chunks(bufnr, row, items)
+  local line = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1]
+  if line == nil then
+    return nil
+  end
+
+  local chunks = {}
+  local last_col = 0
+  for _, item in ipairs(items) do
+    local start_col = item.range[2]
+    local end_col = item.range[4]
+    if start_col > last_col then
+      chunks[#chunks + 1] = { line:sub(last_col + 1, start_col), "" }
+    end
+
+    local display_cols, display_rows = display_size_for_image(item, item.natural_cols, item.natural_rows)
+    if display_rows ~= 1 then
+      return nil
+    end
+    item.display_cols = display_cols
+    item.display_rows = display_rows
+    chunks[#chunks + 1] = {
+      image = true,
+      image_row = 1,
+      hl_group = image_hl_group(item.image_id),
+      width = display_cols,
+    }
+    last_col = end_col
+  end
+
+  if last_col < #line then
+    chunks[#chunks + 1] = { line:sub(last_col + 1), "" }
+  end
+  return chunks
+end
+
+refresh_inline_line = function(bufnr, row, opts)
+  opts = opts or {}
+  if row == nil or not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+
+  clear_inline_line_mark(bufnr, row)
+  if opts.ignore_cursor ~= true and cursor_row_for_buf(bufnr) == row then
+    return false
+  end
+
+  local items = collect_inline_line_items(bufnr, row)
+  if #items == 0 then
+    return false
+  end
+
+  local chunks = build_inline_line_chunks(bufnr, row, items)
+  if chunks == nil then
+    return false
+  end
+
+  local anchor_row, virt_lines_above = choose_inline_line_anchor(bufnr, row)
+  if anchor_row == nil then
+    return false
+  end
+
+  local lines = wrap_inline_chunks(chunks, get_win_text_cols(bufnr))
+  local carrier_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, anchor_row, 0, {
+    virt_lines = lines,
+    virt_lines_above = virt_lines_above,
+    virt_lines_overflow = "trunc",
+  })
+  local conceal_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, row, 0, {
+    conceal_lines = "",
+    end_row = row,
+  })
+
+  local bs = state.get_buf_state(bufnr)
+  bs.inline_line_marks = bs.inline_line_marks or {}
+  bs.inline_line_marks[row] = {
+    anchor_row = anchor_row,
+    carrier_id = carrier_id,
+    conceal_id = conceal_id,
+  }
+  return true
+end
+
 local place_image_extmark
 
 --- Clamp a range to the current buffer contents so extmark updates survive edits.
@@ -359,6 +660,11 @@ end
 --- @return boolean|nil
 function M.unconceal_extmark(bufnr, extmark_id)
   local bs = state.get_buf_state(bufnr)
+  local ok_mark, current_mark = pcall(vim.api.nvim_buf_get_extmark_by_id, bufnr, state.ns_id, extmark_id, {})
+  if ok_mark and current_mark ~= nil and #current_mark > 0 then
+    clear_inline_line_mark(bufnr, current_mark[1])
+  end
+
   local mm = bs.multiline_marks[extmark_id]
   if mm ~= nil then
     if mm.is_block_carrier then
@@ -398,6 +704,35 @@ function M.unconceal_extmark(bufnr, extmark_id)
     invalidate = opts.invalidate,
   })
   return true
+end
+
+--- Hide compact inline line carriers for the cursor span and restore the
+--- previous span when the cursor leaves it.
+--- @param bufnr integer
+--- @param lo integer
+--- @param hi integer|nil
+function M.sync_inline_line_carriers(bufnr, lo, hi)
+  if type(lo) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  hi = type(hi) == "number" and hi or lo
+  local bs = state.get_buf_state(bufnr)
+  local previous = bs.inline_line_suppressed_rows or {}
+  local next_rows = {}
+
+  for row = lo, hi do
+    next_rows[row] = true
+    clear_inline_line_mark(bufnr, row)
+  end
+
+  for row in pairs(previous) do
+    if not next_rows[row] then
+      refresh_inline_line(bufnr, row, { ignore_cursor = true })
+    end
+  end
+
+  bs.inline_line_suppressed_rows = next_rows
 end
 
 --- Update the virt_text/virt_lines on an existing extmark.
@@ -651,6 +986,16 @@ local function conceal_extmark_with_image(
       end
     end
     M.update_extmark_text(bufnr, extmark_id, lines)
+  end
+
+  if
+    item ~= nil
+    and item.semantics ~= nil
+    and item.semantics.display_kind == "inline"
+    and item.range ~= nil
+    and item.range[1] == item.range[3]
+  then
+    refresh_inline_line(bufnr, item.range[1])
   end
 end
 
