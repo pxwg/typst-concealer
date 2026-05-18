@@ -5295,6 +5295,53 @@ local function test_extmark_inline_compact_carrier_follows_cursor_row()
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
+local function test_extmark_clears_shifted_inline_compact_carriers()
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+      block_padding_cols = 0,
+    },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  local line = "A " .. string.rep("x", 60) .. " B"
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "before", line, "after" })
+  vim.api.nvim_win_set_cursor(0, { 3, 0 })
+
+  local extmark = require("typst-concealer.extmark")
+  local semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "code" }
+  local range = { 1, 2, 1, 62 }
+  local image_id = 1415
+  local extmark_id = extmark.place_render_extmark(bufnr, image_id, range, nil, true, semantics)
+  state.item_by_image_id[image_id] = {
+    bufnr = bufnr,
+    image_id = image_id,
+    extmark_id = extmark_id,
+    range = range,
+    display_range = range,
+    node_type = "code",
+    semantics = semantics,
+    natural_cols = 2,
+    natural_rows = 1,
+  }
+
+  extmark.conceal_for_image_id(bufnr, image_id, 2, 1, 1)
+  local bs = state.get_buf_state(bufnr)
+  assert_truthy(bs.inline_line_marks[1] ~= nil, "compact carrier should exist before line insertion")
+
+  vim.api.nvim_buf_set_lines(bufnr, 0, 0, false, { "" })
+  local cleared = extmark.clear_inline_line_marks(bufnr, 0)
+  assert_eq(cleared, 1, "line insertion should clear shifted compact carriers")
+  assert_eq(bs.inline_line_marks[1], nil, "old row-keyed compact carrier should be removed")
+
+  local ns2_marks = vim.api.nvim_buf_get_extmarks(bufnr, state.ns_id2, { 0, 0 }, { -1, -1 }, {})
+  assert_eq(#ns2_marks, 0, "shifted compact carrier extmarks should be deleted")
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
 local function test_cursor_visibility_preserves_insert_math_after_stale_range()
   fresh_state()
   package.loaded["typst-concealer"] = {
@@ -6509,6 +6556,10 @@ local tests = {
   {
     test_extmark_inline_compact_carrier_follows_cursor_row,
     "ok extmark inline compact carrier follows cursor row",
+  },
+  {
+    test_extmark_clears_shifted_inline_compact_carriers,
+    "ok extmark clears shifted inline compact carriers",
   },
   {
     test_cursor_visibility_preserves_insert_math_after_stale_range,

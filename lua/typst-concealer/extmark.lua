@@ -191,6 +191,71 @@ local function clear_inline_line_mark(bufnr, row)
   return true
 end
 
+local function row_in_range(row, start_row, end_row)
+  if type(row) ~= "number" then
+    return false
+  end
+  if type(start_row) == "number" and row < start_row then
+    return false
+  end
+  if type(end_row) == "number" and row > end_row then
+    return false
+  end
+  return true
+end
+
+local function extmark_row(bufnr, ns_id, extmark_id)
+  if type(extmark_id) ~= "number" then
+    return nil
+  end
+  local ok, mark = pcall(vim.api.nvim_buf_get_extmark_by_id, bufnr, ns_id, extmark_id, {})
+  if not ok or mark == nil or #mark == 0 then
+    return nil
+  end
+  return mark[1]
+end
+
+local function inline_line_mark_in_range(bufnr, row, mark, start_row, end_row)
+  if row_in_range(row, start_row, end_row) or row_in_range(mark.anchor_row, start_row, end_row) then
+    return true
+  end
+  if row_in_range(extmark_row(bufnr, state.ns_id2, mark.carrier_id), start_row, end_row) then
+    return true
+  end
+  return row_in_range(extmark_row(bufnr, state.ns_id2, mark.conceal_id), start_row, end_row)
+end
+
+--- Clear compact inline line carriers in a buffer range.
+--- Row-keyed compact carriers can drift after line insertions/deletions because
+--- Neovim moves their extmarks, but the Lua table key still names the old row.
+--- A nil end_row means "from start_row to the end of the buffer".
+--- @param bufnr integer
+--- @param start_row integer|nil
+--- @param end_row integer|nil
+--- @return integer
+function M.clear_inline_line_marks(bufnr, start_row, end_row)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return 0
+  end
+
+  local bs = state.get_buf_state(bufnr)
+  local marks = bs.inline_line_marks or {}
+  local rows = {}
+  for row, mark in pairs(marks) do
+    if inline_line_mark_in_range(bufnr, row, mark, start_row, end_row) then
+      rows[#rows + 1] = row
+    end
+  end
+
+  local cleared = 0
+  for _, row in ipairs(rows) do
+    if clear_inline_line_mark(bufnr, row) then
+      cleared = cleared + 1
+    end
+  end
+  return cleared
+end
+
 local function image_placeholder_text(row, cols, start_col)
   start_col = start_col or 0
   local line = ""

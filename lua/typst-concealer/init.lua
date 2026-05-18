@@ -486,6 +486,14 @@ function M.setup(cfg)
           local old_end_row = math.max(firstline, lastline) - 1
           local new_end_row = math.max(firstline, new_lastline) - 1
           local line_delta = new_lastline - lastline
+          local ok_extmark, extmark = pcall(require, "typst-concealer.extmark")
+          if ok_extmark and type(extmark.clear_inline_line_marks) == "function" then
+            if line_delta == 0 then
+              extmark.clear_inline_line_marks(buf, firstline, math.max(old_end_row, new_end_row))
+            else
+              extmark.clear_inline_line_marks(buf, firstline)
+            end
+          end
           local pending = tracked.pending_change
           if pending == nil then
             tracked.pending_change = {
