@@ -16,14 +16,32 @@ Forked from [typst-concealer](https://www.github.com/PartyWumpus/typst-concealer
 ![example-cmp](./docs/example-cmp.png)
 
 ## Installation
+typst-concealer now requires the bundled Rust compiler service. Install a Rust
+toolchain with Cargo first, then build the service when installing or updating
+the plugin.
+
 Lazy.nvim:
 ```lua
 return {
   "pxwg/typst-concealer",
-  opts = {},
+  build = "cargo build --release --manifest-path service/Cargo.toml",
+  opts = function(plugin)
+    return {
+      service_binary = plugin.dir .. "/service/target/release/typst-concealer-service",
+    }
+  end,
   ft = { "typst", "markdown" },
 }
 ```
+
+Manual install:
+
+```sh
+cargo build --release --manifest-path service/Cargo.toml
+```
+
+Then either put `service/target/release/typst-concealer-service` on `PATH`, or
+configure `service_binary` with its absolute path.
 
 ### Keybinds
 Typst-concealer can be disabled/enabled inside buffers. You can change the default with the `enabled_by_default` option.
@@ -44,6 +62,7 @@ end)
 - Supports top level set/let/import
 - Renders code blocks
 - Renders math blocks
+- High-quality Markdown LaTeX math preview via [MiTeX](https://github.com/mitex-rs/mitex)
 - Can automatically match your nvim colorscheme
 
 ## Options
@@ -55,9 +74,15 @@ The `styling_type` option is probably the most important one. It has three modes
 
 These styles are applied *after* all other rules are applied.
 
-Markdown LaTeX math is enabled for `markdown` buffers by default. To treat
-plugin-owned Markdown-like buffers as Markdown math sources, add their filetypes
-to `markdown_filetypes`:
+Markdown LaTeX math is enabled for `markdown` buffers by default. Thanks to
+[MiTeX](https://github.com/mitex-rs/mitex), Markdown `$...$` and `$$...$$`
+equations are converted into Typst render text and then rendered through the
+same high-resolution concealer pipeline used for Typst buffers. This gives
+Markdown notes the same inline concealment, live preview, styling, and Rust
+compiler-service rendering path.
+
+To treat plugin-owned Markdown-like buffers as Markdown math sources, add their
+filetypes to `markdown_filetypes`:
 
 ```lua
 require("typst-concealer").setup({
@@ -142,8 +167,8 @@ require("typst-concealer").setup({
 
 ### Compiler Service
 
-Full overlay rendering and live preview use the bundled Rust service. Build it
-once, then point setup at the binary when it is not already on `PATH`:
+Full overlay rendering and live preview use the bundled Rust service. If you do
+not build it through your plugin manager, build it once manually:
 
 ```sh
 cargo build --release --manifest-path service/Cargo.toml
