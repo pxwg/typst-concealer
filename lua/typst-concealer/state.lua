@@ -114,6 +114,8 @@ function M.get_buf_state(bufnr)
         throttle_timer = nil,
       },
       visible_refresh_timer = nil,
+      post_commit_ui_timer = nil,
+      post_commit_ui_pending = false,
       pending_change = nil,
       change_tracker_attached = false,
     }
@@ -228,6 +230,16 @@ function M.clear_preview_timer(bufnr)
   end
 
   M.clear_visible_refresh_timer(bufnr)
+
+  local post_commit_timer = bs.post_commit_ui_timer
+  if post_commit_timer ~= nil then
+    if not post_commit_timer:is_closing() then
+      post_commit_timer:stop()
+      post_commit_timer:close()
+    end
+    bs.post_commit_ui_timer = nil
+  end
+  bs.post_commit_ui_pending = false
 end
 
 --- Release sub-extmarks (ns_id2) attached to extmark_id before reuse or deletion.

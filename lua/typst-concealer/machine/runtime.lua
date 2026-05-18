@@ -598,6 +598,34 @@ local function run_abandon_request(effect)
   end
 end
 
+local function schedule_post_commit_ui(bufnr)
+  if state.hooks.on_page_committed == nil or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  local bs = state.get_buf_state(bufnr)
+  bs.post_commit_ui_pending = true
+  if bs.post_commit_ui_timer == nil or bs.post_commit_ui_timer:is_closing() then
+    bs.post_commit_ui_timer = vim.uv.new_timer()
+  end
+
+  bs.post_commit_ui_timer:stop()
+  bs.post_commit_ui_timer:start(
+    16,
+    0,
+    vim.schedule_wrap(function()
+      if not vim.api.nvim_buf_is_valid(bufnr) then
+        return
+      end
+      local current = state.get_buf_state(bufnr)
+      current.post_commit_ui_pending = false
+      if state.hooks.on_page_committed then
+        state.hooks.on_page_committed(bufnr)
+      end
+    end)
+  )
+end
+
 function M.run_effects(effects)
   local commit_effects = {}
   local bind_effects = {}
@@ -673,9 +701,7 @@ function M.run_effects(effects)
       for bufnr in pairs(affected_buffers) do
         require("typst-concealer.formula.manager").get(bufnr):sync_from_machine()
         M.invalidate_hover(bufnr)
-        if state.hooks.on_page_committed then
-          state.hooks.on_page_committed(bufnr)
-        end
+        schedule_post_commit_ui(bufnr)
       end
     end
   end

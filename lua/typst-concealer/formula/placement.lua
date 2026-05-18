@@ -299,7 +299,9 @@ function M:ensure_resources(overlay_id, opts)
     }, { run_effects = false })
   end
 
-  self.manager:sync_from_machine({ read_model = false })
+  if opts.sync_manager ~= false then
+    self.manager:sync_from_machine({ read_model = false })
+  end
   return select(3, self:resolve(overlay_id))
 end
 

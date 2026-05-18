@@ -219,10 +219,17 @@ function Manager:placements_for_row(row)
   return self.row_index[row] or {}
 end
 
-function Manager:placement_for_cursor(row, col, mode)
-  self:sync_from_machine({ read_model = false })
+function Manager:placements_for_row_cached(row)
+  return self.row_index[row] or {}
+end
+
+function Manager:placement_for_cursor(row, col, mode, opts)
+  opts = opts or {}
+  if opts.sync ~= false then
+    self:sync_from_machine({ read_model = false })
+  end
   local best = nil
-  for _, placement in pairs(self:placements_for_row(row)) do
+  for _, placement in pairs(self:placements_for_row_cached(row)) do
     if placement:engages_preview(row, col, mode) then
       if best == nil then
         best = placement
@@ -390,9 +397,9 @@ function Manager:build_render_batch_request(source_request)
   }
 
   for _, source_job in ipairs(source_request.jobs or {}) do
-    local placement = self:placement_for_overlay(source_job.overlay_id)
+    local placement = source_job.overlay_id and self.by_overlay_id[source_job.overlay_id] or nil
     if placement ~= nil then
-      placement:ensure_resources(source_job.overlay_id)
+      placement:ensure_resources(source_job.overlay_id, { sync_manager = false })
       local job = placement:build_render_job(source_job.overlay_id)
       if job ~= nil then
         request.jobs[#request.jobs + 1] = job
@@ -554,7 +561,7 @@ function Manager:sync_cursor_conceal()
 
   local should_hide = {}
   for row = lo, hi do
-    for _, placement in pairs(self:placements_for_row(row)) do
+    for _, placement in pairs(self:placements_for_row_cached(row)) do
       if placement:should_unconceal_for_row(row, cursor_row, cursor_col, mode) then
         local _, _, overlay = placement:resolve(placement.visible_overlay_id)
         if overlay ~= nil and overlay.extmark_id ~= nil then
@@ -626,7 +633,7 @@ function Manager:sync_cursor_preview()
   local cursor_row = cursor[1] - 1
   local cursor_col = cursor[2]
   local mode = vim.api.nvim_get_mode().mode or ""
-  local placement = self:placement_for_cursor(cursor_row, cursor_col, mode)
+  local placement = self:placement_for_cursor(cursor_row, cursor_col, mode, { sync = false })
 
   if placement == nil then
     if self.preview_placement_id ~= nil and self.placements[self.preview_placement_id] ~= nil then
