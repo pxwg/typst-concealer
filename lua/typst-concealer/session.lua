@@ -750,6 +750,9 @@ local function extract_service_inputs(config, project_scope)
       inputs[s:sub(1, eq - 1)] = s:sub(eq + 1)
     end
   end
+  if next(inputs) == nil then
+    return vim.empty_dict()
+  end
   return inputs
 end
 
