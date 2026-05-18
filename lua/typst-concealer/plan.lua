@@ -207,6 +207,17 @@ local function buffer_source_kind(bufnr)
   return nil
 end
 
+local function uses_formula_manager(bufnr, main, project_scope)
+  local config = (main and main.config) or {}
+  if config.use_formula_service ~= false then
+    return true
+  end
+  if project_scope ~= nil and project_scope.backend_id == "latex" then
+    return true
+  end
+  return buffer_source_kind(bufnr) == "latex"
+end
+
 local function get_buffer_parser(bufnr, lang)
   local ok, parser, err = pcall(vim.treesitter.get_parser, bufnr, lang)
   if ok and parser ~= nil then
@@ -794,7 +805,7 @@ function M.render_buf(bufnr)
     scanned_nodes = scan.scanned_nodes,
     binding_dirty_ranges = scan.binding_dirty_ranges,
   }
-  if main.config.use_formula_service ~= false then
+  if uses_formula_manager(bufnr, main, project_scope) then
     require("typst-concealer.formula.manager").update_from_scan(scan_event)
   else
     runtime.dispatch(scan_event)
@@ -855,7 +866,7 @@ end
 --- @param bufnr integer
 function M.hide_extmarks_at_cursor(bufnr)
   local main = require("typst-concealer")
-  if main.config.use_formula_service ~= false then
+  if uses_formula_manager(bufnr, main) then
     require("typst-concealer.formula.manager").sync_cursor_conceal(bufnr)
     return
   end

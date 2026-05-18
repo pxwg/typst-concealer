@@ -518,6 +518,50 @@ local function test_latex_wrapper_applies_configured_color_to_math_modes()
   )
 end
 
+local function test_latex_scope_uses_empty_preamble_without_document_boundary()
+  local root =
+    vim.fs.normalize(vim.fn.fnamemodify(vim.fn.tempname() .. "-latex-body-only-preamble", ":p")):gsub("/$", "")
+  assert(vim.fn.mkdir(root, "p") == 1)
+  local main_path = vim.fs.joinpath(root, "body.tex")
+  write_file(main_path, "$x$\n")
+  main_path = real_path(main_path)
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(bufnr, main_path)
+  vim.bo[bufnr].filetype = "plaintex"
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "$x$" })
+
+  fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      ppi = 300,
+      compiler_args = {},
+      do_diagnostics = false,
+      header = "",
+      backends = {
+        latex = {
+          enabled = true,
+          compiler_args = {},
+          get_root = function()
+            return root
+          end,
+        },
+      },
+    },
+    _styling_prelude = "",
+    source_kind_for_bufnr = function()
+      return "latex"
+    end,
+  }
+
+  local scope = require("typst-concealer.project-scope").resolve(bufnr, "full")
+  assert_eq(scope.preamble_source, "", "body-only LaTeX buffers should not become their own preamble")
+  local context = require("typst-concealer.latex-wrapper").build_context_document(scope, {})
+  assert_truthy(context:find("$x$", 1, true) == nil, "body-only formula source should not be injected before document")
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
 local function fake_ts_node(id, node_type, range, children)
   children = children or {}
   return {
@@ -745,7 +789,8 @@ local function test_render_buf_scans_latex_math_nodes()
   }
 
   local original_get_parser = vim.treesitter.get_parser
-  local dispatched = {}
+  local manager_event = nil
+  local cursor_conceal_calls = 0
   package.loaded["typst-concealer"] = {
     _enabled_buffers = { [bufnr] = true },
     config = {
@@ -767,13 +812,19 @@ local function test_render_buf_scans_latex_math_nodes()
       return "latex"
     end,
   }
+  package.loaded["typst-concealer.formula.manager"] = {
+    update_from_scan = function(event)
+      manager_event = event
+    end,
+    sync_cursor_conceal = function()
+      cursor_conceal_calls = cursor_conceal_calls + 1
+    end,
+  }
   package.loaded["typst-concealer.machine.runtime"] = {
     reconcile_visible_overlay_bindings = function()
       return 0
     end,
-    dispatch = function(event)
-      dispatched[#dispatched + 1] = event
-    end,
+    dispatch = function() end,
     invalidate_hover = function() end,
     get_ui_buffer = function()
       return {
@@ -792,13 +843,15 @@ local function test_render_buf_scans_latex_math_nodes()
   end)
   vim.treesitter.get_parser = original_get_parser
 
-  local scanned = dispatched[1]
+  local scanned = manager_event
+  assert_truthy(scanned ~= nil, "latex scan should use the formula manager even when formula service is disabled")
   assert_eq(scanned.type, "nodes_scanned", "latex render should dispatch scanned nodes")
   assert_eq(#scanned.scanned_nodes, 1, "latex render should scan inline math")
   assert_eq(scanned.scanned_nodes[1].source_text, "$x$", "latex node should carry raw source")
   assert_eq(scanned.scanned_nodes[1].source_str, "$x$", "latex node should keep original source")
   assert_eq(scanned.scanned_nodes[1].backend_node_type, "inline_formula", "latex node should keep backend type")
   assert_eq(scanned.scanned_nodes[1].semantics.source_kind, "latex", "latex node should keep latex semantics")
+  assert_eq(cursor_conceal_calls, 1, "latex cursor sync should use formula-manager hover routing")
 
   vim.wait(10)
   vim.api.nvim_buf_delete(bufnr, { force = true })
@@ -835,7 +888,7 @@ local function test_render_buf_routes_latex_scan_through_formula_manager()
     config = {
       do_diagnostics = false,
       live_preview_enabled = false,
-      use_formula_service = true,
+      use_formula_service = false,
       header = "",
       ppi = 300,
       compiler_args = {},
@@ -1148,6 +1201,29 @@ local function test_get_root_overrides_fallback()
   assert_eq(scope.effective_root, alt_root, "effective root should use get_root")
 
   vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_service_cleanup_removes_latex_work_directories()
+  local root = make_temp_tree("latex-work-cleanup")
+  local workspace = vim.fs.joinpath(root, "workspace")
+  local output_dir = vim.fs.joinpath(workspace, "out")
+  local work_dir = vim.fs.joinpath(output_dir, "latex-work-node-abc123")
+  local nested_dir = vim.fs.joinpath(work_dir, "nested")
+  assert(vim.fn.mkdir(nested_dir, "p") == 1)
+  write_file(vim.fs.joinpath(work_dir, "node.tex"), "$x$\n")
+  write_file(vim.fs.joinpath(work_dir, "node.pdf"), "pdf")
+  write_file(vim.fs.joinpath(work_dir, "node.log"), "log")
+  write_file(vim.fs.joinpath(nested_dir, "node.aux"), "aux")
+
+  local state = fresh_state()
+  local bufnr = 12345
+  state.service_cache_dirs[bufnr] = output_dir
+  state.service_workspace_dirs[bufnr] = workspace
+
+  require("typst-concealer.session").stop_compiler_service(bufnr)
+  assert_eq(vim.uv.fs_stat(work_dir), nil, "LaTeX work directories should be removed during service cleanup")
+  assert_eq(state.service_cache_dirs[bufnr], nil, "service cleanup should clear cache dir tracking")
+  assert_eq(state.service_workspace_dirs[bufnr], nil, "service cleanup should clear workspace dir tracking")
 end
 
 local function test_session_render_request_tracks_active_service_request()
@@ -1470,7 +1546,7 @@ local function test_latex_service_request_writes_backend_json()
   with_stubbed_uv(function(spawned)
     package.loaded["typst-concealer"] = {
       config = {
-        use_formula_service = true,
+        use_formula_service = false,
         formula_worker_count = 2,
         service_binary = "typst-concealer-service-test",
         ppi = 300,
@@ -6202,6 +6278,47 @@ local function test_machine_runtime_cursor_sync_renders_preview()
   assert_eq(hover_calls, 1, "CursorMoved sync should still update conceal state")
 end
 
+local function test_machine_runtime_cursor_sync_routes_latex_to_formula_manager()
+  fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      cursor_hover_throttle_ms = 0,
+      use_formula_service = false,
+    },
+    source_kind_for_bufnr = function()
+      return "latex"
+    end,
+  }
+
+  local preview_calls = 0
+  local hover_calls = 0
+  package.loaded["typst-concealer.formula.manager"] = {
+    sync_cursor_preview = function()
+      preview_calls = preview_calls + 1
+    end,
+    sync_cursor_conceal = function()
+      hover_calls = hover_calls + 1
+    end,
+  }
+
+  local fallback_preview_calls = 0
+  local fallback_hover_calls = 0
+  package.loaded["typst-concealer.plan"] = {
+    render_live_typst_preview = function()
+      fallback_preview_calls = fallback_preview_calls + 1
+    end,
+    hide_extmarks_at_cursor = function()
+      fallback_hover_calls = fallback_hover_calls + 1
+    end,
+  }
+
+  require("typst-concealer.machine.runtime").sync_cursor_ui(1)
+  assert_eq(preview_calls, 1, "latex CursorMoved sync should use formula-manager preview")
+  assert_eq(hover_calls, 1, "latex CursorMoved sync should use formula-manager hover")
+  assert_eq(fallback_preview_calls, 0, "latex CursorMoved sync should not use legacy Typst preview")
+  assert_eq(fallback_hover_calls, 0, "latex CursorMoved sync should not use legacy hover")
+end
+
 local function test_machine_runtime_reconciles_visible_overlay_binding_from_extmark()
   local state = fresh_state()
   local runtime = require("typst-concealer.machine.runtime")
@@ -7000,6 +7117,10 @@ local tests = {
   { test_custom_markdown_filetypes_are_supported, "ok custom markdown filetypes are supported" },
   { test_latex_buffers_require_enabled_backend, "ok latex buffers require enabled backend" },
   { test_latex_wrapper_applies_configured_color_to_math_modes, "ok latex wrapper applies color to math modes" },
+  {
+    test_latex_scope_uses_empty_preamble_without_document_boundary,
+    "ok latex body-only files use empty preamble",
+  },
   { test_markdown_adapter_collects_inline_and_block_math, "ok markdown adapter collects math" },
   { test_latex_adapter_collects_top_level_math, "ok latex adapter collects top-level math" },
   { test_render_buf_scans_markdown_math_nodes, "ok render_buf scans markdown math nodes" },
@@ -7011,6 +7132,7 @@ local tests = {
   { test_vim_resized_renders_on_column_change, "ok VimResized renders on column change" },
   { test_root_prefers_cwd_fallback, "ok root fallback uses cwd" },
   { test_get_root_overrides_fallback, "ok get_root overrides root base" },
+  { test_service_cleanup_removes_latex_work_directories, "ok service cleanup removes latex work dirs" },
   { test_session_render_request_tracks_active_service_request, "ok session tracks machine render requests" },
   { test_session_render_request_via_service_writes_json, "ok session writes compiler service requests" },
   { test_latex_service_request_writes_backend_json, "ok session writes latex backend requests" },
@@ -7227,6 +7349,10 @@ local tests = {
   {
     test_machine_runtime_cursor_sync_renders_preview,
     "ok machine runtime cursor sync renders preview",
+  },
+  {
+    test_machine_runtime_cursor_sync_routes_latex_to_formula_manager,
+    "ok machine runtime routes latex cursor sync through formula manager",
   },
   {
     test_machine_runtime_reconciles_visible_overlay_binding_from_extmark,

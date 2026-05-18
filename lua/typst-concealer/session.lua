@@ -423,6 +423,28 @@ local function get_cache_dir(bufnr, source_root)
   return dir
 end
 
+--- Recursively remove generated, per-render service work directories.
+--- @param dir string
+local function cleanup_generated_work_dir(dir)
+  local scan = vim.uv.fs_scandir(dir)
+  if scan ~= nil then
+    while true do
+      local name, typ = vim.uv.fs_scandir_next(scan)
+      if name == nil then
+        break
+      end
+      local path = dir .. "/" .. name
+      if typ == "directory" then
+        cleanup_generated_work_dir(path)
+        pcall(vim.uv.fs_rmdir, path)
+      elseif typ == "file" then
+        safe_unlink(path)
+      end
+    end
+  end
+  pcall(vim.uv.fs_rmdir, dir)
+end
+
 --- Remove unreferenced service-generated PNGs and preview sidecars for a buffer
 --- cache directory. PNG deletion goes through safe_unlink_service_artifact
 --- because service output paths are content-addressed and may be shared.
@@ -440,7 +462,9 @@ local function cleanup_service_cache_dir(dir)
     if name == nil then
       break
     end
-    if typ == "file" and (name:match("%.png$") or name:match("^%.typst%-concealer%-preview%-.*%.typ$")) then
+    if typ == "directory" and name:match("^latex%-work%-") then
+      cleanup_generated_work_dir(dir .. "/" .. name)
+    elseif typ == "file" and (name:match("%.png$") or name:match("^%.typst%-concealer%-preview%-.*%.typ$")) then
       local path = dir .. "/" .. name
       if name:match("%.png$") then
         safe_unlink_service_artifact(path)
@@ -467,8 +491,12 @@ local function cleanup_service_workspace_dir(dir)
     end
     local path = dir .. "/" .. name
     if typ == "directory" then
-      cleanup_service_workspace_dir(path)
-      pcall(vim.uv.fs_rmdir, path)
+      if name:match("^latex%-work%-") then
+        cleanup_generated_work_dir(path)
+      else
+        cleanup_service_workspace_dir(path)
+        pcall(vim.uv.fs_rmdir, path)
+      end
     elseif typ == "file" then
       if name:match("%.png$") then
         safe_unlink_service_artifact(path)

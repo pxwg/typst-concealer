@@ -15,6 +15,22 @@ pub struct LatexRenderer {
     artifacts: HashMap<u64, (PathBuf, u32, u32)>,
 }
 
+struct WorkDirGuard {
+    path: PathBuf,
+}
+
+impl WorkDirGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for WorkDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 impl LatexRenderer {
     pub fn new() -> Self {
         Self {
@@ -74,6 +90,7 @@ impl LatexRenderer {
                 None,
             );
         }
+        let _work_dir_guard = WorkDirGuard::new(work_dir.clone());
 
         let tex_path = work_dir.join("node.tex");
         let pdf_path = work_dir.join("node.pdf");
@@ -663,6 +680,19 @@ mod tests {
         Command::new(name).arg("--version").output().is_ok()
     }
 
+    fn latex_work_dirs(output_dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(output_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("latex-work-"))
+            })
+            .collect()
+    }
+
     #[test]
     fn unwrap_preserves_latex_math_modes() {
         assert_eq!(unwrap_math("\\(x+y\\)", "inline_formula"), "$x+y$");
@@ -696,7 +726,7 @@ mod tests {
         let root = temp_dir("missing-compiler");
         let output_dir = root.join("out");
         fs::create_dir_all(&output_dir).unwrap();
-        let mut req = latex_request(root.clone(), output_dir);
+        let mut req = latex_request(root.clone(), output_dir.clone());
         req.compiler = Some("definitely-missing-typst-concealer-latex".to_string());
         let node = latex_node();
         let mut renderer = LatexRenderer::new();
@@ -708,6 +738,10 @@ mod tests {
             rendered.diagnostics[0]
                 .message
                 .contains("failed to run LaTeX compiler")
+        );
+        assert!(
+            latex_work_dirs(&output_dir).is_empty(),
+            "LaTeX work directories should be removed after failed renders"
         );
 
         let _ = fs::remove_dir_all(root);

@@ -89,7 +89,7 @@ local function preamble_before_document(text)
   text = text or ""
   local start_pos = text:find("\\begin%s*{%s*document%s*}")
   if start_pos == nil then
-    return text
+    return ""
   end
   return text:sub(1, start_pos - 1)
 end

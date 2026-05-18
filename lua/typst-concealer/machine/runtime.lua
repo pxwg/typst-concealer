@@ -26,6 +26,21 @@ end
 local concealing_for_cursor
 local dispatch_without_effects
 
+local function uses_formula_manager(bufnr, main)
+  if main == nil or main.config == nil then
+    return false
+  end
+  local config = main.config
+  if config.use_formula_service ~= false then
+    return true
+  end
+  if type(main.source_kind_for_bufnr) == "function" then
+    local ok, kind = pcall(main.source_kind_for_bufnr, bufnr)
+    return ok and kind == "latex"
+  end
+  return false
+end
+
 local function ensure_machine_state()
   if state.machine_state == nil then
     state.machine_state = types.initial_state()
@@ -738,7 +753,7 @@ end
 
 function M.render_live_preview(bufnr)
   local ok_main, main = pcall(require, "typst-concealer")
-  if ok_main and main.config and main.config.use_formula_service ~= false then
+  if ok_main and uses_formula_manager(bufnr, main) then
     require("typst-concealer.formula.manager").sync_cursor_preview(bufnr)
     return
   end
@@ -752,7 +767,7 @@ end
 
 function M.sync_hover(bufnr)
   local ok_main, main = pcall(require, "typst-concealer")
-  if ok_main and main.config and main.config.use_formula_service ~= false then
+  if ok_main and uses_formula_manager(bufnr, main) then
     require("typst-concealer.formula.manager").sync_cursor_conceal(bufnr)
     return
   end
