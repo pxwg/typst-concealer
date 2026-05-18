@@ -261,4 +261,22 @@ function M.collect(bufnr, opts)
   return build_entries(bufnr, units), units
 end
 
+function M.render_viewport()
+  local ok, main = pcall(require, "typst-concealer")
+  local latex_config = ok and main.config and main.config.backends and main.config.backends.latex or {}
+  return {
+    kind = "visible",
+    margin = latex_config.viewport_margin or 0,
+  }
+end
+
+function M.render_policy()
+  local ok, main = pcall(require, "typst-concealer")
+  local latex_config = ok and main.config and main.config.backends and main.config.backends.latex or {}
+  return {
+    kind = "progressive",
+    margin = latex_config.viewport_margin or 0,
+  }
+end
+
 return M

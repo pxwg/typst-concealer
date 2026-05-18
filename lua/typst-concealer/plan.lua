@@ -1,5 +1,5 @@
 --- Render dispatch layer for typst-concealer.
---- Handles full-buffer re-rendering (render_buf) and live insert-mode preview
+--- Handles adapter-viewport re-rendering (render_buf) and live insert-mode preview
 --- (render_live_typst_preview).  Both paths share semantics.classify() and the
 --- same extmark/session infrastructure.
 
@@ -792,6 +792,12 @@ function M.render_buf(bufnr)
   state.buffer_render_state[bufnr] = state.buffer_render_state[bufnr] or {}
   state.buffer_render_state[bufnr].full_units = scan.units
   state.buffer_render_state[bufnr].runtime_preludes = scan.runtime_preludes
+  state.buffer_render_state[bufnr].render_viewport = scan.render_viewport
+  state.buffer_render_state[bufnr].render_viewport_key = scan.render_viewport_key
+  state.buffer_render_state[bufnr].render_coverage = scan.render_coverage
+  state.buffer_render_state[bufnr].render_coverage_key = scan.render_coverage_key
+  state.buffer_render_state[bufnr].render_coverage_state = scan.render_coverage_state
+  state.buffer_render_state[bufnr].render_coverage_complete = scan.render_coverage_complete
 
   local runtime = require("typst-concealer.machine.runtime")
   local project_scope = require("typst-concealer.project-scope").resolve(bufnr, "full")
@@ -804,6 +810,10 @@ function M.render_buf(bufnr)
     layout_version = vim.o.columns,
     scanned_nodes = scan.scanned_nodes,
     binding_dirty_ranges = scan.binding_dirty_ranges,
+    render_viewport = scan.render_viewport,
+    render_viewport_key = scan.render_viewport_key,
+    render_coverage = scan.render_coverage,
+    render_coverage_key = scan.render_coverage_key,
   }
   if uses_formula_manager(bufnr, main, project_scope) then
     require("typst-concealer.formula.manager").update_from_scan(scan_event)
@@ -818,6 +828,10 @@ function M.render_buf(bufnr)
   -- Reset hover guard so hide_extmarks_at_cursor re-evaluates after render
   runtime.invalidate_hover(bufnr)
   M.hide_extmarks_at_cursor(bufnr)
+
+  if scan.render_coverage_can_grow then
+    M.schedule_full_render(bufnr, { delay_ms = scan.render_coverage_delay_ms })
+  end
 end
 
 --- Hide a single extmark (removes virt_text/virt_lines from display).
@@ -1121,6 +1135,8 @@ scan_formula_matches = function(bufnr, main)
   if source_kind ~= "typst" and source_kind ~= "markdown" and source_kind ~= "latex" then
     return nil, "unsupported"
   end
+  local viewport_mod = require("typst-concealer.viewport")
+  local render_plan = viewport_mod.resolve_render_plan(bufnr, { source_kind = source_kind })
 
   local units
   local sorted_entries = {}
@@ -1199,6 +1215,8 @@ scan_formula_matches = function(bufnr, main)
       backend_node_type = entry.backend_node_type,
       semantics = sem,
       requires_mitex = entry.requires_mitex == true,
+      render_in_coverage = viewport_mod.range_overlaps(render_plan.render_coverage, display_range),
+      render_priority = viewport_mod.distance_to_viewport(render_plan.render_viewport, display_range),
     }
   end
 
@@ -1207,6 +1225,14 @@ scan_formula_matches = function(bufnr, main)
     scanned_nodes = scanned_nodes,
     binding_dirty_ranges = binding_dirty_ranges,
     runtime_preludes = state.runtime_preludes,
+    render_viewport = render_plan.render_viewport,
+    render_viewport_key = render_plan.render_viewport_key,
+    render_coverage = render_plan.render_coverage,
+    render_coverage_key = render_plan.render_coverage_key,
+    render_coverage_state = render_plan.render_coverage_state,
+    render_coverage_complete = render_plan.render_coverage_complete,
+    render_coverage_can_grow = render_plan.render_coverage_can_grow,
+    render_coverage_delay_ms = render_plan.render_coverage_delay_ms,
   }
 end
 
@@ -1560,7 +1586,7 @@ function M.schedule_full_render(bufnr, opts)
 
   bs._full_render_timer:stop()
   bs._full_render_timer:start(
-    opts.immediate == true and 0 or 16,
+    opts.immediate == true and 0 or (opts.delay_ms or 16),
     0,
     vim.schedule_wrap(function()
       if not vim.api.nvim_buf_is_valid(bufnr) then

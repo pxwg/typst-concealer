@@ -1,7 +1,7 @@
 --- Buffer-level formula manager.
 ---
---- The viewport for typst-concealer is the whole buffer, but the side-effect
---- boundary is a single FormulaPlacement.  This manager keeps persistent
+--- The render viewport is chosen by the source adapter, but the side-effect
+--- boundary is a single FormulaPlacement. This manager keeps persistent
 --- placement indexes and answers cursor/source lookup questions; placement
 --- objects perform the extmark/image mutations.
 
@@ -455,6 +455,49 @@ function Manager:ensure_pending_nodes_rendering(opts)
   return missing
 end
 
+function Manager:render_queue_node_ids()
+  self:sync_from_machine({ read_model = false })
+  local _, buf = machine_buffer(self.bufnr)
+  if buf == nil then
+    return {}
+  end
+
+  local candidates = {}
+  for _, node_id in ipairs(buf.node_order or {}) do
+    local node = buf.nodes[node_id]
+    if
+      node ~= nil
+      and node.status ~= "orphaned"
+      and node.status ~= "deleted_confirmed"
+      and node.render_in_coverage ~= false
+    then
+      local slot = node.slot_id and buf.slots[node.slot_id] or nil
+      local dirty = slot ~= nil
+        and (slot.status == "dirty" or slot.dirty == true or node.status == "pending" or node.status == "stale")
+      if dirty then
+        candidates[#candidates + 1] = {
+          node_id = node.node_id,
+          priority = tonumber(node.render_priority) or math.huge,
+          item_idx = tonumber(node.item_idx) or math.huge,
+        }
+      end
+    end
+  end
+
+  table.sort(candidates, function(a, b)
+    if a.priority ~= b.priority then
+      return a.priority < b.priority
+    end
+    return a.item_idx < b.item_idx
+  end)
+
+  local node_ids = {}
+  for _, candidate in ipairs(candidates) do
+    node_ids[#node_ids + 1] = candidate.node_id
+  end
+  return node_ids
+end
+
 function Manager:on_rendered(entry)
   self:sync_from_machine({ read_model = false })
   local placement = self.by_node_id[entry.owner_node_id] or self.by_overlay_id[entry.overlay_id]
@@ -688,9 +731,12 @@ function M.update_from_scan(scan_event)
   local manager = M.get(scan_event.bufnr)
   runtime.dispatch(scan_event)
   manager:sync_from_machine()
-  local ret = runtime.schedule_formula_renders(scan_event.bufnr)
+  local node_ids = manager:render_queue_node_ids()
+  local ret = runtime.schedule_formula_renders(scan_event.bufnr, {
+    node_ids = node_ids,
+  })
   manager:sync_from_machine({ read_model = false })
-  manager:ensure_pending_nodes_rendering()
+  manager:ensure_pending_nodes_rendering({ node_ids = node_ids })
   return ret
 end
 

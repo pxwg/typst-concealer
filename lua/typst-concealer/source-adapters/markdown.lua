@@ -3,6 +3,20 @@
 
 local M = {}
 
+function M.render_viewport()
+  return {
+    kind = "visible",
+    margin = 0,
+  }
+end
+
+function M.render_policy()
+  return {
+    kind = "progressive",
+    margin = 0,
+  }
+end
+
 local function is_escaped(line, idx)
   local slash_count = 0
   local pos = idx - 1

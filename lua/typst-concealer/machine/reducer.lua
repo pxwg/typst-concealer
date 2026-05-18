@@ -588,6 +588,8 @@ local function patch_node(prev, scanned, buffer_version, layout_version)
   node.source_text_hash = scanned.source_text_hash
   node.backend_node_type = scanned.backend_node_type
   node.requires_mitex = scanned.requires_mitex
+  node.render_in_coverage = scanned.render_in_coverage ~= false
+  node.render_priority = scanned.render_priority
   node.context_hash = scanned.context_hash
   node.prelude_count = scanned.prelude_count or 0
   node.semantics = deepcopy(scanned.semantics)
@@ -615,6 +617,8 @@ local function new_node(state, bufnr, project_scope_id, scanned, buffer_version,
     source_text_hash = scanned.source_text_hash,
     node_rev = 1,
     requires_mitex = scanned.requires_mitex,
+    render_in_coverage = scanned.render_in_coverage ~= false,
+    render_priority = scanned.render_priority,
     context_hash = scanned.context_hash,
     prelude_count = scanned.prelude_count or 0,
     semantics = deepcopy(scanned.semantics),
@@ -1162,12 +1166,22 @@ local function reduce_formula_renders_requested(state, ev)
   local jobs = {}
   local requested = ev.node_ids
   local requested_set = nil
+  local request_slot_ids = nil
   if type(requested) == "table" then
     requested_set = {}
+    request_slot_ids = {}
+    local seen_slots = {}
     for _, node_id in ipairs(requested) do
       requested_set[node_id] = true
+      local node = buf.nodes[node_id]
+      local slot_id = node and node.slot_id or nil
+      if slot_id ~= nil and not seen_slots[slot_id] then
+        request_slot_ids[#request_slot_ids + 1] = slot_id
+        seen_slots[slot_id] = true
+      end
     end
   end
+  request_slot_ids = request_slot_ids or buf.slot_order or {}
 
   local request_id = nil
   local function ensure_request_id()
@@ -1178,7 +1192,7 @@ local function reduce_formula_renders_requested(state, ev)
     return request_id
   end
 
-  for _, slot_id in ipairs(buf.slot_order or {}) do
+  for _, slot_id in ipairs(request_slot_ids) do
     local slot = buf.slots[slot_id]
     if slot ~= nil then
       if slot.status == "tombstone" then

@@ -150,6 +150,7 @@ end
 --- @field converter?             string    PDF-to-PNG converter executable. Default "pdftocairo".
 --- @field compiler_args?         string[]  Extra compiler arguments.
 --- @field header?                string    Custom LaTeX preamble inserted before project preamble.
+--- @field viewport_margin?       integer   Extra screen rows around visible windows rendered by LaTeX. Default 0.
 --- @field get_root?              fun(bufnr: integer, path: string, cwd: string, kind: "full"): string|nil
 --- @field get_main_file?         fun(bufnr: integer, path: string, cwd: string, kind: "full"): string|nil
 --- @field get_preamble_file?     fun(bufnr: integer, path: string, cwd: string, kind: "full"): string|nil
@@ -293,6 +294,22 @@ local function maybe_resume_visible_compiler_service(bufnr)
   require("typst-concealer.machine.runtime").render_buf(bufnr)
 end
 
+local function schedule_render_if_viewport_changed(bufnr)
+  if
+    not vim.api.nvim_buf_is_valid(bufnr)
+    or not M.is_supported_bufnr(bufnr)
+    or M._enabled_buffers[bufnr] ~= true
+    or not M.is_render_allowed(bufnr)
+  then
+    return
+  end
+
+  local changed = require("typst-concealer.viewport").changed_since_last_render(bufnr)
+  if changed then
+    require("typst-concealer.machine.runtime").schedule_full_render(bufnr)
+  end
+end
+
 local function attach_buffer_local_autocmds(bufnr)
   if not vim.api.nvim_buf_is_valid(bufnr) or not M.is_supported_bufnr(bufnr) then
     return
@@ -341,6 +358,7 @@ local function attach_buffer_local_autocmds(bufnr)
     callback = function(ev)
       vim.schedule(function()
         maybe_resume_visible_compiler_service(ev.buf)
+        schedule_render_if_viewport_changed(ev.buf)
         local runtime = require("typst-concealer.machine.runtime")
         runtime.render_live_preview(ev.buf)
         runtime.sync_hover(ev.buf)
@@ -461,6 +479,7 @@ function M.setup(cfg)
         converter = default(latex_cfg.converter, "pdftocairo"),
         compiler_args = default(latex_cfg.compiler_args, {}),
         header = default(latex_cfg.header, ""),
+        viewport_margin = default(latex_cfg.viewport_margin, 0),
         get_root = latex_cfg.get_root,
         get_main_file = latex_cfg.get_main_file,
         get_preamble_file = latex_cfg.get_preamble_file,
@@ -488,6 +507,9 @@ function M.setup(cfg)
     if type(arg) ~= "string" then
       error("backends.latex.compiler_args must be a list of strings")
     end
+  end
+  if type(latex_backend_cfg.viewport_margin) ~= "number" or latex_backend_cfg.viewport_margin < 0 then
+    error("backends.latex.viewport_margin must be a non-negative number")
   end
   for _, key in ipairs({ "get_root", "get_main_file", "get_preamble_file" }) do
     if latex_backend_cfg[key] ~= nil and type(latex_backend_cfg[key]) ~= "function" then
@@ -740,6 +762,7 @@ function M.setup(cfg)
     callback = function(ev)
       vim.schedule(function()
         maybe_resume_visible_compiler_service(ev.buf)
+        schedule_render_if_viewport_changed(ev.buf)
         local runtime = require("typst-concealer.machine.runtime")
         runtime.render_live_preview(ev.buf)
         runtime.sync_hover(ev.buf)
@@ -754,6 +777,26 @@ function M.setup(cfg)
     callback = function(ev)
       vim.schedule(function()
         maybe_resume_visible_compiler_service(ev.buf)
+        schedule_render_if_viewport_changed(ev.buf)
+      end)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("WinScrolled", {
+    group = augroup,
+    desc = "render buffers whose adapter viewport follows visible windows",
+    callback = function()
+      vim.schedule(function()
+        local seen = {}
+        for _, winid in ipairs(vim.api.nvim_list_wins()) do
+          if vim.api.nvim_win_is_valid(winid) then
+            local bufnr = vim.api.nvim_win_get_buf(winid)
+            if not seen[bufnr] then
+              seen[bufnr] = true
+              schedule_render_if_viewport_changed(bufnr)
+            end
+          end
+        end
       end)
     end,
   })

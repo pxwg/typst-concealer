@@ -59,6 +59,8 @@ local function reset_modules()
   package.loaded["typst-concealer.wrapper"] = nil
   package.loaded["typst-concealer.latex-wrapper"] = nil
   package.loaded["typst-concealer.path-rewrite"] = nil
+  package.loaded["typst-concealer.viewport"] = nil
+  package.loaded["typst-concealer.source-adapters.typst"] = nil
   package.loaded["typst-concealer.source-adapters.markdown"] = nil
   package.loaded["typst-concealer.source-adapters.latex"] = nil
 end
@@ -700,6 +702,91 @@ local function test_latex_adapter_collects_top_level_math()
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
+local function test_latex_adapter_collects_buffer_independent_of_viewport()
+  reset_modules()
+  local bufnr = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
+    "Hidden $a$.",
+    "",
+    "Visible $b$.",
+    "\\[",
+    "c",
+    "\\]",
+  })
+
+  local hidden = fake_ts_node(2, "inline_formula", { 0, 7, 0, 10 })
+  local visible = fake_ts_node(3, "inline_formula", { 2, 8, 2, 11 })
+  local spanning = fake_ts_node(4, "displayed_equation", { 3, 0, 5, 2 })
+  local root = fake_ts_node(1, "source_file", { 0, 0, 5, 2 }, { hidden, visible, spanning })
+  local parser = {
+    parse = function()
+      return {
+        {
+          root = function()
+            return root
+          end,
+        },
+      }
+    end,
+  }
+
+  with_fake_latex_query({ hidden, visible, spanning }, function()
+    local entries = require("typst-concealer.source-adapters.latex").collect(bufnr, {
+      parser = parser,
+      viewport = {
+        kind = "visible",
+        ranges = {
+          { top = 2, bottom = 4 },
+        },
+      },
+    })
+    assert_eq(#entries, 3, "latex adapter should collect all math; render coverage is planner-owned")
+    assert_eq(entries[1].source_text, "$a$", "hidden inline math should remain in the scan model")
+    assert_eq(entries[2].source_text, "$b$", "visible inline math should be included")
+    assert_eq(entries[3].source_text, "\\[\nc\n\\]", "math spanning the viewport should be included")
+  end)
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_viewport_change_tracking_is_adapter_scoped()
+  local state = fresh_state()
+  local bufnr = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_name(bufnr, "viewport.tex")
+  vim.bo[bufnr].filetype = "tex"
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "$x$" })
+
+  package.loaded["typst-concealer"] = {
+    config = {
+      markdown_filetypes = { "markdown" },
+      backends = {
+        latex = { enabled = true, viewport_margin = 0 },
+      },
+    },
+    source_kind_for_bufnr = function()
+      return "latex"
+    end,
+  }
+
+  local viewport = require("typst-concealer.viewport")
+  local changed, resolved, key = viewport.changed_since_last_render(bufnr)
+  assert_eq(changed, true, "latex progressive policy should request an initial viewport render")
+  assert_eq(resolved.kind, "visible", "latex adapter should choose a visible render viewport")
+  state.buffer_render_state[bufnr] = { render_viewport_key = key, render_coverage_complete = true }
+  changed = viewport.changed_since_last_render(bufnr)
+  assert_eq(changed, false, "unchanged latex viewport should not schedule another scroll render")
+
+  package.loaded["typst-concealer"].source_kind_for_bufnr = function()
+    return "typst"
+  end
+  changed, resolved = viewport.changed_since_last_render(bufnr)
+  assert_eq(changed, false, "whole-buffer adapters should not schedule viewport-change renders")
+  assert_eq(resolved.kind, "buffer", "typst adapter should use the whole buffer viewport")
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
 local function test_render_buf_scans_markdown_math_nodes()
   reset_modules()
   local state = require("typst-concealer.state")
@@ -770,6 +857,7 @@ local function test_render_buf_scans_latex_math_nodes()
   state.machine_state = require("typst-concealer.machine.types").initial_state()
 
   local bufnr = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_set_current_buf(bufnr)
   vim.api.nvim_buf_set_name(bufnr, "render-latex.tex")
   vim.bo[bufnr].filetype = "tex"
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "Inline $x$." })
@@ -863,6 +951,7 @@ local function test_render_buf_routes_latex_scan_through_formula_manager()
   state.machine_state = require("typst-concealer.machine.types").initial_state()
 
   local bufnr = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_set_current_buf(bufnr)
   vim.api.nvim_buf_set_name(bufnr, "render-latex-manager.tex")
   vim.bo[bufnr].filetype = "tex"
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "Inline $x$." })
@@ -5157,6 +5246,97 @@ local function test_machine_reducer_formula_batch_keeps_node_request_state_indep
   assert_eq(count_effects(effects, "retire_overlay"), 1, "only failed formula candidate should retire")
 end
 
+local function test_machine_reducer_formula_batch_respects_requested_node_order()
+  reset_modules()
+  local types = require("typst-concealer.machine.types")
+  local reducer = require("typst-concealer.machine.reducer")
+
+  local state = types.initial_state()
+  local effects
+  state, effects = reducer.reduce(
+    state,
+    scan_event({
+      make_scanned_node({ stable_key = "a", source_text = "$a$", source_text_hash = "hash:a" }),
+      make_scanned_node({
+        stable_key = "b",
+        item_idx = 2,
+        source_range = { 1, 0, 1, 3 },
+        display_range = { 1, 0, 1, 3 },
+        source_text = "$b$",
+        source_text_hash = "hash:b",
+      }),
+      make_scanned_node({
+        stable_key = "c",
+        item_idx = 3,
+        source_range = { 2, 0, 2, 3 },
+        display_range = { 2, 0, 2, 3 },
+        source_text = "$c$",
+        source_text_hash = "hash:c",
+      }),
+    })
+  )
+
+  local node_a = state.buffers[1].node_order[1]
+  local node_c = state.buffers[1].node_order[3]
+  state, effects = reducer.reduce(state, {
+    type = "formula_renders_requested",
+    bufnr = 1,
+    node_ids = { node_c, node_a },
+  })
+
+  local request = first_effect(effects, "request_formula_render_batch")
+  assert_truthy(request, "requested formula nodes should produce a formula batch")
+  assert_eq(#request.request.jobs, 2, "formula batch should include only requested nodes")
+  assert_eq(request.request.jobs[1].node_id, node_c, "requested order should prioritize near-viewport node")
+  assert_eq(request.request.jobs[2].node_id, node_a, "requested order should be preserved for remaining nodes")
+end
+
+local function test_formula_manager_render_queue_uses_coverage_priority()
+  local state = fresh_state()
+  local reducer = require("typst-concealer.machine.reducer")
+
+  state.machine_state = reducer.reduce(
+    state.machine_state,
+    scan_event({
+      make_scanned_node({
+        stable_key = "hidden",
+        source_text = "$hidden$",
+        source_text_hash = "hash:hidden",
+        render_in_coverage = false,
+        render_priority = 0,
+      }),
+      make_scanned_node({
+        stable_key = "far",
+        item_idx = 2,
+        source_range = { 20, 0, 20, 5 },
+        display_range = { 20, 0, 20, 5 },
+        source_text = "$far$",
+        source_text_hash = "hash:far",
+        render_in_coverage = true,
+        render_priority = 20,
+      }),
+      make_scanned_node({
+        stable_key = "near",
+        item_idx = 3,
+        source_range = { 2, 0, 2, 6 },
+        display_range = { 2, 0, 2, 6 },
+        source_text = "$near$",
+        source_text_hash = "hash:near",
+        render_in_coverage = true,
+        render_priority = 0,
+      }),
+    })
+  )
+
+  local manager = require("typst-concealer.formula.manager").get(1)
+  local node_ids = manager:render_queue_node_ids()
+  local buf = state.machine_state.buffers[1]
+
+  assert_eq(#node_ids, 2, "render queue should exclude nodes outside current coverage")
+  assert_eq(buf.nodes[node_ids[1]].stable_key, "near", "nearest covered node should render first")
+  assert_eq(buf.nodes[node_ids[2]].stable_key, "far", "farther covered node should render later")
+end
+
 local function test_machine_reducer_scan_retires_cleared_formula_candidates()
   reset_modules()
   local types = require("typst-concealer.machine.types")
@@ -7123,6 +7303,11 @@ local tests = {
   },
   { test_markdown_adapter_collects_inline_and_block_math, "ok markdown adapter collects math" },
   { test_latex_adapter_collects_top_level_math, "ok latex adapter collects top-level math" },
+  {
+    test_latex_adapter_collects_buffer_independent_of_viewport,
+    "ok latex adapter scans buffer independently of render coverage",
+  },
+  { test_viewport_change_tracking_is_adapter_scoped, "ok viewport change tracking is adapter scoped" },
   { test_render_buf_scans_markdown_math_nodes, "ok render_buf scans markdown math nodes" },
   { test_render_buf_scans_latex_math_nodes, "ok render_buf scans latex math nodes" },
   {
@@ -7274,6 +7459,14 @@ local tests = {
   {
     test_machine_reducer_formula_batch_keeps_node_request_state_independent,
     "ok machine reducer formula batch keeps node state independent",
+  },
+  {
+    test_machine_reducer_formula_batch_respects_requested_node_order,
+    "ok machine reducer formula batch respects requested node order",
+  },
+  {
+    test_formula_manager_render_queue_uses_coverage_priority,
+    "ok formula manager render queue uses coverage priority",
   },
   {
     test_machine_reducer_scan_retires_cleared_formula_candidates,

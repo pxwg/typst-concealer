@@ -76,6 +76,8 @@ local M = {}
 --- @field source_text_hash string
 --- @field node_rev integer
 --- @field requires_mitex boolean|nil
+--- @field render_in_coverage boolean|nil
+--- @field render_priority number|nil
 --- @field context_hash string
 --- @field prelude_count integer
 --- @field semantics NodeSemantics
@@ -221,6 +223,8 @@ local M = {}
 --- @field context_hash string
 --- @field prelude_count integer
 --- @field semantics NodeSemantics
+--- @field render_in_coverage boolean|nil
+--- @field render_priority number|nil
 
 --- @class RenderJob
 --- @field request_id string
