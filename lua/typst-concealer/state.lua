@@ -103,6 +103,10 @@ function M.get_buf_state(bufnr)
       currently_hidden_extmark_ids = {},
       multiline_marks = {},
       inline_line_marks = {},
+      line_run_marks = {},
+      line_run_by_row = {},
+      line_run_by_extmark = {},
+      next_line_run_id = 0,
       inline_line_suppressed_rows = {},
       hover = {
         last_cursor_row = nil,
@@ -247,14 +251,51 @@ end
 --- @param extmark_id integer
 function M.prepare_extmark_reuse(bufnr, extmark_id)
   local bs = M.get_buf_state(bufnr)
+
+  local function clear_line_run_id(run_id)
+    local run = bs.line_run_marks and bs.line_run_marks[run_id] or nil
+    if run == nil then
+      return false
+    end
+    if run.carrier_id ~= nil then
+      pcall(vim.api.nvim_buf_del_extmark, bufnr, M.ns_id2, run.carrier_id)
+    end
+    for _, id in pairs(run.conceal_ids or {}) do
+      pcall(vim.api.nvim_buf_del_extmark, bufnr, M.ns_id2, id)
+    end
+    for row in pairs(run.rows or {}) do
+      if bs.inline_line_marks and bs.inline_line_marks[row] and bs.inline_line_marks[row].line_run_id == run_id then
+        bs.inline_line_marks[row] = nil
+      end
+      if bs.line_run_by_row then
+        bs.line_run_by_row[row] = nil
+      end
+    end
+    for run_extmark_id in pairs(run.block_extmark_ids or {}) do
+      local run_mm = bs.multiline_marks[run_extmark_id]
+      if run_mm and run_mm.line_run_id == run_id then
+        run_mm.carrier_id = nil
+        run_mm.tail_ids = {}
+        run_mm.line_run_id = nil
+      end
+      if bs.line_run_by_extmark then
+        bs.line_run_by_extmark[run_extmark_id] = nil
+      end
+    end
+    bs.line_run_marks[run_id] = nil
+    return true
+  end
+
   local ok_mark, mark = pcall(vim.api.nvim_buf_get_extmark_by_id, bufnr, M.ns_id, extmark_id, {})
   if ok_mark and mark ~= nil and #mark > 0 then
     local inline = bs.inline_line_marks and bs.inline_line_marks[mark[1]]
     if inline ~= nil then
-      if inline.carrier_id ~= nil then
+      if inline.line_run_id ~= nil and clear_line_run_id(inline.line_run_id) then
+        inline = nil
+      elseif inline.carrier_id ~= nil then
         pcall(vim.api.nvim_buf_del_extmark, bufnr, M.ns_id2, inline.carrier_id)
       end
-      if inline.conceal_id ~= nil then
+      if inline ~= nil and inline.conceal_id ~= nil then
         pcall(vim.api.nvim_buf_del_extmark, bufnr, M.ns_id2, inline.conceal_id)
       end
       bs.inline_line_marks[mark[1]] = nil
@@ -264,11 +305,15 @@ function M.prepare_extmark_reuse(bufnr, extmark_id)
   local mm = bs.multiline_marks[extmark_id]
   if mm ~= nil then
     if mm.is_block_carrier then
-      if mm.carrier_id then
-        pcall(vim.api.nvim_buf_del_extmark, bufnr, M.ns_id2, mm.carrier_id)
-      end
-      for _, id in ipairs(mm.tail_ids or {}) do
-        pcall(vim.api.nvim_buf_del_extmark, bufnr, M.ns_id2, id)
+      if mm.line_run_id ~= nil and clear_line_run_id(mm.line_run_id) then
+        -- run-owned carrier and conceal extmarks were cleared above
+      else
+        if mm.carrier_id then
+          pcall(vim.api.nvim_buf_del_extmark, bufnr, M.ns_id2, mm.carrier_id)
+        end
+        for _, id in ipairs(mm.tail_ids or {}) do
+          pcall(vim.api.nvim_buf_del_extmark, bufnr, M.ns_id2, id)
+        end
       end
     else
       for _, id in pairs(mm) do

@@ -45,6 +45,7 @@ local function reset_modules()
   package.loaded["typst-concealer.apply"] = nil
   package.loaded["typst-concealer.plan"] = nil
   package.loaded["typst-concealer.cursor-visibility"] = nil
+  package.loaded["typst-concealer.display"] = nil
   package.loaded["typst-concealer.extmark"] = nil
   package.loaded["typst-concealer.session"] = nil
   package.loaded["typst-concealer.project-scope"] = nil
@@ -5936,6 +5937,394 @@ local function virt_line_text(line)
   return table.concat(parts)
 end
 
+local function hl_index(hl_group, expected)
+  if hl_group == expected then
+    return 1
+  end
+  if type(hl_group) ~= "table" then
+    return nil
+  end
+  for idx, group in ipairs(hl_group) do
+    if group == expected then
+      return idx
+    end
+  end
+end
+
+local function assert_hl_contains(hl_group, expected, msg)
+  assert_truthy(hl_index(hl_group, expected) ~= nil, msg .. "\nhl_group: " .. vim.inspect(hl_group))
+end
+
+local function test_extmark_embedded_block_math_uses_display_composer()
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+      block_padding_cols = 0,
+    },
+  }
+
+  local old_conceallevel = vim.o.conceallevel
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  local line = "pre abc $ sin(alpha) $ tail"
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "before", line, "after" })
+  vim.api.nvim_win_set_cursor(0, { 3, 0 })
+  vim.cmd("syntax on")
+  vim.cmd("syntax match TypstConcealerBlockComposerWord /abc/ conceal cchar=X")
+  vim.api.nvim_set_hl(0, "TypstConcealerBlockComposerWord", { fg = "#00ff00" })
+  vim.o.conceallevel = 2
+
+  local tail_start = line:find("tail", 1, true) - 1
+  local hl_ns = vim.api.nvim_create_namespace("typst-concealer-block-composer-test")
+  vim.api.nvim_buf_set_extmark(bufnr, hl_ns, 1, tail_start, {
+    end_col = tail_start + #"tail",
+    hl_group = "String",
+  })
+
+  local extmark = require("typst-concealer.extmark")
+  local image_id = 1305
+  local math_start, math_end = line:find("$ sin(alpha) $", 1, true)
+  local source_range = { 1, math_start - 1, 1, math_end }
+  local display_range = { 1, 0, 1, #line }
+  local semantics = {
+    display_kind = "block",
+    constraint_kind = "intrinsic",
+    source_kind = "math",
+    render_whole_line = true,
+  }
+  local extmark_id = extmark.place_render_extmark(bufnr, image_id, display_range, nil, true, semantics)
+  local item = {
+    bufnr = bufnr,
+    image_id = image_id,
+    extmark_id = extmark_id,
+    range = source_range,
+    display_range = display_range,
+    display_prefix = "pre abc",
+    display_suffix = "tail",
+    node_type = "math",
+    semantics = semantics,
+  }
+  state.image_id_to_extmark[image_id] = extmark_id
+  state.item_by_image_id[image_id] = item
+
+  extmark.conceal_for_image_id(bufnr, image_id, 8, 1, 1)
+
+  local mm = state.get_buf_state(bufnr).multiline_marks[extmark_id]
+  assert_truthy(mm ~= nil and mm.is_block_carrier == true, "embedded block math should use a block carrier")
+  local carrier = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, mm.carrier_id, { details = true })
+  local virt_lines = carrier[3].virt_lines or {}
+  assert_eq(carrier[1], 0, "embedded block carrier should anchor outside the concealed source row")
+  assert_eq(carrier[3].virt_lines_above, false, "embedded block carrier should render after the previous row")
+  assert_truthy(#virt_lines >= 3, "embedded block composer should split prefix, image, and suffix virtual lines")
+
+  local prefix_text = virt_line_text(virt_lines[1])
+  assert_truthy(prefix_text:find("pre X ", 1, true) ~= nil, "block composer should replay syntax conceal in prefix")
+  assert_truthy(prefix_text:find("abc", 1, true) == nil, "block composer should not use raw display_prefix text")
+
+  local seen_x_hl
+  for _, chunk in ipairs(virt_lines[1]) do
+    if (chunk[1] or ""):find("X", 1, true) ~= nil then
+      seen_x_hl = chunk[2]
+      break
+    end
+  end
+  assert_hl_contains(
+    seen_x_hl,
+    "TypstConcealerBlockComposerWord",
+    "block composer should preserve syntax conceal highlight"
+  )
+
+  local suffix_text = virt_line_text(virt_lines[#virt_lines])
+  assert_truthy(suffix_text:find(" tail", 1, true) ~= nil, "block composer should replay suffix text")
+  local seen_tail_hl
+  for _, chunk in ipairs(virt_lines[#virt_lines]) do
+    if chunk[1] == "t" then
+      seen_tail_hl = chunk[2]
+      break
+    end
+  end
+  assert_hl_contains(seen_tail_hl, "String", "block composer should preserve suffix extmark highlights")
+
+  local image_cols = 0
+  local image_hl = "typst-concealer-image-id-" .. tostring(image_id)
+  for _, virt_line in ipairs(virt_lines) do
+    for _, chunk in ipairs(virt_line) do
+      if chunk[2] == image_hl then
+        image_cols = image_cols + vim.fn.strdisplaywidth(chunk[1] or "")
+      end
+    end
+  end
+  assert_eq(image_cols, 8, "embedded block composer should keep the rendered image placeholder width")
+
+  vim.o.conceallevel = old_conceallevel
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_extmark_embedded_block_math_avoids_inline_source_anchor()
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+      block_padding_cols = 0,
+    },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  local inline_line = "World $sin(alpha)$ beta lambda hello, world!"
+  local block_line = "Hello, world $ sin(alpha) $ hello `hi`"
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "before", inline_line, block_line, "after" })
+  vim.api.nvim_win_set_cursor(0, { 4, 0 })
+
+  local extmark = require("typst-concealer.extmark")
+  local inline_id = 1306
+  local inline_start, inline_end = inline_line:find("$sin(alpha)$", 1, true)
+  local inline_range = { 1, inline_start - 1, 1, inline_end }
+  local inline_semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "math" }
+  local inline_extmark = extmark.place_render_extmark(bufnr, inline_id, inline_range, nil, true, inline_semantics)
+  state.item_by_image_id[inline_id] = {
+    bufnr = bufnr,
+    image_id = inline_id,
+    extmark_id = inline_extmark,
+    range = inline_range,
+    display_range = inline_range,
+    node_type = "math",
+    semantics = inline_semantics,
+    natural_cols = 5,
+    natural_rows = 1,
+  }
+
+  local block_id = 1307
+  local block_start, block_end = block_line:find("$ sin(alpha) $", 1, true)
+  local block_source_range = { 2, block_start - 1, 2, block_end }
+  local block_display_range = { 2, 0, 2, #block_line }
+  local block_semantics = {
+    display_kind = "block",
+    constraint_kind = "intrinsic",
+    source_kind = "math",
+    render_whole_line = true,
+  }
+  local block_extmark = extmark.place_render_extmark(bufnr, block_id, block_display_range, nil, true, block_semantics)
+  state.item_by_image_id[block_id] = {
+    bufnr = bufnr,
+    image_id = block_id,
+    extmark_id = block_extmark,
+    range = block_source_range,
+    display_range = block_display_range,
+    display_prefix = "Hello, world",
+    display_suffix = "hello `hi`",
+    node_type = "math",
+    semantics = block_semantics,
+    natural_cols = 6,
+    natural_rows = 1,
+  }
+
+  extmark.conceal_for_image_id(bufnr, block_id, 6, 1, 1)
+  extmark.conceal_for_image_id(bufnr, inline_id, 5, 1, 1)
+
+  local bs = state.get_buf_state(bufnr)
+  local inline = bs.inline_line_marks[1]
+  assert_truthy(inline ~= nil, "preceding inline math should still get a compact carrier")
+  assert_eq(inline.anchor_row, 0, "preceding inline carrier should anchor above its source row")
+
+  local mm = bs.multiline_marks[block_extmark]
+  assert_truthy(mm ~= nil and mm.is_block_carrier == true, "embedded block should keep a block carrier")
+  local carrier = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, mm.carrier_id, { details = true })
+  assert_eq(mm.carrier_id, inline.carrier_id, "adjacent inline and embedded block rows should share one run carrier")
+  assert_eq(carrier[1], 0, "line-run carrier should anchor outside the rewritten source rows")
+  assert_eq(carrier[3].virt_lines_above, false, "line-run carrier should render after the preceding safe row")
+  assert_truthy(
+    virt_line_text((carrier[3].virt_lines or {})[1] or {}):find("World", 1, true) ~= nil,
+    "line-run carrier should render the preceding inline row first"
+  )
+  assert_truthy(
+    virt_line_text((carrier[3].virt_lines or {})[2] or {}):find("Hello, world", 1, true) ~= nil,
+    "embedded block carrier should still render the prefix"
+  )
+
+  local tail = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, mm.tail_ids[1], { details = true })
+  assert_eq(tail[1], 2, "embedded block source row should still be concealed")
+  assert_eq(tail[3].conceal_lines, "", "embedded block source row should collapse to zero height")
+
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  extmark.sync_inline_line_carriers(bufnr, 1)
+  assert_eq(bs.inline_line_marks[1], nil, "cursor row inline source should expand out of the shared run")
+  carrier = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, mm.carrier_id, { details = true })
+  assert_eq(carrier[1], 3, "remaining embedded block run should re-anchor after the suppressed inline row")
+  assert_eq(carrier[3].virt_lines_above, true, "remaining embedded block run should render before the following row")
+  assert_truthy(
+    virt_line_text((carrier[3].virt_lines or {})[1] or {}):find("Hello, world", 1, true) ~= nil,
+    "embedded block should remain visible while the adjacent inline row is expanded"
+  )
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_display_line_chunks_preserve_native_ui()
+  fresh_state()
+
+  local old_conceallevel = vim.o.conceallevel
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "A abc DEF tail" })
+  vim.cmd("syntax on")
+  vim.cmd("syntax match TypstConcealerTestWord /abc/ conceal cchar=X")
+  vim.api.nvim_set_hl(0, "TypstConcealerTestWord", { fg = "#00ff00" })
+  vim.o.conceallevel = 2
+
+  local ns = vim.api.nvim_create_namespace("typst-concealer-display-test")
+  vim.api.nvim_buf_set_extmark(bufnr, ns, 0, 6, {
+    end_col = 9,
+    conceal = "Y",
+    hl_group = "ErrorMsg",
+  })
+  vim.api.nvim_buf_set_extmark(bufnr, ns, 0, 10, {
+    virt_text = { { "V", "Search" } },
+    virt_text_pos = "inline",
+  })
+  vim.api.nvim_buf_set_extmark(bufnr, ns, 0, 10, {
+    end_col = 14,
+    hl_group = "Search",
+  })
+
+  local chunks = require("typst-concealer.display").line_chunks(bufnr, 0)
+  assert_eq(virt_line_text(chunks), "A X Y Vtail", "display chunks should replay native conceal and inline virt_text")
+
+  local seen = {}
+  for _, chunk in ipairs(chunks) do
+    seen[chunk[1]] = chunk[2]
+    if (chunk[1] or ""):find("V", 1, true) ~= nil then
+      seen.V = chunk[2]
+    end
+    if (chunk[1] or ""):find("tail", 1, true) ~= nil then
+      seen.tail = chunk[2]
+    end
+  end
+  assert_hl_contains(seen.X, "TypstConcealerTestWord", "syntax conceal replacement should keep syntax highlight")
+  assert_hl_contains(seen.Y, "ErrorMsg", "extmark conceal replacement should keep extmark highlight")
+  assert_hl_contains(seen.V, "Search", "inline virtual text should keep its highlight")
+  assert_hl_contains(seen.tail, "Search", "plain text should inherit extmark highlight")
+
+  vim.o.conceallevel = old_conceallevel
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_display_line_chunks_preserve_treesitter_conceal()
+  fresh_state()
+
+  local old_conceallevel = vim.o.conceallevel
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { 'local s = "abc"' })
+  vim.bo[bufnr].filetype = "lua"
+  vim.treesitter.query.set("lua", "highlights", '((string_content) @string.special (#set! conceal "X"))')
+  vim.treesitter.start(bufnr, "lua")
+  vim.cmd("redraw")
+  vim.o.conceallevel = 2
+
+  local chunks = require("typst-concealer.display").line_chunks(bufnr, 0)
+  assert_eq(virt_line_text(chunks), 'local s = "X"', "display chunks should replay tree-sitter conceal")
+
+  local seen_x_hl
+  for _, chunk in ipairs(chunks) do
+    if (chunk[1] or ""):find("X", 1, true) ~= nil then
+      seen_x_hl = chunk[2]
+      break
+    end
+  end
+  assert_truthy(
+    seen_x_hl == "@string.special.lua" or seen_x_hl == "@string.special",
+    "tree-sitter conceal should keep capture highlight"
+  )
+
+  vim.o.conceallevel = old_conceallevel
+  pcall(vim.treesitter.stop, bufnr)
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_display_line_chunks_preserve_neovim_highlight_stack()
+  fresh_state()
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { 'local s = "abc"' })
+  vim.bo[bufnr].filetype = "lua"
+  vim.treesitter.query.set("lua", "highlights", "((string_content) @string.special)")
+  vim.treesitter.start(bufnr, "lua")
+  vim.cmd("redraw")
+
+  local ns = vim.api.nvim_create_namespace("typst-concealer-empty-highlight-test")
+  vim.api.nvim_set_hl(0, "TypstConcealerEmptyHighlight", {})
+  vim.api.nvim_buf_set_extmark(bufnr, ns, 0, 11, {
+    end_col = 14,
+    hl_group = "TypstConcealerEmptyHighlight",
+    priority = 1000,
+  })
+
+  local chunks = require("typst-concealer.display").line_chunks(bufnr, 0)
+  local seen_hl
+  for _, chunk in ipairs(chunks) do
+    if (chunk[1] or ""):find("abc", 1, true) ~= nil then
+      seen_hl = chunk[2]
+      break
+    end
+  end
+  assert_truthy(
+    hl_index(seen_hl, "@string.special.lua") ~= nil or hl_index(seen_hl, "@string.special") ~= nil,
+    "tree-sitter highlight should remain in the Neovim-style highlight stack\nhl_group: " .. vim.inspect(seen_hl)
+  )
+  assert_hl_contains(
+    seen_hl,
+    "TypstConcealerEmptyHighlight",
+    "higher-priority extmark highlight should remain in the Neovim-style highlight stack"
+  )
+  local tree_idx = hl_index(seen_hl, "@string.special.lua") or hl_index(seen_hl, "@string.special")
+  local extmark_idx = hl_index(seen_hl, "TypstConcealerEmptyHighlight")
+  assert_truthy(
+    tree_idx < extmark_idx,
+    "highlight stack should keep lower-priority tree-sitter before higher-priority extmark"
+  )
+
+  pcall(vim.treesitter.stop, bufnr)
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_display_line_chunks_accept_math_conceal_provider()
+  fresh_state()
+
+  local original = package.loaded["math-conceal.render"]
+  package.loaded["math-conceal.render"] = {
+    collect_display_marks = function(bufnr, opts)
+      assert_eq(opts.toprow, 0, "math-conceal provider should receive the target top row")
+      assert_eq(opts.botrow, 0, "math-conceal provider should receive the target bottom row")
+      return {
+        {
+          kind = "conceal",
+          row = 0,
+          col = 2,
+          end_row = 0,
+          end_col = 7,
+          conceal = "alpha",
+          hl_group = "@conceal",
+          priority = 100,
+        },
+      }
+    end,
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "A alpha tail" })
+
+  local chunks = require("typst-concealer.display").line_chunks(bufnr, 0)
+  assert_eq(virt_line_text(chunks), "A alpha tail", "display chunks should replay math-conceal provider marks")
+  assert_eq(chunks[2][2], "@conceal", "math-conceal provider highlight should be preserved")
+
+  package.loaded["math-conceal.render"] = original
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
 local function test_extmark_compacts_inline_images_by_display_width()
   local state = fresh_state()
   package.loaded["typst-concealer"] = {
@@ -6002,6 +6391,161 @@ local function test_extmark_compacts_inline_images_by_display_width()
   local conceal = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, inline.conceal_id, { details = true })
   assert_eq(conceal[3].conceal_lines, "", "compact inline carrier should hide the original source line")
 
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_extmark_inline_math_carrier_reuses_display_composer()
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+      block_padding_cols = 0,
+    },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  local line = "pre $x$ mid `hi` $y$ tail"
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { line, "after" })
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+
+  local code_start, code_end = line:find("`hi`", 1, true)
+  local hl_ns = vim.api.nvim_create_namespace("typst-concealer-inline-math-composer-test")
+  vim.api.nvim_buf_set_extmark(bufnr, hl_ns, 0, code_start - 1, {
+    end_col = code_end,
+    hl_group = "String",
+  })
+
+  local extmark = require("typst-concealer.extmark")
+  local semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "math" }
+  local first_start, first_end = line:find("$x$", 1, true)
+  local second_start, second_end = line:find("$y$", 1, true)
+  local first_range = { 0, first_start - 1, 0, first_end }
+  local second_range = { 0, second_start - 1, 0, second_end }
+  local first_id = 1403
+  local second_id = 1404
+  local first_extmark = extmark.place_render_extmark(bufnr, first_id, first_range, nil, true, semantics)
+  local second_extmark = extmark.place_render_extmark(bufnr, second_id, second_range, nil, true, semantics)
+
+  state.item_by_image_id[first_id] = {
+    bufnr = bufnr,
+    image_id = first_id,
+    extmark_id = first_extmark,
+    range = first_range,
+    display_range = first_range,
+    node_type = "math",
+    semantics = semantics,
+    natural_cols = 2,
+    natural_rows = 1,
+  }
+  state.item_by_image_id[second_id] = {
+    bufnr = bufnr,
+    image_id = second_id,
+    extmark_id = second_extmark,
+    range = second_range,
+    display_range = second_range,
+    node_type = "math",
+    semantics = semantics,
+    natural_cols = 3,
+    natural_rows = 1,
+  }
+
+  extmark.conceal_for_image_id(bufnr, first_id, 2, 1, 1)
+  extmark.conceal_for_image_id(bufnr, second_id, 3, 1, 1)
+
+  local inline = state.get_buf_state(bufnr).inline_line_marks[0]
+  assert_truthy(inline ~= nil, "inline math row should get the shared compact carrier")
+  local carrier = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, inline.carrier_id, { details = true })
+  local virt_lines = carrier[3].virt_lines or {}
+  local rendered = {}
+  local code_hl
+  local image_cols = 0
+  for _, virt_line in ipairs(virt_lines) do
+    for _, chunk in ipairs(virt_line) do
+      rendered[#rendered + 1] = chunk[1] or ""
+      if chunk[1] == "h" then
+        code_hl = chunk[2]
+      end
+      if
+        chunk[2] == "typst-concealer-image-id-" .. tostring(first_id)
+        or chunk[2] == "typst-concealer-image-id-" .. tostring(second_id)
+      then
+        image_cols = image_cols + vim.fn.strdisplaywidth(chunk[1] or "")
+      end
+    end
+  end
+  local rendered_text = table.concat(rendered)
+  assert_truthy(rendered_text:find("$x$", 1, true) == nil, "composer should replace the first inline formula source")
+  assert_truthy(rendered_text:find("$y$", 1, true) == nil, "composer should replace the second inline formula source")
+  assert_truthy(rendered_text:find("pre ", 1, true) ~= nil, "composer should preserve text before inline formulas")
+  assert_truthy(
+    rendered_text:find(" mid `hi` ", 1, true) ~= nil,
+    "composer should preserve text between inline formulas"
+  )
+  assert_truthy(rendered_text:find(" tail", 1, true) ~= nil, "composer should preserve text after inline formulas")
+  assert_eq(image_cols, 5, "composer wrapping should account for rendered math image width")
+  assert_hl_contains(code_hl, "String", "inline math carrier should replay surrounding native highlights")
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_extmark_inline_carrier_replays_native_ui()
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+      block_padding_cols = 0,
+    },
+  }
+
+  local old_conceallevel = vim.o.conceallevel
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  local source = string.rep("x", 20)
+  local line = "A abc " .. source .. " DEF"
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { line, "after" })
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  vim.cmd("syntax on")
+  vim.cmd("syntax match TypstConcealerCarrierWord /abc/ conceal cchar=X")
+  vim.api.nvim_set_hl(0, "TypstConcealerCarrierWord", { fg = "#00ff00" })
+  vim.o.conceallevel = 2
+
+  local other_ns = vim.api.nvim_create_namespace("typst-concealer-carrier-native-test")
+  vim.api.nvim_buf_set_extmark(bufnr, other_ns, 0, #("A abc " .. source .. " "), {
+    end_col = #line,
+    conceal = "Y",
+    hl_group = "ErrorMsg",
+  })
+
+  local extmark = require("typst-concealer.extmark")
+  local semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "code" }
+  local range = { 0, 6, 0, 6 + #source }
+  local image_id = 1402
+  local extmark_id = extmark.place_render_extmark(bufnr, image_id, range, nil, true, semantics)
+  state.item_by_image_id[image_id] = {
+    bufnr = bufnr,
+    image_id = image_id,
+    extmark_id = extmark_id,
+    range = range,
+    display_range = range,
+    node_type = "code",
+    semantics = semantics,
+    natural_cols = 2,
+    natural_rows = 1,
+  }
+
+  extmark.conceal_for_image_id(bufnr, image_id, 2, 1, 1)
+
+  local inline = state.get_buf_state(bufnr).inline_line_marks[0]
+  assert_truthy(inline ~= nil, "inline line should get a compact carrier")
+  local carrier = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, inline.carrier_id, { details = true })
+  local rendered = virt_line_text((carrier[3].virt_lines or {})[1] or {})
+  assert_truthy(rendered:find("X", 1, true) ~= nil, "compact carrier should replay syntax conceal")
+  assert_truthy(rendered:find("Y", 1, true) ~= nil, "compact carrier should replay extmark conceal")
+  assert_truthy(rendered:find("abc", 1, true) == nil, "compact carrier should not show concealed syntax source")
+  assert_truthy(rendered:find("DEF", 1, true) == nil, "compact carrier should not show concealed extmark source")
+
+  vim.o.conceallevel = old_conceallevel
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
@@ -7542,12 +8086,44 @@ local tests = {
     "ok extmark collapses wrapping single-line block source",
   },
   {
+    test_extmark_embedded_block_math_uses_display_composer,
+    "ok extmark embedded block math uses display composer",
+  },
+  {
+    test_extmark_embedded_block_math_avoids_inline_source_anchor,
+    "ok extmark embedded block math avoids inline source anchors",
+  },
+  {
     test_extmark_scales_wide_block_images_to_window_width,
     "ok extmark scales wide block images to window width",
   },
   {
+    test_display_line_chunks_preserve_native_ui,
+    "ok display line chunks preserve native UI",
+  },
+  {
+    test_display_line_chunks_preserve_treesitter_conceal,
+    "ok display line chunks preserve tree-sitter conceal",
+  },
+  {
+    test_display_line_chunks_preserve_neovim_highlight_stack,
+    "ok display line chunks preserve Neovim highlight stack",
+  },
+  {
+    test_display_line_chunks_accept_math_conceal_provider,
+    "ok display line chunks accept math-conceal provider",
+  },
+  {
     test_extmark_compacts_inline_images_by_display_width,
     "ok extmark compacts inline images by display width",
+  },
+  {
+    test_extmark_inline_math_carrier_reuses_display_composer,
+    "ok extmark inline math carrier reuses display composer",
+  },
+  {
+    test_extmark_inline_carrier_replays_native_ui,
+    "ok extmark inline carrier replays native UI",
   },
   {
     test_extmark_inline_carrier_does_not_anchor_across_block_conceal,
