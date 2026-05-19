@@ -47,6 +47,7 @@ local function reset_modules()
   package.loaded["typst-concealer.cursor-visibility"] = nil
   package.loaded["typst-concealer.display"] = nil
   package.loaded["typst-concealer.extmark"] = nil
+  package.loaded["typst-concealer.line-run"] = nil
   package.loaded["typst-concealer.session"] = nil
   package.loaded["typst-concealer.project-scope"] = nil
   package.loaded["typst-concealer.machine.types"] = nil
