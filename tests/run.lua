@@ -7497,6 +7497,107 @@ local function test_extmark_clears_shifted_inline_compact_carriers()
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
+local function test_extmark_line_run_reconcile_skips_unchanged_state()
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+      block_padding_cols = 0,
+    },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "A $x$ tail", "after" })
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+
+  local extmark = require("typst-concealer.extmark")
+  local line_run = require("typst-concealer.line-run")
+  local semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "math" }
+  local image_id = 1420
+  local range = { 0, 2, 0, 5 }
+  local extmark_id = extmark.place_render_extmark(bufnr, image_id, range, nil, true, semantics)
+  state.item_by_image_id[image_id] = {
+    bufnr = bufnr,
+    image_id = image_id,
+    extmark_id = extmark_id,
+    range = range,
+    display_range = range,
+    node_type = "math",
+    semantics = semantics,
+    natural_cols = 2,
+    natural_rows = 1,
+  }
+  extmark.conceal_for_image_id(bufnr, image_id, 2, 1, 1)
+
+  local original_refresh = line_run.refresh_for_row
+  local calls = 0
+  line_run.refresh_for_row = function(...)
+    calls = calls + 1
+    return original_refresh(...)
+  end
+
+  extmark.reconcile_cursor_line_runs(bufnr, 0, 0)
+  local first_calls = calls
+  assert_truthy(first_calls > 0, "first cursor reconcile should refresh affected rows")
+  assert_eq(extmark.reconcile_cursor_line_runs(bufnr, 0, 0), false, "unchanged cursor reconcile should short-circuit")
+  assert_eq(calls, first_calls, "unchanged cursor reconcile should not refresh rows again")
+
+  line_run.refresh_for_row = original_refresh
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_extmark_line_run_reconcile_refreshes_each_row_once()
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+      block_padding_cols = 0,
+    },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "A $x$ tail", "cursor", "after" })
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+
+  local extmark = require("typst-concealer.extmark")
+  local line_run = require("typst-concealer.line-run")
+  local semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "math" }
+  local image_id = 1421
+  local range = { 0, 2, 0, 5 }
+  local extmark_id = extmark.place_render_extmark(bufnr, image_id, range, nil, true, semantics)
+  state.item_by_image_id[image_id] = {
+    bufnr = bufnr,
+    image_id = image_id,
+    extmark_id = extmark_id,
+    range = range,
+    display_range = range,
+    node_type = "math",
+    semantics = semantics,
+    natural_cols = 2,
+    natural_rows = 1,
+  }
+  extmark.conceal_for_image_id(bufnr, image_id, 2, 1, 1)
+
+  local bs = state.get_buf_state(bufnr)
+  bs.inline_line_suppressed_rows = { [0] = true }
+  bs.inline_line_reconcile_key = nil
+
+  local original_refresh = line_run.refresh_for_row
+  local calls_by_row = {}
+  line_run.refresh_for_row = function(_, row, ...)
+    calls_by_row[row] = (calls_by_row[row] or 0) + 1
+    return original_refresh(bufnr, row, ...)
+  end
+
+  extmark.reconcile_cursor_line_runs(bufnr, 1, 1)
+  assert_eq(calls_by_row[0], 1, "row present in previous suppressed set and neighbor range should refresh once")
+
+  line_run.refresh_for_row = original_refresh
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
 local function test_cursor_visibility_preserves_insert_math_after_stale_range()
   fresh_state()
   package.loaded["typst-concealer"] = {
@@ -8898,6 +8999,14 @@ local tests = {
   {
     test_extmark_clears_shifted_inline_compact_carriers,
     "ok extmark clears shifted inline compact carriers",
+  },
+  {
+    test_extmark_line_run_reconcile_skips_unchanged_state,
+    "ok extmark line-run reconcile skips unchanged state",
+  },
+  {
+    test_extmark_line_run_reconcile_refreshes_each_row_once,
+    "ok extmark line-run reconcile refreshes each row once",
   },
   {
     test_cursor_visibility_preserves_insert_math_after_stale_range,

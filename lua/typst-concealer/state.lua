@@ -251,6 +251,7 @@ end
 --- @param bufnr integer
 function M.invalidate_hover(bufnr)
   local bs = M.get_buf_state(bufnr)
+  bs.inline_line_reconcile_key = nil
   if bs.hover ~= nil then
     bs.hover.invalidated = true
   end

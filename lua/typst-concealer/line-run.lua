@@ -110,6 +110,7 @@ end
 
 function M.clear(bufnr, run_id)
   local bs = state.get_buf_state(bufnr)
+  bs.inline_line_reconcile_key = nil
   local runs = bs.line_run_marks or {}
   local run = runs[run_id]
   if run == nil then
@@ -156,6 +157,7 @@ end
 
 function M.clear_inline_line_mark(bufnr, row)
   local bs = state.get_buf_state(bufnr)
+  bs.inline_line_reconcile_key = nil
   local marks = bs.inline_line_marks or {}
   local mark = marks[row]
   if mark == nil then
@@ -471,6 +473,8 @@ function M.refresh_for_row(bufnr, row, opts)
     return false
   end
 
+  state.get_buf_state(bufnr).inline_line_reconcile_key = nil
+
   if not line_run_row_ready(bufnr, row, opts) then
     clear_line_runs_in_range(bufnr, row, row)
     return false
@@ -638,6 +642,31 @@ local function attach_inline_images_for_rows(bufnr, rows, opts)
   end
 end
 
+local function row_set_key(rows)
+  local keys = {}
+  for row in pairs(rows or {}) do
+    keys[#keys + 1] = tonumber(row) or row
+  end
+  table.sort(keys)
+  for idx, row in ipairs(keys) do
+    keys[idx] = tostring(row)
+  end
+  return table.concat(keys, ",")
+end
+
+local function hidden_extmarks_key(bs)
+  return row_set_key(bs.currently_hidden_extmark_ids or {})
+end
+
+local function reconcile_key(bufnr, bs, rows)
+  return table.concat({
+    row_set_key(rows),
+    hidden_extmarks_key(bs),
+    tostring(vim.api.nvim_buf_get_changedtick(bufnr)),
+    tostring(get_win_text_cols(bufnr)),
+  }, "|")
+end
+
 function M.reconcile_cursor_line_runs(bufnr, lo, hi, opts)
   if type(lo) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
     return
@@ -652,6 +681,12 @@ function M.reconcile_cursor_line_runs(bufnr, lo, hi, opts)
   for row = lo, hi do
     next_rows[row] = true
   end
+
+  local next_key = reconcile_key(bufnr, bs, next_rows)
+  if bs.inline_line_reconcile_key == next_key then
+    return false
+  end
+
   bs.inline_line_suppressed_rows = next_rows
   restore_line_attachments(bufnr, next_rows, opts)
 
@@ -660,9 +695,18 @@ function M.reconcile_cursor_line_runs(bufnr, lo, hi, opts)
   end
   attach_inline_images_for_rows(bufnr, next_rows, opts)
 
+  local refreshed_rows = {}
+  local function refresh_once(row, refresh_opts)
+    if refreshed_rows[row] then
+      return nil
+    end
+    refreshed_rows[row] = true
+    return M.refresh_for_row(bufnr, row, refresh_opts)
+  end
+
   for row in pairs(previous) do
     if not next_rows[row] then
-      M.refresh_for_row(bufnr, row, {
+      refresh_once(row, {
         ignore_cursor = true,
         anchor_rows = next_rows,
         suppressed_rows = next_rows,
@@ -673,12 +717,15 @@ function M.reconcile_cursor_line_runs(bufnr, lo, hi, opts)
   local line_count = vim.api.nvim_buf_line_count(bufnr)
   for row = math.max(0, lo - 1), math.min(line_count - 1, hi + 1) do
     if not next_rows[row] then
-      M.refresh_for_row(bufnr, row, {
+      refresh_once(row, {
         anchor_rows = next_rows,
         suppressed_rows = next_rows,
       })
     end
   end
+
+  bs.inline_line_reconcile_key = next_key
+  return true
 end
 
 return M
