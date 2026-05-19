@@ -19,6 +19,13 @@ local function get_win_cols(bufnr)
   return vim.api.nvim_win_get_width(winid ~= -1 and winid or 0)
 end
 
+local function buf_win(bufnr)
+  local winid = vim.fn.bufwinid(bufnr)
+  if winid ~= -1 and vim.api.nvim_win_is_valid(winid) then
+    return winid
+  end
+end
+
 local function get_win_text_cols(bufnr)
   local winid = vim.fn.bufwinid(bufnr)
   local width = get_win_cols(bufnr)
@@ -395,12 +402,16 @@ local function build_line_run_row(bufnr, row, opts)
     return nil
   end
 
-  local lines = display.line_virt_lines(bufnr, row, replacements, get_win_text_cols(bufnr), {
+  local display_opts = {
     exclude_namespaces = {
       [state.ns_id] = true,
       [state.ns_id2] = true,
     },
-  })
+    math_conceal = opts.math_conceal,
+    math_conceal_marks_by_row = opts.math_conceal_marks_by_row,
+    winid = opts.winid,
+  }
+  local lines = display.line_virt_lines(bufnr, row, replacements, get_win_text_cols(bufnr), display_opts)
   if lines == nil then
     return nil
   end
@@ -501,8 +512,19 @@ function M.refresh_for_row(bufnr, row, opts)
   local display_lines = {}
   local inline_rows = {}
   local block_extmark_ids = {}
+  local build_opts = opts
+  if opts.math_conceal ~= false and type(opts.math_conceal_marks_by_row) ~= "table" then
+    local winid = buf_win(bufnr)
+    local marks_by_row = display.collect_math_conceal_marks_by_row(bufnr, start_row, end_row, {
+      winid = winid,
+    }) or {}
+    build_opts = vim.tbl_extend("force", opts, {
+      math_conceal_marks_by_row = marks_by_row,
+      winid = winid,
+    })
+  end
   for run_row = start_row, end_row do
-    local row_lines, meta = build_line_run_row(bufnr, run_row, opts)
+    local row_lines, meta = build_line_run_row(bufnr, run_row, build_opts)
     if row_lines == nil then
       return false
     end

@@ -6992,19 +6992,21 @@ local function test_display_line_chunks_accept_math_conceal_provider()
 
   local original = package.loaded["math-conceal.render"]
   package.loaded["math-conceal.render"] = {
-    collect_display_marks = function(bufnr, opts)
+    collect_display_marks_by_row = function(bufnr, opts)
       assert_eq(opts.toprow, 0, "math-conceal provider should receive the target top row")
       assert_eq(opts.botrow, 0, "math-conceal provider should receive the target bottom row")
       return {
-        {
-          kind = "conceal",
-          row = 0,
-          col = 2,
-          end_row = 0,
-          end_col = 7,
-          conceal = "alpha",
-          hl_group = "@conceal",
-          priority = 100,
+        [0] = {
+          {
+            kind = "conceal",
+            row = 0,
+            col = 2,
+            end_row = 0,
+            end_col = 7,
+            conceal = "alpha",
+            hl_group = "@conceal",
+            priority = 100,
+          },
         },
       }
     end,
@@ -7017,6 +7019,65 @@ local function test_display_line_chunks_accept_math_conceal_provider()
   local chunks = require("typst-concealer.display").line_chunks(bufnr, 0)
   assert_eq(virt_line_text(chunks), "A alpha tail", "display chunks should replay math-conceal provider marks")
   assert_eq(chunks[2][2], "@conceal", "math-conceal provider highlight should be preserved")
+
+  package.loaded["math-conceal.render"] = original
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_line_run_batches_math_conceal_provider()
+  local state = fresh_state()
+
+  local original = package.loaded["math-conceal.render"]
+  local calls = {}
+  package.loaded["math-conceal.render"] = {
+    collect_display_marks_by_row = function(bufnr, opts)
+      calls[#calls + 1] = {
+        bufnr = bufnr,
+        toprow = opts.toprow,
+        botrow = opts.botrow,
+        winid = opts.winid,
+      }
+      return {
+        [0] = {},
+        [1] = {},
+      }
+    end,
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "A alpha tail", "B beta tail", "after" })
+  vim.api.nvim_win_set_cursor(0, { 3, 0 })
+
+  local semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "math" }
+  state.item_by_image_id[7101] = {
+    bufnr = bufnr,
+    image_id = 7101,
+    extmark_id = 8101,
+    range = { 0, 2, 0, 7 },
+    display_range = { 0, 2, 0, 7 },
+    node_type = "math",
+    semantics = semantics,
+    natural_cols = 2,
+    natural_rows = 1,
+  }
+  state.item_by_image_id[7102] = {
+    bufnr = bufnr,
+    image_id = 7102,
+    extmark_id = 8102,
+    range = { 1, 2, 1, 6 },
+    display_range = { 1, 2, 1, 6 },
+    node_type = "math",
+    semantics = semantics,
+    natural_cols = 2,
+    natural_rows = 1,
+  }
+
+  require("typst-concealer.line-run").refresh_for_row(bufnr, 0)
+
+  assert_eq(#calls, 1, "line-run refresh should batch math-conceal collection for the whole run")
+  assert_eq(calls[1].toprow, 0, "batched math-conceal collection should start at the run start")
+  assert_eq(calls[1].botrow, 1, "batched math-conceal collection should end at the run end")
 
   package.loaded["math-conceal.render"] = original
   vim.api.nvim_buf_delete(bufnr, { force = true })
@@ -8971,6 +9032,10 @@ local tests = {
   {
     test_display_line_chunks_accept_math_conceal_provider,
     "ok display line chunks accept math-conceal provider",
+  },
+  {
+    test_line_run_batches_math_conceal_provider,
+    "ok line-run batches math-conceal provider calls",
   },
   {
     test_extmark_compacts_inline_images_by_display_width,

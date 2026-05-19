@@ -501,16 +501,15 @@ local function collect_math_conceal_ops(bufnr, row, line, opts, operations)
     return
   end
 
-  local ok, render = pcall(require, "math-conceal.render")
-  if not ok or type(render.collect_display_marks) ~= "function" then
-    return
+  local marks
+  local marks_by_row = opts and opts.math_conceal_marks_by_row
+  if type(marks_by_row) == "table" then
+    marks = marks_by_row[row] or {}
+  else
+    local collected = M.collect_math_conceal_marks_by_row(bufnr, row, row, opts)
+    marks = collected and collected[row] or {}
   end
-
-  local ok_marks, marks = pcall(render.collect_display_marks, bufnr, {
-    toprow = row,
-    botrow = row,
-  })
-  if not ok_marks or type(marks) ~= "table" then
+  if type(marks) ~= "table" then
     return
   end
 
@@ -525,6 +524,32 @@ local function collect_math_conceal_ops(bufnr, row, line, opts, operations)
       })
     end
   end
+end
+
+function M.collect_math_conceal_marks_by_row(bufnr, start_row, end_row, opts)
+  if opts and opts.math_conceal == false then
+    return nil
+  end
+
+  local ok, render = pcall(require, "math-conceal.render")
+  if not ok or type(render.collect_display_marks_by_row) ~= "function" then
+    return nil
+  end
+
+  local query_opts = {
+    toprow = start_row,
+    botrow = end_row,
+  }
+  local winid = opts and opts.winid or buf_win(bufnr)
+  if winid ~= nil then
+    query_opts.winid = winid
+  end
+
+  local ok_marks, marks = pcall(render.collect_display_marks_by_row, bufnr, query_opts)
+  if not ok_marks or type(marks) ~= "table" then
+    return nil
+  end
+  return marks
 end
 
 local function collect_operations(bufnr, row, line, replacements, opts)
