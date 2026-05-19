@@ -150,6 +150,7 @@ end
 local clear_line_run
 local refresh_inline_line
 local refresh_line_run_for_row
+local conceal_extmark_with_image
 
 local function get_win_text_cols(bufnr)
   local winid = vim.fn.bufwinid(bufnr)
@@ -260,6 +261,26 @@ function M.clear_inline_line_marks(bufnr, start_row, end_row)
       cleared = cleared + 1
     end
   end
+
+  local attachments = bs.inline_line_attachment_marks or {}
+  local attachment_extmark_ids = {}
+  for extmark_id, meta in pairs(attachments) do
+    if
+      row_in_range(meta.row, start_row, end_row)
+      or row_in_range(extmark_row(bufnr, state.ns_id2, meta.attach_id), start_row, end_row)
+    then
+      attachment_extmark_ids[#attachment_extmark_ids + 1] = extmark_id
+    end
+  end
+  for _, extmark_id in ipairs(attachment_extmark_ids) do
+    local meta = attachments[extmark_id]
+    if meta and meta.attach_id ~= nil then
+      pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id2, meta.attach_id)
+    end
+    attachments[extmark_id] = nil
+  end
+  bs.inline_line_attachment_marks = attachments
+
   return cleared
 end
 
@@ -307,6 +328,144 @@ local function collect_inline_line_items(bufnr, row)
     last_end = item.range[4]
   end
   return items
+end
+
+local function item_for_extmark_id(bufnr, extmark_id)
+  if type(extmark_id) ~= "number" then
+    return nil
+  end
+  for _, item in pairs(state.item_by_image_id) do
+    if
+      item ~= nil
+      and item_display_bufnr(item) == bufnr
+      and (item.extmark_id == extmark_id or state.image_id_to_extmark[item.image_id] == extmark_id)
+    then
+      return item
+    end
+  end
+end
+
+local function image_placeholder_text(display_cols, image_row)
+  local line = ""
+  for col = 0, display_cols - 1 do
+    line = line .. kitty_codes.placeholder .. kitty_codes.diacritics[image_row] .. kitty_codes.diacritics[col + 1]
+  end
+  return line
+end
+
+local function clear_inline_line_attachment(bufnr, extmark_id)
+  local bs = state.get_buf_state(bufnr)
+  local attachments = bs.inline_line_attachment_marks or {}
+  local meta = attachments[extmark_id]
+  if meta == nil then
+    return nil
+  end
+  if meta.attach_id ~= nil then
+    pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id2, meta.attach_id)
+  end
+  attachments[extmark_id] = nil
+  bs.inline_line_attachment_marks = attachments
+  return meta
+end
+
+local function set_inline_source_conceal_only(bufnr, extmark_id)
+  local ok, mark = pcall(vim.api.nvim_buf_get_extmark_by_id, bufnr, state.ns_id, extmark_id, { details = true })
+  if not ok or mark == nil or #mark == 0 then
+    return nil
+  end
+
+  local row, col, opts = mark[1], mark[2], mark[3] or {}
+  vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
+    id = extmark_id,
+    virt_text = { { "" } },
+    virt_text_pos = opts.virt_text_pos or "inline",
+    conceal = "",
+    invalidate = opts.invalidate,
+    end_col = opts.end_col,
+    end_row = opts.end_row,
+  })
+  return {
+    row = row,
+    end_col = opts.end_col,
+  }
+end
+
+local function attach_inline_image_after_source(bufnr, item, extmark_id, natural_cols, natural_rows)
+  if item == nil or type(item.range) ~= "table" or item.range[1] ~= item.range[3] then
+    return false
+  end
+  local bs = state.get_buf_state(bufnr)
+  if bs.currently_hidden_extmark_ids and bs.currently_hidden_extmark_ids[extmark_id] then
+    return false
+  end
+  if cursor_visibility.should_preserve_source_at_cursor(bufnr, item) then
+    return false
+  end
+
+  local display_cols, display_rows = display_size_for_image(item, natural_cols, natural_rows)
+  if display_rows ~= 1 then
+    return false
+  end
+  item.display_cols = display_cols
+  item.display_rows = display_rows
+
+  local source = set_inline_source_conceal_only(bufnr, extmark_id)
+  if source == nil then
+    return false
+  end
+
+  clear_inline_line_attachment(bufnr, extmark_id)
+  local attach_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, item.range[1], item.range[4], {
+    virt_text = {
+      {
+        image_placeholder_text(display_cols, 1),
+        image_hl_group(item.image_id),
+      },
+    },
+    virt_text_pos = "inline",
+    invalidate = true,
+  })
+
+  bs.inline_line_attachment_marks = bs.inline_line_attachment_marks or {}
+  bs.inline_line_attachment_marks[extmark_id] = {
+    row = item.range[1],
+    image_id = item.image_id,
+    attach_id = attach_id,
+  }
+  return true
+end
+
+local function restore_row_attached_extmark(bufnr, extmark_id)
+  local meta = clear_inline_line_attachment(bufnr, extmark_id)
+  if meta == nil then
+    return false
+  end
+
+  local bs = state.get_buf_state(bufnr)
+  if bs.currently_hidden_extmark_ids and bs.currently_hidden_extmark_ids[extmark_id] then
+    return false
+  end
+
+  local item = item_for_extmark_id(bufnr, extmark_id)
+  if item == nil or item.natural_cols == nil or item.natural_rows == nil then
+    return false
+  end
+
+  local range = item.range or item.display_range
+  local source_rows = item.source_rows
+  if source_rows == nil and type(range) == "table" then
+    source_rows = (range[3] or range[1]) - range[1] + 1
+  end
+  conceal_extmark_with_image(
+    bufnr,
+    extmark_id,
+    item.image_id,
+    item.natural_cols,
+    item.natural_rows,
+    source_rows or 1,
+    item
+  )
+  return true
 end
 
 local function row_has_render_item(bufnr, row)
@@ -734,6 +893,33 @@ local function refresh_line_runs_around_range(bufnr, start_row, end_row, opts)
   end
 end
 
+local function restore_line_attachments(bufnr, next_rows)
+  local bs = state.get_buf_state(bufnr)
+  local attachments = bs.inline_line_attachment_marks or {}
+  for extmark_id, meta in pairs(vim.deepcopy(attachments)) do
+    if not (next_rows and next_rows[meta.row]) then
+      restore_row_attached_extmark(bufnr, extmark_id)
+    end
+  end
+end
+
+local function attach_inline_images_for_rows(bufnr, rows)
+  if rows == nil then
+    return
+  end
+
+  local bs = state.get_buf_state(bufnr)
+  bs.inline_line_attachment_marks = bs.inline_line_attachment_marks or {}
+  for row in pairs(rows) do
+    for _, item in ipairs(collect_inline_line_items(bufnr, row)) do
+      local extmark_id = item.extmark_id or state.image_id_to_extmark[item.image_id]
+      if extmark_id ~= nil then
+        attach_inline_image_after_source(bufnr, item, extmark_id, item.natural_cols, item.natural_rows)
+      end
+    end
+  end
+end
+
 local place_image_extmark
 
 --- Clamp a range to the current buffer contents so extmark updates survive edits.
@@ -947,6 +1133,7 @@ end
 --- @return boolean|nil
 function M.unconceal_extmark(bufnr, extmark_id)
   local bs = state.get_buf_state(bufnr)
+  clear_inline_line_attachment(bufnr, extmark_id)
   local ok_mark, current_mark =
     pcall(vim.api.nvim_buf_get_extmark_by_id, bufnr, state.ns_id, extmark_id, { details = true })
   local source_start_row = nil
@@ -1045,10 +1232,12 @@ function M.sync_inline_line_carriers(bufnr, lo, hi)
     next_rows[row] = true
   end
   bs.inline_line_suppressed_rows = next_rows
+  restore_line_attachments(bufnr, next_rows)
 
   for row = lo, hi do
     clear_inline_line_mark(bufnr, row)
   end
+  attach_inline_images_for_rows(bufnr, next_rows)
 
   for row in pairs(previous) do
     if not next_rows[row] then
@@ -1214,15 +1403,7 @@ end
 --- @param natural_rows integer
 --- @param source_rows integer
 --- @param item table|nil
-local function conceal_extmark_with_image(
-  bufnr,
-  extmark_id,
-  render_image_id,
-  natural_cols,
-  natural_rows,
-  source_rows,
-  item
-)
+conceal_extmark_with_image = function(bufnr, extmark_id, render_image_id, natural_cols, natural_rows, source_rows, item)
   local bs = state.get_buf_state(bufnr)
   if type(extmark_id) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
     return
@@ -1389,6 +1570,10 @@ function M.conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, sou
   local extmark_id = state.image_id_to_extmark[image_id]
   local bs = state.get_buf_state(bufnr)
   local item = state.get_item_by_image_id(image_id)
+  if extmark_id ~= nil and bs.inline_line_attachment_marks and bs.inline_line_attachment_marks[extmark_id] then
+    attach_inline_image_after_source(bufnr, item, extmark_id, natural_cols, natural_rows)
+    return
+  end
   if extmark_id ~= nil and cursor_visibility.should_preserve_source_at_cursor(bufnr, item) then
     if M.unconceal_extmark(bufnr, extmark_id) ~= nil then
       bs.currently_hidden_extmark_ids[extmark_id] = true

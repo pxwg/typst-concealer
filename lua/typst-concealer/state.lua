@@ -108,6 +108,7 @@ function M.get_buf_state(bufnr)
       line_run_by_extmark = {},
       next_line_run_id = 0,
       inline_line_suppressed_rows = {},
+      inline_line_attachment_marks = {},
       hover = {
         last_cursor_row = nil,
         last_cursor_col = nil,
@@ -333,6 +334,13 @@ function M.prepare_extmark_reuse(bufnr, extmark_id)
     bs.multiline_marks[extmark_id] = nil
   end
   bs.currently_hidden_extmark_ids[extmark_id] = nil
+  if bs.inline_line_attachment_marks then
+    local attachment = bs.inline_line_attachment_marks[extmark_id]
+    if attachment and attachment.attach_id then
+      pcall(vim.api.nvim_buf_del_extmark, bufnr, M.ns_id2, attachment.attach_id)
+    end
+    bs.inline_line_attachment_marks[extmark_id] = nil
+  end
 end
 
 return M

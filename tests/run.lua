@@ -6945,9 +6945,37 @@ local function test_extmark_inline_compact_carrier_follows_cursor_row()
 
   extmark.sync_inline_line_carriers(bufnr, 0)
   assert_eq(bs.inline_line_marks[0], nil, "compact carrier should clear while the cursor is on its row")
+  assert_truthy(bs.inline_line_attachment_marks[extmark_id] ~= nil, "cursor row should attach the image after source")
+  local source_mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, extmark_id, { details = true })
+  assert_eq(source_mark[3].conceal, "", "cursor row source extmark should still conceal source")
+  assert_truthy(
+    source_mark[3].virt_text == nil or source_mark[3].virt_text[1] == nil or source_mark[3].virt_text[1][1] == "",
+    "cursor row source extmark should not render the image placeholder at source start"
+  )
+  local attachment = bs.inline_line_attachment_marks[extmark_id]
+  local attachment_mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, attachment.attach_id, {
+    details = true,
+  })
+  assert_eq(attachment_mark[1], 0, "cursor row image attachment should stay on the source row")
+  assert_eq(attachment_mark[2], range[4], "cursor row image attachment should be placed after source")
+  assert_truthy(
+    attachment_mark[3].virt_text ~= nil and attachment_mark[3].virt_text[1] ~= nil,
+    "cursor row image attachment should render the image placeholder"
+  )
+
+  extmark.conceal_for_image_id(bufnr, image_id, 2, 1, 1)
+  source_mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, extmark_id, { details = true })
+  assert_eq(source_mark[3].conceal, "", "image refresh should keep the cursor row source concealed")
 
   extmark.sync_inline_line_carriers(bufnr, 1)
   assert_truthy(bs.inline_line_marks[0] ~= nil, "compact carrier should restore after cursor leaves its row")
+  assert_eq(bs.inline_line_attachment_marks[extmark_id], nil, "leaving the row should clear row image attachment")
+  source_mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id, extmark_id, { details = true })
+  assert_eq(source_mark[3].conceal, "", "leaving the row should restore source extmark conceal")
+  assert_truthy(
+    source_mark[3].virt_text ~= nil and source_mark[3].virt_text[1] ~= nil and source_mark[3].virt_text[1][1] ~= "",
+    "leaving the row should restore the inline image placeholder"
+  )
 
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
