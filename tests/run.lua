@@ -222,19 +222,21 @@ local function with_stubbed_extmark(fn)
         height = height,
       }
     end,
-    conceal_for_image_id = function(bufnr, image_id, natural_cols, natural_rows, source_rows)
+    conceal_for_image_id = function(bufnr, image_id, natural_cols, natural_rows, source_rows, opts)
       calls.concealed[#calls.concealed + 1] = {
         bufnr = bufnr,
         image_id = image_id,
         natural_cols = natural_cols,
         natural_rows = natural_rows,
         source_rows = source_rows,
+        opts = opts,
       }
     end,
-    unconceal_extmark = function(bufnr, extmark_id)
+    unconceal_extmark = function(bufnr, extmark_id, opts)
       calls.unconcealed[#calls.unconcealed + 1] = {
         bufnr = bufnr,
         extmark_id = extmark_id,
+        opts = opts,
       }
       return true
     end,
@@ -7024,6 +7026,43 @@ local function test_display_line_chunks_accept_math_conceal_provider()
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
+local function test_display_line_chunks_skip_replaced_source_highlights()
+  fresh_state()
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "A hidden tail" })
+
+  local original_inspect = vim.inspect_pos
+  local inspected_cols = {}
+  vim.inspect_pos = function(...)
+    local col = select(3, ...)
+    inspected_cols[#inspected_cols + 1] = col
+    return original_inspect(...)
+  end
+
+  local chunks = require("typst-concealer.display").line_chunks(bufnr, 0, {
+    {
+      start_col = 2,
+      end_col = 8,
+      priority = 10000,
+      chunks = { { "IMG", "TypstConcealerTestImage" } },
+    },
+  })
+
+  vim.inspect_pos = original_inspect
+
+  assert_eq(virt_line_text(chunks), "A IMG tail", "display chunks should replace the covered source range")
+  for _, col in ipairs(inspected_cols) do
+    assert_truthy(
+      col < 2 or col >= 8,
+      "display chunks should not inspect highlights inside replaced source ranges\ncol: " .. tostring(col)
+    )
+  end
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
 local function test_line_run_batches_math_conceal_provider()
   local state = fresh_state()
 
@@ -7080,6 +7119,47 @@ local function test_line_run_batches_math_conceal_provider()
   assert_eq(calls[1].botrow, 1, "batched math-conceal collection should end at the run end")
 
   package.loaded["math-conceal.render"] = original
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_line_run_refresh_reports_expanded_range()
+  local state = fresh_state()
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "A alpha tail", "B beta tail", "after" })
+  vim.api.nvim_win_set_cursor(0, { 3, 0 })
+
+  local semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "math" }
+  state.item_by_image_id[7201] = {
+    bufnr = bufnr,
+    image_id = 7201,
+    extmark_id = 8201,
+    range = { 0, 2, 0, 7 },
+    display_range = { 0, 2, 0, 7 },
+    node_type = "math",
+    semantics = semantics,
+    natural_cols = 2,
+    natural_rows = 1,
+  }
+  state.item_by_image_id[7202] = {
+    bufnr = bufnr,
+    image_id = 7202,
+    extmark_id = 8202,
+    range = { 1, 2, 1, 6 },
+    display_range = { 1, 2, 1, 6 },
+    node_type = "math",
+    semantics = semantics,
+    natural_cols = 2,
+    natural_rows = 1,
+  }
+
+  local ok_refresh, start_row, end_row = require("typst-concealer.line-run").refresh_for_row(bufnr, 0)
+
+  assert_eq(ok_refresh, true, "line-run refresh should build a compact run")
+  assert_eq(start_row, 0, "line-run refresh should report the expanded start row")
+  assert_eq(end_row, 1, "line-run refresh should report the expanded end row")
+
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
@@ -8411,6 +8491,128 @@ local function test_formula_cursor_fast_boundary_switch_only_touches_previous_an
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
+local function test_runtime_sync_cursor_ui_batches_formula_line_run_reconcile()
+  local state = fresh_state()
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "$a$ tail" })
+  vim.api.nvim_win_set_cursor(0, { 1, 1 })
+
+  package.loaded["typst-concealer"] = {
+    _enabled_buffers = { [bufnr] = true },
+    is_render_allowed = function()
+      return true
+    end,
+    config = {
+      use_formula_service = true,
+      live_preview_enabled = false,
+      conceal_in_normal = false,
+      cursor_hover_throttle_ms = 0,
+    },
+  }
+
+  local node_id = "node:a"
+  local overlay_id = "overlay:a"
+  state.machine_state.buffers[bufnr] = {
+    bufnr = bufnr,
+    project_scope_id = "p",
+    buffer_version = 1,
+    layout_version = 80,
+    render_epoch = 1,
+    context_id = "ctx",
+    context_rev = 1,
+    node_order = { node_id },
+    nodes = {
+      [node_id] = {
+        node_id = node_id,
+        bufnr = bufnr,
+        project_scope_id = "p",
+        item_idx = 1,
+        node_type = "math",
+        source_range = { 0, 0, 0, 3 },
+        display_range = { 0, 0, 0, 3 },
+        source_text = "$a$",
+        source_text_hash = "hash:a",
+        node_rev = 1,
+        context_hash = "ctx",
+        prelude_count = 0,
+        semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "math" },
+        status = "stable",
+        visible_overlay_id = overlay_id,
+      },
+    },
+  }
+  state.machine_state.overlays = {
+    [overlay_id] = {
+      overlay_id = overlay_id,
+      owner_node_id = node_id,
+      owner_bufnr = bufnr,
+      owner_project_scope_id = "p",
+      request_id = "request:a",
+      render_epoch = 1,
+      node_rev = 1,
+      context_id = "ctx",
+      context_rev = 1,
+      buffer_version = 1,
+      layout_version = 80,
+      image_id = 101,
+      extmark_id = 201,
+      page_path = "/tmp/a.png",
+      natural_cols = 1,
+      natural_rows = 1,
+      source_rows = 1,
+      terminal_upload_epoch = state.terminal_upload_epoch,
+      status = "visible",
+    },
+  }
+
+  with_stubbed_extmark(function(calls)
+    require("typst-concealer.machine.runtime").sync_cursor_ui(bufnr)
+
+    assert_eq(#calls.unconcealed, 1, "cursor sync should still expand the formula under cursor")
+    assert_truthy(
+      calls.unconcealed[1].opts and calls.unconcealed[1].opts.defer_line_run_reconcile,
+      "cursor sync should defer per-extmark line-run rebuilds"
+    )
+    assert_eq(#calls.syncs, 1, "cursor sync should reconcile line-runs once after hover and preview updates")
+    assert_eq(calls.syncs[1].lo, 0, "batched line-run reconcile should target the cursor row")
+    assert_eq(calls.syncs[1].hi, 0, "batched line-run reconcile should target the cursor row")
+  end)
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_apply_cleanup_preview_image_defers_source_reattach_line_run()
+  local state = fresh_state()
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+
+  local reattach_call = nil
+  package.loaded["typst-concealer.formula.manager"] = {
+    reattach_image = function(image_id, opts)
+      reattach_call = { image_id = image_id, opts = opts }
+      return true
+    end,
+  }
+
+  local bs = state.get_buf_state(bufnr)
+  bs.preview_item = {
+    image_id = 301,
+    source_image_id = 101,
+  }
+
+  require("typst-concealer.apply").cleanup_preview_image(bufnr, { defer_line_run_reconcile = true })
+
+  assert_truthy(reattach_call ~= nil, "preview cleanup should restore the source image")
+  assert_eq(reattach_call.image_id, 101, "preview cleanup should restore the original source image")
+  assert_truthy(
+    reattach_call.opts and reattach_call.opts.defer_line_run_reconcile,
+    "preview cleanup should propagate deferred line-run reconciliation"
+  )
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
 local function test_formula_cursor_preview_targets_single_placement()
   local state = fresh_state()
   local bufnr = vim.api.nvim_create_buf(true, false)
@@ -9034,8 +9236,16 @@ local tests = {
     "ok display line chunks accept math-conceal provider",
   },
   {
+    test_display_line_chunks_skip_replaced_source_highlights,
+    "ok display line chunks skip replaced source highlights",
+  },
+  {
     test_line_run_batches_math_conceal_provider,
     "ok line-run batches math-conceal provider calls",
+  },
+  {
+    test_line_run_refresh_reports_expanded_range,
+    "ok line-run refresh reports expanded range",
   },
   {
     test_extmark_compacts_inline_images_by_display_width,
@@ -9120,6 +9330,14 @@ local tests = {
   {
     test_formula_cursor_fast_boundary_switch_only_touches_previous_and_current,
     "ok formula cursor boundary switches stay placement-local",
+  },
+  {
+    test_runtime_sync_cursor_ui_batches_formula_line_run_reconcile,
+    "ok runtime cursor sync batches formula line-run reconcile",
+  },
+  {
+    test_apply_cleanup_preview_image_defers_source_reattach_line_run,
+    "ok preview cleanup defers source reattach line-run reconcile",
   },
   {
     test_formula_cursor_preview_targets_single_placement,

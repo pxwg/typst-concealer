@@ -481,14 +481,14 @@ end
 function M.refresh_for_row(bufnr, row, opts)
   opts = opts or {}
   if row == nil or not vim.api.nvim_buf_is_valid(bufnr) then
-    return false
+    return false, row, row
   end
 
   state.get_buf_state(bufnr).inline_line_reconcile_key = nil
 
   if not line_run_row_ready(bufnr, row, opts) then
     clear_line_runs_in_range(bufnr, row, row)
-    return false
+    return false, row, row
   end
 
   local start_row = row
@@ -506,7 +506,7 @@ function M.refresh_for_row(bufnr, row, opts)
 
   local anchor_row, virt_lines_above = choose_line_run_anchor(bufnr, start_row, end_row, opts)
   if anchor_row == nil then
-    return false
+    return false, start_row, end_row
   end
 
   local display_lines = {}
@@ -526,7 +526,7 @@ function M.refresh_for_row(bufnr, row, opts)
   for run_row = start_row, end_row do
     local row_lines, meta = build_line_run_row(bufnr, run_row, build_opts)
     if row_lines == nil then
-      return false
+      return false, start_row, end_row
     end
     for _, line in ipairs(row_lines) do
       display_lines[#display_lines + 1] = line
@@ -540,7 +540,7 @@ function M.refresh_for_row(bufnr, row, opts)
   end
 
   if #display_lines == 0 then
-    return false
+    return false, start_row, end_row
   end
 
   local bs = state.get_buf_state(bufnr)
@@ -610,7 +610,7 @@ function M.refresh_for_row(bufnr, row, opts)
     end
   end
 
-  return true
+  return true, start_row, end_row
 end
 
 function M.refresh_around_range(bufnr, start_row, end_row, opts)
@@ -642,7 +642,7 @@ local function restore_line_attachments(bufnr, next_rows, opts)
   local attachments = bs.inline_line_attachment_marks or {}
   for extmark_id, meta in pairs(vim.deepcopy(attachments)) do
     if not (next_rows and next_rows[meta.row]) then
-      opts.restore_row_attached_extmark(bufnr, extmark_id)
+      opts.restore_row_attached_extmark(bufnr, extmark_id, { defer_line_run_reconcile = true })
     end
   end
 end
@@ -722,8 +722,15 @@ function M.reconcile_cursor_line_runs(bufnr, lo, hi, opts)
     if refreshed_rows[row] then
       return nil
     end
-    refreshed_rows[row] = true
-    return M.refresh_for_row(bufnr, row, refresh_opts)
+    local ok, start_row, end_row = M.refresh_for_row(bufnr, row, refresh_opts)
+    if type(start_row) == "number" and type(end_row) == "number" then
+      for refreshed_row = start_row, end_row do
+        refreshed_rows[refreshed_row] = true
+      end
+    else
+      refreshed_rows[row] = true
+    end
+    return ok
   end
 
   for row in pairs(previous) do

@@ -41,6 +41,60 @@ local function uses_formula_manager(bufnr, main)
   return false
 end
 
+local function formula_cursor_ui_can_batch(bufnr, main)
+  if not uses_formula_manager(bufnr, main) then
+    return false
+  end
+  if main._enabled_buffers == nil or main._enabled_buffers[bufnr] ~= true then
+    return false
+  end
+  if type(main.is_render_allowed) == "function" and not main.is_render_allowed(bufnr) then
+    return false
+  end
+  local mode = vim.api.nvim_get_mode().mode or ""
+  if main.config.conceal_in_normal and mode:find("n", 1, true) ~= nil then
+    return false
+  end
+  return true
+end
+
+local function cursor_line_range(bufnr)
+  local winid = vim.fn.bufwinid(bufnr)
+  if winid == -1 then
+    return nil, nil
+  end
+
+  local ok_cursor, cursor = pcall(vim.api.nvim_win_get_cursor, winid)
+  if not ok_cursor or cursor == nil then
+    return nil, nil
+  end
+
+  local row = cursor[1] - 1
+  local mode = vim.api.nvim_get_mode().mode or ""
+  if mode == "v" or mode == "V" or mode == "\22" then
+    local visual_row = vim.fn.getpos("v")[2] - 1
+    return math.min(row, visual_row), math.max(row, visual_row)
+  end
+  return row, row
+end
+
+local function sync_cursor_ui_now(bufnr)
+  local ok_main, main = pcall(require, "typst-concealer")
+  if ok_main and formula_cursor_ui_can_batch(bufnr, main) then
+    local lo, hi = cursor_line_range(bufnr)
+    local defer_opts = { defer_line_run_reconcile = true }
+    M.sync_hover(bufnr, defer_opts)
+    M.render_live_preview(bufnr, defer_opts)
+    if lo ~= nil then
+      require("typst-concealer.extmark").reconcile_cursor_line_runs(bufnr, lo, hi)
+    end
+    return
+  end
+
+  M.sync_hover(bufnr)
+  M.render_live_preview(bufnr)
+end
+
 local function ensure_machine_state()
   if state.machine_state == nil then
     state.machine_state = types.initial_state()
@@ -751,24 +805,26 @@ function M.schedule_formula_renders(bufnr, opts)
   })
 end
 
-function M.render_live_preview(bufnr)
+function M.render_live_preview(bufnr, opts)
+  opts = opts or {}
   local ok_main, main = pcall(require, "typst-concealer")
   if ok_main and uses_formula_manager(bufnr, main) then
-    require("typst-concealer.formula.manager").sync_cursor_preview(bufnr)
+    require("typst-concealer.formula.manager").sync_cursor_preview(bufnr, opts)
     return
   end
   require("typst-concealer.plan").render_live_typst_preview(bufnr)
 end
 
-function M.clear_live_preview(bufnr)
+function M.clear_live_preview(bufnr, opts)
   M.clear_preview_request(bufnr)
-  require("typst-concealer.plan").clear_live_typst_preview(bufnr)
+  require("typst-concealer.plan").clear_live_typst_preview(bufnr, opts)
 end
 
-function M.sync_hover(bufnr)
+function M.sync_hover(bufnr, opts)
+  opts = opts or {}
   local ok_main, main = pcall(require, "typst-concealer")
   if ok_main and uses_formula_manager(bufnr, main) then
-    require("typst-concealer.formula.manager").sync_cursor_conceal(bufnr)
+    require("typst-concealer.formula.manager").sync_cursor_conceal(bufnr, opts)
     return
   end
   require("typst-concealer.plan").hide_extmarks_at_cursor(bufnr)
@@ -777,8 +833,7 @@ end
 function M.sync_cursor_ui(bufnr)
   local throttle = require("typst-concealer").config.cursor_hover_throttle_ms
   if throttle <= 0 then
-    M.sync_hover(bufnr)
-    M.render_live_preview(bufnr)
+    sync_cursor_ui_now(bufnr)
     return
   end
 
@@ -791,8 +846,7 @@ function M.sync_cursor_ui(bufnr)
     throttle,
     0,
     vim.schedule_wrap(function()
-      M.sync_hover(bufnr)
-      M.render_live_preview(bufnr)
+      sync_cursor_ui_now(bufnr)
     end)
   )
 end

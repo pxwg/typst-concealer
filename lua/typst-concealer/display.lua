@@ -317,25 +317,6 @@ local function collect_treesitter_highlight_spans(bufnr, row, line)
   return spans
 end
 
-local function line_chars(bufnr, row, line, opts)
-  local chars = {}
-  local col = 0
-  local char_count = vim.fn.strchars(line)
-  local treesitter_cursor = treesitter_span_cursor(collect_treesitter_highlight_spans(bufnr, row, line))
-  for idx = 0, char_count - 1 do
-    local text = vim.fn.strcharpart(line, idx, 1)
-    local next_col = col + #text
-    chars[#chars + 1] = {
-      start_col = col,
-      end_col = next_col,
-      text = text,
-      hl_group = inspect_hl_stack(bufnr, row, col, opts, treesitter_hls_at_col(treesitter_cursor, col)),
-    }
-    col = next_col
-  end
-  return chars
-end
-
 local function char_at_byte(line, col)
   local text = vim.fn.strcharpart(line:sub(col + 1), 0, 1)
   if text == "" then
@@ -357,11 +338,16 @@ local function append_chunk(chunks, text, hl_group)
   chunks[#chunks + 1] = { text, hl_group }
 end
 
-local function append_chars(chunks, chars, start_col, end_col)
-  for _, char in ipairs(chars) do
-    if char.end_col > start_col and char.start_col < end_col then
-      append_chunk(chunks, char.text, char.hl_group)
+local function append_source_chars(chunks, bufnr, row, line, start_col, end_col, opts, treesitter_cursor)
+  local col = math.max(0, start_col)
+  end_col = math.min(end_col, #line)
+  while col < end_col do
+    local text = char_at_byte(line, col)
+    local next_col = col + math.max(1, #text)
+    if next_col > start_col then
+      append_chunk(chunks, text, inspect_hl_stack(bufnr, row, col, opts, treesitter_hls_at_col(treesitter_cursor, col)))
     end
+    col = next_col
   end
 end
 
@@ -597,14 +583,14 @@ function M.line_chunks(bufnr, row, replacements, opts)
     return nil
   end
 
-  local chars = line_chars(bufnr, row, line, opts)
   local operations = collect_operations(bufnr, row, line, replacements, opts)
+  local treesitter_cursor = treesitter_span_cursor(collect_treesitter_highlight_spans(bufnr, row, line))
   local chunks = {}
   local last_col = 0
 
   for _, op in ipairs(operations) do
     if op.start_col >= last_col then
-      append_chars(chunks, chars, last_col, op.start_col)
+      append_source_chars(chunks, bufnr, row, line, last_col, op.start_col, opts, treesitter_cursor)
       for _, chunk in ipairs(op.chunks or {}) do
         chunks[#chunks + 1] = chunk
       end
@@ -612,7 +598,7 @@ function M.line_chunks(bufnr, row, replacements, opts)
     end
   end
 
-  append_chars(chunks, chars, last_col, #line)
+  append_source_chars(chunks, bufnr, row, line, last_col, #line, opts, treesitter_cursor)
   return chunks
 end
 

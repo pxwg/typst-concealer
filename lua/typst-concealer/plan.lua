@@ -407,8 +407,8 @@ local function cleanup_item(bufnr, item)
   return require("typst-concealer.apply").cleanup_item(bufnr, item)
 end
 
-local function cleanup_preview_image(bufnr)
-  return require("typst-concealer.apply").cleanup_preview_image(bufnr)
+local function cleanup_preview_image(bufnr, opts)
+  return require("typst-concealer.apply").cleanup_preview_image(bufnr, opts)
 end
 
 local function cleanup_preview_item_request(bufnr, item, opts)
@@ -1567,9 +1567,10 @@ end
 
 --- Stop the live preview tail page and remove its extmark/image.
 --- @param bufnr integer
-function M.clear_live_typst_preview(bufnr)
+--- @param opts table|nil
+function M.clear_live_typst_preview(bufnr, opts)
   require("typst-concealer.machine.runtime").clear_preview_request(bufnr)
-  cleanup_preview_image(bufnr)
+  cleanup_preview_image(bufnr, opts)
 end
 
 --- Coalesce insert-mode text/cursor churn into a single preview sync pipeline.

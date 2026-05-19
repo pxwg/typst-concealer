@@ -344,7 +344,8 @@ local function attach_inline_image_after_source(bufnr, item, extmark_id, natural
   return true
 end
 
-local function restore_row_attached_extmark(bufnr, extmark_id)
+local function restore_row_attached_extmark(bufnr, extmark_id, opts)
+  opts = opts or {}
   local meta = clear_inline_line_attachment(bufnr, extmark_id)
   if meta == nil then
     return false
@@ -372,7 +373,8 @@ local function restore_row_attached_extmark(bufnr, extmark_id)
     item.natural_cols,
     item.natural_rows,
     source_rows or 1,
-    item
+    item,
+    opts
   )
   return true
 end

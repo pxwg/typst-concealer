@@ -143,13 +143,13 @@ end
 
 M.find_matching_prev_item = find_matching_prev_item
 
-local function reattach_item_image(image_id)
+local function reattach_item_image(image_id, opts)
   if image_id == nil then
     return
   end
 
   local ok_manager, manager = pcall(require, "typst-concealer.formula.manager")
-  if ok_manager and manager.reattach_image(image_id) then
+  if ok_manager and manager.reattach_image(image_id, opts) then
     return
   end
 
@@ -172,11 +172,19 @@ local function reattach_item_image(image_id)
   local extmark_mod = require("typst-concealer.extmark")
   extmark_mod.create_image(item.page_path, image_id, item.natural_cols, item.natural_rows)
   item.terminal_upload_epoch = state.terminal_upload_epoch
-  extmark_mod.conceal_for_image_id(target_bufnr, image_id, item.natural_cols, item.natural_rows, item.source_rows or 1)
+  extmark_mod.conceal_for_image_id(
+    target_bufnr,
+    image_id,
+    item.natural_cols,
+    item.natural_rows,
+    item.source_rows or 1,
+    opts
+  )
   extmark_mod.flush_terminal_data()
 end
 
-local function cleanup_preview_image(bufnr)
+local function cleanup_preview_image(bufnr, opts)
+  opts = opts or {}
   local bs = state.get_buf_state(bufnr)
   local preview = bs.preview_image
   local last_rendered = bs.preview_last_rendered_item
@@ -206,7 +214,7 @@ local function cleanup_preview_image(bufnr)
     bs.preview_source_page_stamp = nil
     bs.preview_source_range = nil
     if had_preview_resources then
-      reattach_item_image(source_image_id)
+      reattach_item_image(source_image_id, opts)
     end
     return
   end
@@ -238,7 +246,7 @@ local function cleanup_preview_image(bufnr)
   bs.preview_source_page_stamp = nil
   bs.preview_source_range = nil
   if had_preview_resources then
-    reattach_item_image(source_image_id)
+    reattach_item_image(source_image_id, opts)
   end
 end
 

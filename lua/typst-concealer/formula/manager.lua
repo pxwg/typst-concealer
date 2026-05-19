@@ -544,7 +544,8 @@ function Manager:restore_all_hidden()
   self.last_hi = nil
 end
 
-function Manager:sync_cursor_conceal()
+function Manager:sync_cursor_conceal(opts)
+  opts = opts or {}
   self:sync_from_machine({ read_model = false })
   local ok_main, main = pcall(require, "typst-concealer")
   local bs = state.get_buf_state(self.bufnr)
@@ -634,7 +635,9 @@ function Manager:sync_cursor_conceal()
   end
 
   bs.currently_hidden_extmark_ids = new_hidden
-  require("typst-concealer.extmark").reconcile_cursor_line_runs(self.bufnr, lo, hi)
+  if opts.defer_line_run_reconcile ~= true then
+    require("typst-concealer.extmark").reconcile_cursor_line_runs(self.bufnr, lo, hi)
+  end
   hover.last_cursor_row = cursor_row
   hover.last_cursor_col = cursor_col
   hover.last_mode = mode
@@ -644,7 +647,8 @@ function Manager:sync_cursor_conceal()
   return true
 end
 
-function Manager:sync_cursor_preview()
+function Manager:sync_cursor_preview(opts)
+  opts = opts or {}
   self:sync_from_machine({ read_model = false })
   local ok_main, main = pcall(require, "typst-concealer")
   if
@@ -655,9 +659,9 @@ function Manager:sync_cursor_preview()
     or not vim.api.nvim_buf_is_valid(self.bufnr)
   then
     if self.preview_placement_id ~= nil and self.placements[self.preview_placement_id] ~= nil then
-      self.placements[self.preview_placement_id]:clear_preview()
+      self.placements[self.preview_placement_id]:clear_preview(opts)
     else
-      require("typst-concealer.plan").clear_live_typst_preview(self.bufnr)
+      require("typst-concealer.plan").clear_live_typst_preview(self.bufnr, opts)
     end
     self.preview_placement_id = nil
     return false
@@ -666,9 +670,9 @@ function Manager:sync_cursor_preview()
   local winid = vim.fn.bufwinid(self.bufnr)
   if winid == -1 then
     if self.preview_placement_id ~= nil and self.placements[self.preview_placement_id] ~= nil then
-      self.placements[self.preview_placement_id]:clear_preview()
+      self.placements[self.preview_placement_id]:clear_preview(opts)
     else
-      require("typst-concealer.plan").clear_live_typst_preview(self.bufnr)
+      require("typst-concealer.plan").clear_live_typst_preview(self.bufnr, opts)
     end
     self.preview_placement_id = nil
     return false
@@ -682,9 +686,9 @@ function Manager:sync_cursor_preview()
 
   if placement == nil then
     if self.preview_placement_id ~= nil and self.placements[self.preview_placement_id] ~= nil then
-      self.placements[self.preview_placement_id]:clear_preview()
+      self.placements[self.preview_placement_id]:clear_preview(opts)
     else
-      require("typst-concealer.plan").clear_live_typst_preview(self.bufnr)
+      require("typst-concealer.plan").clear_live_typst_preview(self.bufnr, opts)
     end
     self.preview_placement_id = nil
     return false
@@ -759,12 +763,12 @@ function M.reconcile_visible_overlay_bindings(bufnr)
   return M.get(bufnr):reconcile_visible_overlay_bindings()
 end
 
-function M.sync_cursor_conceal(bufnr)
-  return M.get(bufnr):sync_cursor_conceal()
+function M.sync_cursor_conceal(bufnr, opts)
+  return M.get(bufnr):sync_cursor_conceal(opts)
 end
 
-function M.sync_cursor_preview(bufnr)
-  return M.get(bufnr):sync_cursor_preview()
+function M.sync_cursor_preview(bufnr, opts)
+  return M.get(bufnr):sync_cursor_preview(opts)
 end
 
 function M.ensure_pending_nodes_rendering(bufnr, opts)
@@ -779,14 +783,14 @@ function M.render_failed(bufnr, ev)
   return M.get(bufnr):on_render_failed(ev)
 end
 
-function M.reattach_image(image_id)
+function M.reattach_image(image_id, opts)
   if image_id == nil then
     return false
   end
   for _, manager in pairs(state.formula_managers or {}) do
     local placement = manager:placement_for_image(image_id)
     if placement ~= nil then
-      placement:reattach_image()
+      placement:reattach_image(opts)
       require("typst-concealer.extmark").flush_terminal_data()
       return true
     end

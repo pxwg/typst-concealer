@@ -249,11 +249,11 @@ function M:expand_preview(cursor_row, cursor_col, mode)
   return ok
 end
 
-function M:clear_preview()
+function M:clear_preview(opts)
   local bs = state.get_buf_state(self.bufnr)
   local preview_item = bs.preview_item or bs.preview_last_rendered_item
   if self.preview_item ~= nil or (preview_item ~= nil and preview_item.node_id == self.node_id) then
-    require("typst-concealer.plan").clear_live_typst_preview(self.bufnr)
+    require("typst-concealer.plan").clear_live_typst_preview(self.bufnr, opts)
   end
   self.preview_item = nil
   self.preview_render_key = nil
@@ -487,7 +487,9 @@ function M:update_presentation(opts)
     end
   end
 
-  self.image:conceal(node.bufnr, overlay.source_rows or 1)
+  self.image:conceal(node.bufnr, overlay.source_rows or 1, {
+    defer_line_run_reconcile = opts.defer_line_run_reconcile == true,
+  })
   self.manager:replace_read_model_entry(self, self:compat_item(machine_state, node, overlay))
   self.manager:reindex_placement(self)
   return true, uploaded
@@ -645,8 +647,9 @@ function M:show(opts)
   return true
 end
 
-function M:reattach_image()
-  return self:update_presentation({ force_reupload = true })
+function M:reattach_image(opts)
+  opts = vim.tbl_extend("force", opts or {}, { force_reupload = true })
+  return self:update_presentation(opts)
 end
 
 function M:close(opts)
