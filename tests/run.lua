@@ -5929,6 +5929,125 @@ local function test_extmark_scales_wide_block_images_to_window_width()
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
+local function test_extmark_multiline_block_uses_line_run_lifecycle()
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+      block_padding_cols = 0,
+    },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "before", "$", "  x", "$", "after" })
+  vim.api.nvim_win_set_cursor(0, { 5, 0 })
+
+  local extmark = require("typst-concealer.extmark")
+  local image_id = 1308
+  local range = { 1, 0, 3, 1 }
+  local semantics = { display_kind = "block", constraint_kind = "intrinsic", source_kind = "math" }
+  local extmark_id = extmark.place_render_extmark(bufnr, image_id, range, nil, true, semantics)
+  state.item_by_image_id[image_id] = {
+    bufnr = bufnr,
+    image_id = image_id,
+    extmark_id = extmark_id,
+    range = range,
+    display_range = range,
+    node_type = "math",
+    semantics = semantics,
+    natural_cols = 6,
+    natural_rows = 2,
+  }
+
+  extmark.conceal_for_image_id(bufnr, image_id, 6, 2, 3)
+
+  local bs = state.get_buf_state(bufnr)
+  local mm = bs.multiline_marks[extmark_id]
+  assert_truthy(mm ~= nil and mm.is_block_carrier == true, "multiline block should keep block metadata")
+  assert_truthy(mm.line_run_id ~= nil, "multiline block should be owned by a line run")
+  local run_id = mm.line_run_id
+  local run = bs.line_run_marks[run_id]
+  assert_eq(run.start_row, 1, "multiline block run should cover the first source row")
+  assert_eq(run.end_row, 3, "multiline block run should cover the last source row")
+  assert_eq(#mm.tail_ids, 3, "multiline block run should own conceal extmarks for every source row")
+
+  local carrier = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, mm.carrier_id, { details = true })
+  assert_eq(carrier[1], 0, "multiline block run should anchor outside its source rows")
+  assert_eq(carrier[3].virt_lines_above, false, "multiline block run should render after the previous safe row")
+  assert_eq(#(carrier[3].virt_lines or {}), 2, "multiline block run should render image rows as virtual lines")
+  for _, conceal_id in ipairs(mm.tail_ids) do
+    local conceal = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, conceal_id, { details = true })
+    assert_eq(conceal[3].conceal_lines, "", "multiline block source rows should collapse via line run")
+  end
+
+  state.prepare_extmark_reuse(bufnr, extmark_id)
+  assert_eq(bs.line_run_marks[run_id], nil, "prepare_extmark_reuse should clear the multiline block line run")
+  assert_eq(bs.multiline_marks[extmark_id], nil, "prepare_extmark_reuse should clear multiline block metadata")
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_extmark_nonblock_multiline_uses_line_run_lifecycle()
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+      block_padding_cols = 0,
+    },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "abc", "def", "ghi", "after" })
+  vim.api.nvim_win_set_cursor(0, { 4, 0 })
+
+  local extmark = require("typst-concealer.extmark")
+  local image_id = 1309
+  local range = { 0, 0, 2, 3 }
+  local semantics = { display_kind = "inline", constraint_kind = "flow", source_kind = "code" }
+  local extmark_id = extmark.place_render_extmark(bufnr, image_id, range, nil, true, semantics)
+  state.item_by_image_id[image_id] = {
+    bufnr = bufnr,
+    image_id = image_id,
+    extmark_id = extmark_id,
+    range = range,
+    display_range = range,
+    node_type = "code",
+    semantics = semantics,
+    natural_cols = 2,
+    natural_rows = 2,
+  }
+
+  extmark.conceal_for_image_id(bufnr, image_id, 2, 2, 3)
+
+  local bs = state.get_buf_state(bufnr)
+  local mm = bs.multiline_marks[extmark_id]
+  assert_truthy(mm ~= nil and mm.is_multiline_overlay == true, "non-block multiline should use overlay run metadata")
+  assert_truthy(mm.line_run_id ~= nil, "non-block multiline should be owned by a line run")
+  local run_id = mm.line_run_id
+  local run = bs.line_run_marks[run_id]
+  assert_eq(run.mode, "row_overlay", "non-block multiline should keep per-source-row overlay semantics")
+  assert_eq(run.start_row, 0, "non-block multiline run should track the first source row")
+  assert_eq(run.end_row, 2, "non-block multiline run should track the last source row")
+  assert_eq(#run.sub_ids, 3, "non-block multiline run should own all row overlay extmarks")
+
+  local first_overlay = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, run.sub_ids[1], { details = true })
+  assert_truthy(first_overlay[3].virt_text ~= nil, "row-overlay run should render with virt_text")
+  assert_eq(first_overlay[3].conceal, "", "row-overlay run should keep source rows visible but concealed")
+  assert_eq(first_overlay[3].conceal_lines, nil, "row-overlay run should not collapse source rows")
+
+  assert_eq(extmark.unconceal_extmark(bufnr, extmark_id), true, "unconceal should clear non-block multiline run")
+  assert_eq(bs.line_run_marks[run_id], nil, "unconceal should remove the non-block multiline line run")
+  assert_eq(
+    #vim.api.nvim_buf_get_extmarks(bufnr, state.ns_id2, { 0, 0 }, { -1, -1 }, {}),
+    0,
+    "unconceal should delete all row-overlay extmarks"
+  )
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
 local function virt_line_text(line)
   local parts = {}
   for _, chunk in ipairs(line or {}) do
@@ -8092,6 +8211,14 @@ local tests = {
   {
     test_extmark_embedded_block_math_avoids_inline_source_anchor,
     "ok extmark embedded block math avoids inline source anchors",
+  },
+  {
+    test_extmark_multiline_block_uses_line_run_lifecycle,
+    "ok extmark multiline block uses line-run lifecycle",
+  },
+  {
+    test_extmark_nonblock_multiline_uses_line_run_lifecycle,
+    "ok extmark non-block multiline uses line-run lifecycle",
   },
   {
     test_extmark_scales_wide_block_images_to_window_width,

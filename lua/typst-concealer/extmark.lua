@@ -405,9 +405,10 @@ local function line_run_block_for_row(bufnr, row)
       and type(mm.line_run_display_lines) == "table"
       and bs.currently_hidden_extmark_ids[extmark_id] == nil
     then
-      local mark_row = extmark_row(bufnr, state.ns_id, extmark_id)
-      if mark_row == row then
-        return item, extmark_id, mm
+      local start_row = mm.line_run_start_row or extmark_row(bufnr, state.ns_id, extmark_id)
+      local end_row = mm.line_run_end_row or start_row
+      if start_row ~= nil and row >= start_row and row <= end_row then
+        return item, extmark_id, mm, row == start_row
       end
     end
   end
@@ -431,9 +432,9 @@ local function line_run_row_ready(bufnr, row, opts)
 end
 
 local function build_line_run_row(bufnr, row)
-  local _, extmark_id, mm = line_run_block_for_row(bufnr, row)
+  local _, extmark_id, mm, is_block_start = line_run_block_for_row(bufnr, row)
   if mm ~= nil then
-    return mm.line_run_display_lines, {
+    return is_block_start and mm.line_run_display_lines or {}, {
       block_extmark_id = extmark_id,
     }
   end
@@ -487,11 +488,16 @@ clear_line_run = function(bufnr, run_id)
     end
   end
 
-  for extmark_id in pairs(run.block_extmark_ids or {}) do
+  for _, sub_id in pairs(run.sub_ids or {}) do
+    pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id2, sub_id)
+  end
+
+  for extmark_id in pairs(run.extmark_ids or run.block_extmark_ids or {}) do
     local mm = bs.multiline_marks[extmark_id]
     if mm and mm.line_run_id == run_id then
       mm.carrier_id = nil
       mm.tail_ids = {}
+      mm.sub_ids = {}
       mm.line_run_id = nil
     end
     if bs.line_run_by_extmark then
@@ -630,6 +636,7 @@ refresh_line_run_for_row = function(bufnr, row, opts)
     carrier_id = carrier_id,
     conceal_ids = conceal_ids,
     rows = rows,
+    extmark_ids = block_extmark_ids,
     block_extmark_ids = block_extmark_ids,
   }
 
@@ -647,9 +654,14 @@ refresh_line_run_for_row = function(bufnr, row, opts)
     if mm then
       mm.carrier_id = carrier_id
       mm.tail_ids = {}
-      local mark_row = extmark_row(bufnr, state.ns_id, extmark_id)
-      if mark_row ~= nil and conceal_ids[mark_row] ~= nil then
-        mm.tail_ids[1] = conceal_ids[mark_row]
+      local start_row = mm.line_run_start_row or extmark_row(bufnr, state.ns_id, extmark_id)
+      local end_row = mm.line_run_end_row or start_row
+      if start_row ~= nil and end_row ~= nil then
+        for run_row = start_row, end_row do
+          if conceal_ids[run_row] ~= nil then
+            mm.tail_ids[#mm.tail_ids + 1] = conceal_ids[run_row]
+          end
+        end
       end
       mm.line_run_id = run_id
       bs.line_run_by_extmark[extmark_id] = run_id
@@ -887,7 +899,8 @@ function M.unconceal_extmark(bufnr, extmark_id)
       if mm.line_run_id ~= nil and clear_line_run ~= nil then
         clear_line_run(bufnr, mm.line_run_id)
         mm.line_run_display_lines = nil
-        mm.line_run_row = nil
+        mm.line_run_start_row = nil
+        mm.line_run_end_row = nil
         return true
       end
       if mm.carrier_id then
@@ -905,8 +918,14 @@ function M.unconceal_extmark(bufnr, extmark_id)
     if #mark > 0 and mark[3] and mark[3].virt_text_pos == "right_align" then
       return nil
     end
+    if mm.line_run_id ~= nil and clear_line_run ~= nil then
+      clear_line_run(bufnr, mm.line_run_id)
+      return mm.conceals_source ~= false and true or nil
+    end
     for _, sub_id in ipairs(mm) do
-      vim.api.nvim_buf_del_extmark(bufnr, state.ns_id2, sub_id)
+      if type(sub_id) == "number" then
+        vim.api.nvim_buf_del_extmark(bufnr, state.ns_id2, sub_id)
+      end
     end
     return true
   end
@@ -997,64 +1016,49 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
   local mm = bs.multiline_marks[extmark_id]
   if mm and mm.is_block_carrier then
     -- Top-carrier atomic model: one ns_id2 carrier owns the visible display.
-    if mm.carrier_id then
+    if mm.line_run_id ~= nil then
+      clear_line_run(bufnr, mm.line_run_id)
+    elseif mm.carrier_id then
       pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id2, mm.carrier_id)
       mm.carrier_id = nil
-    end
-    for _, id in ipairs(mm.tail_ids or {}) do
-      pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id2, id)
+      for _, id in ipairs(mm.tail_ids or {}) do
+        pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id2, id)
+      end
     end
     mm.tail_ids = {}
 
-    local lines_buf = vim.api.nvim_buf_get_lines(bufnr, row, opts.end_row + 1, false)
     local display_lines = normalize_virt_text_lines(virt_text_data)
-    local source_rows = opts.end_row - row + 1
-
-    if source_rows == 1 then
-      -- A single long source line can still occupy multiple wrapped screen
-      -- rows after character conceal. Collapse the source line completely and
-      -- render the whole block as consecutive virtual lines, matching the
-      -- original Typst block strategy that avoids breaking the kitty grid.
-      mm.line_run_display_lines = display_lines
-      mm.line_run_row = row
-      refresh_line_run_for_row(bufnr, row)
-      return
-    end
-
-    local carrier_vl = {}
-    for i = 2, #display_lines do
-      carrier_vl[#carrier_vl + 1] = display_lines[i]
-    end
-
-    -- Tail conceal: fully hide source rows start_row+1 .. end_row (0 screen lines each)
-    mm.carrier_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, row, 0, {
-      virt_text = display_lines[1] or { { "", "" } },
-      virt_text_pos = "overlay",
-      conceal = "",
-      end_col = #(lines_buf[1] or ""),
-      end_row = row,
-      virt_lines = carrier_vl,
-    })
-
-    for i = 2, source_rows do
-      local tid = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, row + i - 1, 0, {
-        conceal_lines = "",
-        end_row = row + i - 1,
-      })
-      table.insert(mm.tail_ids, tid)
-    end
+    mm.line_run_display_lines = display_lines
+    mm.line_run_start_row = row
+    mm.line_run_end_row = opts.end_row
+    refresh_line_run_for_row(bufnr, row)
+    return
   else
     local height = opts.end_row - row + 1
     if height ~= 1 then
-      -- Non-block multiline: existing per-source-line overlay model
       if mm then
-        for _, id in pairs(mm) do
-          vim.api.nvim_buf_del_extmark(bufnr, state.ns_id2, id)
+        if mm.line_run_id ~= nil then
+          clear_line_run(bufnr, mm.line_run_id)
+        else
+          for _, id in pairs(mm) do
+            if type(id) == "number" then
+              pcall(vim.api.nvim_buf_del_extmark, bufnr, state.ns_id2, id)
+            end
+          end
         end
       end
-      bs.multiline_marks[extmark_id] = {}
+
+      local run_id = (bs.next_line_run_id or 0) + 1
+      bs.next_line_run_id = run_id
+      bs.line_run_marks = bs.line_run_marks or {}
+      bs.line_run_by_row = bs.line_run_by_row or {}
+      bs.line_run_by_extmark = bs.line_run_by_extmark or {}
+
       local lines = vim.api.nvim_buf_get_lines(bufnr, row, opts.end_row + 1, false)
+      local sub_ids = {}
+      local rows = {}
       for i = 1, height do
+        local source_row = row + i - 1
         local conceal = nil
         if opts.virt_text_pos ~= "right_align" then
           conceal = ""
@@ -1073,8 +1077,28 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
           end_col = #(lines[i] or ""),
           end_row = row + i - 1,
         })
-        table.insert(bs.multiline_marks[extmark_id], new_id)
+        sub_ids[#sub_ids + 1] = new_id
+        rows[source_row] = true
+        bs.line_run_by_row[source_row] = run_id
       end
+
+      bs.line_run_marks[run_id] = {
+        mode = "row_overlay",
+        start_row = row,
+        end_row = opts.end_row,
+        rows = rows,
+        sub_ids = sub_ids,
+        extmark_ids = {
+          [extmark_id] = true,
+        },
+      }
+      bs.line_run_by_extmark[extmark_id] = run_id
+      bs.multiline_marks[extmark_id] = {
+        is_multiline_overlay = true,
+        line_run_id = run_id,
+        sub_ids = sub_ids,
+        conceals_source = opts.virt_text_pos ~= "right_align",
+      }
     elseif opts.virt_text_pos == "inline" or (opts.virt_text_pos == "overlay" and opts.conceal == "") then
       vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
         id = extmark_id,

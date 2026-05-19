@@ -263,6 +263,9 @@ function M.prepare_extmark_reuse(bufnr, extmark_id)
     for _, id in pairs(run.conceal_ids or {}) do
       pcall(vim.api.nvim_buf_del_extmark, bufnr, M.ns_id2, id)
     end
+    for _, id in pairs(run.sub_ids or {}) do
+      pcall(vim.api.nvim_buf_del_extmark, bufnr, M.ns_id2, id)
+    end
     for row in pairs(run.rows or {}) do
       if bs.inline_line_marks and bs.inline_line_marks[row] and bs.inline_line_marks[row].line_run_id == run_id then
         bs.inline_line_marks[row] = nil
@@ -271,11 +274,12 @@ function M.prepare_extmark_reuse(bufnr, extmark_id)
         bs.line_run_by_row[row] = nil
       end
     end
-    for run_extmark_id in pairs(run.block_extmark_ids or {}) do
+    for run_extmark_id in pairs(run.extmark_ids or run.block_extmark_ids or {}) do
       local run_mm = bs.multiline_marks[run_extmark_id]
       if run_mm and run_mm.line_run_id == run_id then
         run_mm.carrier_id = nil
         run_mm.tail_ids = {}
+        run_mm.sub_ids = {}
         run_mm.line_run_id = nil
       end
       if bs.line_run_by_extmark then
@@ -316,8 +320,14 @@ function M.prepare_extmark_reuse(bufnr, extmark_id)
         end
       end
     else
-      for _, id in pairs(mm) do
-        pcall(vim.api.nvim_buf_del_extmark, bufnr, M.ns_id2, id)
+      if mm.line_run_id ~= nil and clear_line_run_id(mm.line_run_id) then
+        -- run-owned row overlays were cleared above
+      else
+        for _, id in pairs(mm) do
+          if type(id) == "number" then
+            pcall(vim.api.nvim_buf_del_extmark, bufnr, M.ns_id2, id)
+          end
+        end
       end
     end
     bs.multiline_marks[extmark_id] = nil
