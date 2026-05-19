@@ -77,6 +77,41 @@ local function stack_hl(stack)
   return stack
 end
 
+local function capture_metadata(metadata, capture_id)
+  if type(metadata) ~= "table" then
+    return nil
+  end
+  return metadata[capture_id]
+end
+
+local function metadata_value(metadata, capture_id, key)
+  local capture_data = capture_metadata(metadata, capture_id)
+  if type(capture_data) == "table" and capture_data[key] ~= nil then
+    return capture_data[key]
+  end
+  if type(metadata) == "table" then
+    return metadata[key]
+  end
+end
+
+local function treesitter_capture_hl(query, capture_id, lang, metadata)
+  local hl_group = metadata_value(metadata, capture_id, "highlight")
+  if type(hl_group) == "string" and hl_group ~= "" then
+    return hl_group
+  end
+
+  local capture = query.captures and query.captures[capture_id]
+  if type(capture) ~= "string" or capture == "" then
+    return "Conceal"
+  end
+
+  if type(lang) == "string" and lang ~= "" then
+    return "@" .. capture .. "." .. lang
+  end
+
+  return "@" .. capture
+end
+
 local function position_in_item(item, row, col)
   if item.row == nil or item.col == nil then
     return true
@@ -98,11 +133,80 @@ local function position_in_item(item, row, col)
     or (row > start_row and row < end_row)
 end
 
-local function inspect_hl_stack(bufnr, row, col, opts)
+local function treesitter_span_cursor(spans)
+  if spans == nil then
+    return nil
+  end
+
+  table.sort(spans, function(a, b)
+    if a.start_col ~= b.start_col then
+      return a.start_col < b.start_col
+    end
+    return a.order < b.order
+  end)
+
+  return {
+    spans = spans,
+    active = {},
+    next_idx = 1,
+    cached_col = nil,
+    cached_hls = {},
+  }
+end
+
+local function treesitter_hls_at_col(cursor, col)
+  if cursor == nil then
+    return nil
+  end
+  if cursor.cached_col == col then
+    return cursor.cached_hls
+  end
+
+  local changed = false
+  local spans = cursor.spans
+  while spans[cursor.next_idx] ~= nil and spans[cursor.next_idx].start_col <= col do
+    cursor.active[#cursor.active + 1] = spans[cursor.next_idx]
+    cursor.next_idx = cursor.next_idx + 1
+    changed = true
+  end
+
+  local write_idx = 1
+  for read_idx = 1, #cursor.active do
+    local span = cursor.active[read_idx]
+    if col < span.end_col then
+      cursor.active[write_idx] = span
+      write_idx = write_idx + 1
+    else
+      changed = true
+    end
+  end
+  for idx = write_idx, #cursor.active do
+    cursor.active[idx] = nil
+  end
+
+  if changed then
+    table.sort(cursor.active, function(a, b)
+      if a.priority ~= b.priority then
+        return a.priority < b.priority
+      end
+      return a.order < b.order
+    end)
+  end
+
+  local hls = {}
+  for _, span in ipairs(cursor.active) do
+    hls[#hls + 1] = span.hl_group
+  end
+  cursor.cached_col = col
+  cursor.cached_hls = hls
+  return hls
+end
+
+local function inspect_hl_stack(bufnr, row, col, opts, treesitter_hls)
   local ok, inspected = pcall(vim.inspect_pos, bufnr, row, col, {
     extmarks = "all",
     syntax = true,
-    treesitter = true,
+    treesitter = treesitter_hls == nil,
     semantic_tokens = true,
   })
   if not ok or type(inspected) ~= "table" then
@@ -113,8 +217,14 @@ local function inspect_hl_stack(bufnr, row, col, opts)
   for _, item in ipairs(inspected.syntax or {}) do
     append_hl(stack, item_hl(item))
   end
-  for _, item in ipairs(inspected.treesitter or {}) do
-    append_hl(stack, item_hl(item))
+  if treesitter_hls ~= nil then
+    for _, hl_group in ipairs(treesitter_hls) do
+      append_hl(stack, hl_group)
+    end
+  else
+    for _, item in ipairs(inspected.treesitter or {}) do
+      append_hl(stack, item_hl(item))
+    end
   end
   for _, item in ipairs(inspected.semantic_tokens or {}) do
     append_hl(stack, item_hl(item))
@@ -143,10 +253,75 @@ local function inspect_hl_stack(bufnr, row, col, opts)
   return stack_hl(stack)
 end
 
+local function highlighter_states(bufnr, visit_state)
+  local highlighter_api = vim.treesitter and vim.treesitter.highlighter
+  local highlighter = highlighter_api and highlighter_api.active and highlighter_api.active[bufnr]
+  if highlighter == nil then
+    return
+  end
+
+  if type(highlighter.for_each_highlight_state) == "function" then
+    pcall(function()
+      highlighter:for_each_highlight_state(visit_state)
+    end)
+  else
+    for _, state in ipairs(highlighter._highlight_states or {}) do
+      visit_state(state)
+    end
+  end
+end
+
+local function collect_treesitter_highlight_spans(bufnr, row, line)
+  local spans = {}
+  local order = 0
+
+  highlighter_states(bufnr, function(state)
+    local highlighter_query = state.highlighter_query or {}
+    local query = highlighter_query._query
+    local tree = state.tstree
+    if query == nil or tree == nil then
+      return
+    end
+
+    local ok_root, root = pcall(function()
+      return tree:root()
+    end)
+    if not ok_root or root == nil then
+      return
+    end
+
+    for capture_id, node, metadata in query:iter_captures(root, bufnr, row, row + 1) do
+      local start_row, start_col, end_row, end_col = node:range()
+      if start_row <= row and end_row >= row then
+        local line_start_col = row == start_row and start_col or 0
+        local line_end_col = row == end_row and end_col or #line
+        line_start_col = math.max(0, math.min(line_start_col, #line))
+        line_end_col = math.max(line_start_col, math.min(line_end_col, #line))
+        if line_end_col > line_start_col then
+          order = order + 1
+          spans[#spans + 1] = {
+            start_col = line_start_col,
+            end_col = line_end_col,
+            hl_group = treesitter_capture_hl(query, capture_id, highlighter_query.lang, metadata),
+            priority = tonumber(metadata_value(metadata, capture_id, "priority")) or 100,
+            order = order,
+          }
+        end
+      end
+    end
+  end)
+
+  if #spans == 0 then
+    return nil
+  end
+  return spans
+end
+
 local function line_chars(bufnr, row, line, opts)
   local chars = {}
   local col = 0
   local char_count = vim.fn.strchars(line)
+  local treesitter_cursor = treesitter_span_cursor(collect_treesitter_highlight_spans(bufnr, row, line))
   for idx = 0, char_count - 1 do
     local text = vim.fn.strcharpart(line, idx, 1)
     local next_col = col + #text
@@ -154,7 +329,7 @@ local function line_chars(bufnr, row, line, opts)
       start_col = col,
       end_col = next_col,
       text = text,
-      hl_group = inspect_hl_stack(bufnr, row, col, opts),
+      hl_group = inspect_hl_stack(bufnr, row, col, opts, treesitter_hls_at_col(treesitter_cursor, col)),
     }
     col = next_col
   end
@@ -236,52 +411,12 @@ local function collect_syntax_conceal(bufnr, row, line, opts, operations)
   end
 end
 
-local function capture_metadata(metadata, capture_id)
-  if type(metadata) ~= "table" then
-    return nil
-  end
-  return metadata[capture_id]
-end
-
-local function metadata_value(metadata, capture_id, key)
-  local capture_data = capture_metadata(metadata, capture_id)
-  if type(capture_data) == "table" and capture_data[key] ~= nil then
-    return capture_data[key]
-  end
-  if type(metadata) == "table" then
-    return metadata[key]
-  end
-end
-
-local function treesitter_capture_hl(query, capture_id, lang, metadata)
-  local hl_group = metadata_value(metadata, capture_id, "highlight")
-  if type(hl_group) == "string" and hl_group ~= "" then
-    return hl_group
-  end
-
-  local capture = query.captures and query.captures[capture_id]
-  if type(capture) ~= "string" or capture == "" then
-    return "Conceal"
-  end
-
-  if type(lang) == "string" and lang ~= "" then
-    return "@" .. capture .. "." .. lang
-  end
-
-  return "@" .. capture
-end
-
 local function collect_treesitter_conceal(bufnr, row, line, operations)
   if conceallevel(bufnr) <= 0 then
     return
   end
-  local highlighter_api = vim.treesitter and vim.treesitter.highlighter
-  local highlighter = highlighter_api and highlighter_api.active and highlighter_api.active[bufnr]
-  if highlighter == nil then
-    return
-  end
 
-  local function visit_state(state)
+  highlighter_states(bufnr, function(state)
     local highlighter_query = state.highlighter_query or {}
     local query = highlighter_query._query
     local tree = state.tstree
@@ -314,17 +449,7 @@ local function collect_treesitter_conceal(bufnr, row, line, operations)
         end
       end
     end
-  end
-
-  if type(highlighter.for_each_highlight_state) == "function" then
-    pcall(function()
-      highlighter:for_each_highlight_state(visit_state)
-    end)
-  else
-    for _, state in ipairs(highlighter._highlight_states or {}) do
-      visit_state(state)
-    end
-  end
+  end)
 end
 
 local function collect_extmark_ops(bufnr, row, line, opts, operations)
