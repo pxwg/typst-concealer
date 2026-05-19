@@ -593,12 +593,15 @@ function M:on_render_failed(ev)
   }, ev))
 end
 
-function M:hide()
+function M:hide(opts)
+  opts = opts or {}
   local _, _, overlay = self:resolve(self.visible_overlay_id)
   if overlay == nil or overlay.extmark_id == nil then
     return false
   end
-  local ok = require("typst-concealer.extmark").unconceal_extmark(self.bufnr, overlay.extmark_id) ~= nil
+  local ok = require("typst-concealer.extmark").unconceal_extmark(self.bufnr, overlay.extmark_id, {
+    defer_line_run_reconcile = opts.defer_line_run_reconcile == true,
+  }) ~= nil
   if ok then
     self.hidden = true
     state.get_buf_state(self.bufnr).currently_hidden_extmark_ids[overlay.extmark_id] = true
@@ -606,7 +609,8 @@ function M:hide()
   return ok
 end
 
-function M:show()
+function M:show(opts)
+  opts = opts or {}
   local _, node, overlay = self:resolve(self.visible_overlay_id)
   if
     node == nil
@@ -635,7 +639,9 @@ function M:show()
   if overlay.extmark_id ~= nil then
     state.get_buf_state(self.bufnr).currently_hidden_extmark_ids[overlay.extmark_id] = nil
   end
-  self.image:conceal(node.bufnr, overlay.source_rows or 1)
+  self.image:conceal(node.bufnr, overlay.source_rows or 1, {
+    defer_line_run_reconcile = opts.defer_line_run_reconcile == true,
+  })
   return true
 end
 

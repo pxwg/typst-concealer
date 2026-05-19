@@ -600,8 +600,6 @@ function Manager:sync_cursor_conceal()
     return true
   end
 
-  require("typst-concealer.extmark").sync_inline_line_carriers(self.bufnr, lo, hi)
-
   local should_hide = {}
   for row = lo, hi do
     for _, placement in pairs(self:placements_for_row_cached(row)) do
@@ -621,18 +619,22 @@ function Manager:sync_cursor_conceal()
     else
       local placement = self.extmark_index[extmark_id]
       if placement ~= nil then
-        placement:show()
+        placement:show({ defer_line_run_reconcile = true })
       end
     end
   end
 
   for extmark_id, placement in pairs(should_hide) do
-    if not (bs.currently_hidden_extmark_ids or {})[extmark_id] and placement:hide() then
+    if
+      not (bs.currently_hidden_extmark_ids or {})[extmark_id]
+      and placement:hide({ defer_line_run_reconcile = true })
+    then
       new_hidden[extmark_id] = true
     end
   end
 
   bs.currently_hidden_extmark_ids = new_hidden
+  require("typst-concealer.extmark").reconcile_cursor_line_runs(self.bufnr, lo, hi)
   hover.last_cursor_row = cursor_row
   hover.last_cursor_col = cursor_col
   hover.last_mode = mode

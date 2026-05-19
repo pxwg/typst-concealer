@@ -174,6 +174,7 @@ local function with_stubbed_extmark(fn)
     concealed = {},
     unconcealed = {},
     virtual = {},
+    syncs = {},
     flushed = 0,
   }
 
@@ -249,7 +250,23 @@ local function with_stubbed_extmark(fn)
       }
       return id
     end,
-    sync_inline_line_carriers = function() end,
+    reconcile_cursor_line_runs = function(bufnr, lo, hi)
+      local state = require("typst-concealer.state")
+      local hidden = {}
+      for extmark_id in pairs(state.get_buf_state(bufnr).currently_hidden_extmark_ids or {}) do
+        hidden[#hidden + 1] = extmark_id
+      end
+      table.sort(hidden)
+      calls.syncs[#calls.syncs + 1] = {
+        bufnr = bufnr,
+        lo = lo,
+        hi = hi,
+        hidden = hidden,
+      }
+    end,
+    sync_inline_line_carriers = function(bufnr, lo, hi)
+      package.loaded["typst-concealer.extmark"].reconcile_cursor_line_runs(bufnr, lo, hi)
+    end,
     flush_terminal_data = function()
       calls.flushed = calls.flushed + 1
     end,
@@ -6156,6 +6173,215 @@ local function test_extmark_line_run_progressively_expands_active_block()
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
+local function test_extmark_line_run_clear_invalidates_hover_guard()
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+      block_padding_cols = 0,
+    },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "before", "$", "  x", "$", "after" })
+  vim.api.nvim_win_set_cursor(0, { 5, 0 })
+
+  local runtime = require("typst-concealer.machine.runtime")
+  local extmark = require("typst-concealer.extmark")
+  local image_id = 1313
+  local range = { 1, 0, 3, 1 }
+  local semantics = { display_kind = "block", constraint_kind = "intrinsic", source_kind = "math" }
+  local extmark_id = extmark.place_render_extmark(bufnr, image_id, range, nil, true, semantics)
+  state.item_by_image_id[image_id] = {
+    bufnr = bufnr,
+    image_id = image_id,
+    extmark_id = extmark_id,
+    range = range,
+    display_range = range,
+    node_type = "math",
+    semantics = semantics,
+    natural_cols = 6,
+    natural_rows = 2,
+  }
+
+  extmark.conceal_for_image_id(bufnr, image_id, 6, 2, 3)
+
+  local bs = state.get_buf_state(bufnr)
+  local mm = bs.multiline_marks[extmark_id]
+  assert_truthy(mm ~= nil and mm.line_run_id ~= nil, "block should be owned by a line run before clear")
+
+  local hover = runtime.get_ui_buffer(bufnr).hover
+  hover.invalidated = false
+  assert_eq(extmark.unconceal_extmark(bufnr, extmark_id), true, "unconceal should clear the line run")
+  assert_eq(hover.invalidated, true, "clearing a line run should force the next cursor UI sync")
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_state_prepare_extmark_reuse_invalidates_hover_guard_for_line_run()
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+      block_padding_cols = 0,
+    },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "before", "$", "  y", "$", "after" })
+  vim.api.nvim_win_set_cursor(0, { 5, 0 })
+
+  local runtime = require("typst-concealer.machine.runtime")
+  local extmark = require("typst-concealer.extmark")
+  local image_id = 1314
+  local range = { 1, 0, 3, 1 }
+  local semantics = { display_kind = "block", constraint_kind = "intrinsic", source_kind = "math" }
+  local extmark_id = extmark.place_render_extmark(bufnr, image_id, range, nil, true, semantics)
+  state.item_by_image_id[image_id] = {
+    bufnr = bufnr,
+    image_id = image_id,
+    extmark_id = extmark_id,
+    range = range,
+    display_range = range,
+    node_type = "math",
+    semantics = semantics,
+    natural_cols = 6,
+    natural_rows = 2,
+  }
+
+  extmark.conceal_for_image_id(bufnr, image_id, 6, 2, 3)
+
+  local bs = state.get_buf_state(bufnr)
+  local mm = bs.multiline_marks[extmark_id]
+  assert_truthy(mm ~= nil and mm.line_run_id ~= nil, "block should be owned by a line run before reuse")
+
+  local hover = runtime.get_ui_buffer(bufnr).hover
+  hover.invalidated = false
+  state.prepare_extmark_reuse(bufnr, extmark_id)
+  assert_eq(hover.invalidated, true, "prepare_extmark_reuse should force the next cursor UI sync")
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_extmark_resync_repairs_restored_block_with_occupied_boundary_anchors()
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+      block_padding_cols = 0,
+    },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
+    "previous render item",
+    "",
+    "$",
+    "  x",
+    "$",
+    "$",
+    "  y",
+    "$",
+    "",
+    "next render item",
+  })
+
+  local extmark = require("typst-concealer.extmark")
+  local semantics = { display_kind = "block", constraint_kind = "intrinsic", source_kind = "math" }
+
+  local function bind_block(image_id, range)
+    local extmark_id = extmark.place_render_extmark(bufnr, image_id, range, nil, true, semantics)
+    state.item_by_image_id[image_id] = {
+      bufnr = bufnr,
+      image_id = image_id,
+      extmark_id = extmark_id,
+      range = range,
+      display_range = range,
+      node_type = "math",
+      semantics = semantics,
+      natural_cols = 4,
+      natural_rows = 1,
+      source_rows = range[3] - range[1] + 1,
+    }
+    extmark.conceal_for_image_id(bufnr, image_id, 4, 1, range[3] - range[1] + 1)
+    return extmark_id
+  end
+
+  local first_extmark = bind_block(1315, { 2, 0, 4, 1 })
+  local second_extmark = bind_block(1316, { 5, 0, 7, 1 })
+  local bs = state.get_buf_state(bufnr)
+  assert_truthy(bs.multiline_marks[first_extmark].line_run_id ~= nil, "first block should start collapsed")
+  assert_truthy(bs.multiline_marks[second_extmark].line_run_id ~= nil, "second block should start collapsed")
+
+  vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, 1, 0, { virt_lines = { { { "occupied previous anchor", "" } } } })
+  vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, 8, 0, { virt_lines = { { { "occupied next anchor", "" } } } })
+  state.item_by_image_id[91315] = {
+    bufnr = bufnr,
+    image_id = 91315,
+    range = { 0, 0, 0, 1 },
+    display_range = { 0, 0, 0, 1 },
+    semantics = { display_kind = "inline" },
+  }
+  state.item_by_image_id[91316] = {
+    bufnr = bufnr,
+    image_id = 91316,
+    range = { 9, 0, 9, 1 },
+    display_range = { 9, 0, 9, 1 },
+    semantics = { display_kind = "inline" },
+  }
+
+  vim.api.nvim_win_set_cursor(0, { 4, 0 })
+  assert_eq(extmark.unconceal_extmark(bufnr, first_extmark), true, "first block should expand under cursor")
+  bs.currently_hidden_extmark_ids[first_extmark] = true
+  assert_truthy(bs.multiline_marks[second_extmark].line_run_id ~= nil, "second block should stay collapsed")
+
+  vim.api.nvim_win_set_cursor(0, { 6, 0 })
+  extmark.reconcile_cursor_line_runs(bufnr, 5, 5)
+  bs.currently_hidden_extmark_ids[first_extmark] = nil
+  extmark.conceal_for_image_id(bufnr, 1315, 4, 1, 3)
+  assert_eq(
+    bs.multiline_marks[first_extmark].line_run_id,
+    nil,
+    "restoring without cursor anchor context should still reproduce the missing line-run state"
+  )
+
+  assert_eq(extmark.unconceal_extmark(bufnr, second_extmark), true, "second block should expand under cursor")
+  bs.currently_hidden_extmark_ids[second_extmark] = true
+  extmark.reconcile_cursor_line_runs(bufnr, 5, 5)
+
+  local restored = bs.multiline_marks[first_extmark]
+  assert_truthy(restored.line_run_id ~= nil, "final cursor resync should restore the first block line-run")
+  assert_eq(bs.line_run_by_row[2], restored.line_run_id, "first block start row should be collapsed again")
+  assert_eq(bs.line_run_by_row[3], restored.line_run_id, "first block middle row should be collapsed again")
+  assert_eq(bs.line_run_by_row[4], restored.line_run_id, "first block end row should be collapsed again")
+  assert_eq(bs.line_run_by_row[5], nil, "active second block row should remain expanded")
+
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  bs.currently_hidden_extmark_ids[second_extmark] = nil
+  extmark.conceal_for_image_id(bufnr, 1316, 4, 1, 3, { defer_line_run_reconcile = true })
+  assert_eq(
+    bs.multiline_marks[second_extmark].line_run_id,
+    nil,
+    "restoring the lower block should defer line-run creation to the cursor scheduler"
+  )
+  extmark.reconcile_cursor_line_runs(bufnr, 1, 1)
+
+  local merged_run_id = bs.multiline_marks[first_extmark].line_run_id
+  assert_truthy(merged_run_id ~= nil, "moving above the block cluster should restore the upper block")
+  assert_eq(
+    bs.multiline_marks[second_extmark].line_run_id,
+    merged_run_id,
+    "moving above the block cluster should merge the lower block back into the run"
+  )
+  assert_eq(bs.line_run_by_row[2], merged_run_id, "upper block start row should be collapsed after upward move")
+  assert_eq(bs.line_run_by_row[7], merged_run_id, "lower block end row should be collapsed after upward move")
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
 local function virt_line_text(line)
   local parts = {}
   for _, chunk in ipairs(line or {}) do
@@ -7767,6 +7993,13 @@ local function test_formula_cursor_fast_boundary_switch_only_touches_previous_an
     for _, call in ipairs(calls.concealed) do
       assert_truthy(call.image_id ~= 103, "unrelated formula image should not be reattached")
     end
+    assert_eq(#calls.syncs, 3, "cursor boundary changes should reconcile line-runs once after each transition")
+    assert_eq(#calls.syncs[#calls.syncs].hidden, 1, "final line-run resync should observe one settled hidden extmark")
+    assert_eq(
+      calls.syncs[#calls.syncs].hidden[1],
+      202,
+      "final line-run resync should observe the settled hidden extmark set"
+    )
   end)
 
   vim.api.nvim_buf_delete(bufnr, { force = true })
@@ -8359,6 +8592,18 @@ local tests = {
   {
     test_extmark_line_run_progressively_expands_active_block,
     "ok extmark line-run progressively expands active block",
+  },
+  {
+    test_extmark_line_run_clear_invalidates_hover_guard,
+    "ok extmark line-run clear invalidates hover guard",
+  },
+  {
+    test_state_prepare_extmark_reuse_invalidates_hover_guard_for_line_run,
+    "ok state prepares line-run reuse with hover invalidation",
+  },
+  {
+    test_extmark_resync_repairs_restored_block_with_occupied_boundary_anchors,
+    "ok extmark cursor resync repairs restored block with occupied anchors",
   },
   {
     test_extmark_scales_wide_block_images_to_window_width,

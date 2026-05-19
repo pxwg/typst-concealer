@@ -247,6 +247,20 @@ function M.clear_preview_timer(bufnr)
   bs.post_commit_ui_pending = false
 end
 
+--- Force the cursor-driven UI sync to re-evaluate on its next tick.
+--- @param bufnr integer
+function M.invalidate_hover(bufnr)
+  local bs = M.get_buf_state(bufnr)
+  if bs.hover ~= nil then
+    bs.hover.invalidated = true
+  end
+
+  local ok, runtime = pcall(require, "typst-concealer.machine.runtime")
+  if ok and runtime ~= nil and type(runtime.invalidate_hover) == "function" then
+    runtime.invalidate_hover(bufnr)
+  end
+end
+
 --- Release sub-extmarks (ns_id2) attached to extmark_id before reuse or deletion.
 --- @param bufnr integer
 --- @param extmark_id integer
@@ -288,6 +302,7 @@ function M.prepare_extmark_reuse(bufnr, extmark_id)
       end
     end
     bs.line_run_marks[run_id] = nil
+    M.invalidate_hover(bufnr)
     return true
   end
 

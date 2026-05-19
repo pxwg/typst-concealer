@@ -675,6 +675,7 @@ clear_line_run = function(bufnr, run_id)
   end
 
   runs[run_id] = nil
+  state.invalidate_hover(bufnr)
   return run
 end
 
@@ -1130,8 +1131,11 @@ end
 --- Remove rendered placeholder text/conceal from an extmark so the source stays editable.
 --- @param bufnr integer
 --- @param extmark_id integer
+--- @param opts table|nil
 --- @return boolean|nil
-function M.unconceal_extmark(bufnr, extmark_id)
+function M.unconceal_extmark(bufnr, extmark_id, opts)
+  opts = opts or {}
+  local defer_line_run_reconcile = opts.defer_line_run_reconcile == true
   local bs = state.get_buf_state(bufnr)
   clear_inline_line_attachment(bufnr, extmark_id)
   local ok_mark, current_mark =
@@ -1154,12 +1158,14 @@ function M.unconceal_extmark(bufnr, extmark_id)
         mm.line_run_display_lines = nil
         mm.line_run_start_row = nil
         mm.line_run_end_row = nil
-        refresh_line_runs_around_range(bufnr, start_row, end_row, {
-          anchor_rows = row_set(start_row, end_row),
-          suppressed_extmark_ids = {
-            [extmark_id] = true,
-          },
-        })
+        if not defer_line_run_reconcile then
+          refresh_line_runs_around_range(bufnr, start_row, end_row, {
+            anchor_rows = row_set(start_row, end_row),
+            suppressed_extmark_ids = {
+              [extmark_id] = true,
+            },
+          })
+        end
         return true
       end
       if mm.carrier_id then
@@ -1193,32 +1199,36 @@ function M.unconceal_extmark(bufnr, extmark_id)
   if #mark == 0 then
     return nil
   end
-  local row, col, opts = mark[1], mark[2], mark[3]
+  local row, col, mark_opts = mark[1], mark[2], mark[3]
   vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
     id = extmark_id,
     virt_text = { { "" } },
-    end_row = opts.end_row,
-    end_col = opts.end_col,
+    end_row = mark_opts.end_row,
+    end_col = mark_opts.end_col,
     conceal = nil,
-    virt_text_pos = opts.virt_text_pos,
-    invalidate = opts.invalidate,
+    virt_text_pos = mark_opts.virt_text_pos,
+    invalidate = mark_opts.invalidate,
   })
-  refresh_line_runs_around_range(bufnr, row, opts.end_row or row, {
-    anchor_rows = row_set(row, opts.end_row or row),
-    suppressed_extmark_ids = {
-      [extmark_id] = true,
-    },
-    suppressed_rows = row_set(row, opts.end_row or row),
-  })
+  if not defer_line_run_reconcile then
+    refresh_line_runs_around_range(bufnr, row, mark_opts.end_row or row, {
+      anchor_rows = row_set(row, mark_opts.end_row or row),
+      suppressed_extmark_ids = {
+        [extmark_id] = true,
+      },
+      suppressed_rows = row_set(row, mark_opts.end_row or row),
+    })
+  end
   return true
 end
 
---- Hide compact inline line carriers for the cursor span and restore the
---- previous span when the cursor leaves it.
+--- Reconcile all line-run carriers after a cursor visibility transition.
+--- Atomic show/hide operations only mutate their own source extmark/image
+--- payload; this scheduler owns cross-extmark grouping, splitting and anchor
+--- selection for the final hidden set.
 --- @param bufnr integer
 --- @param lo integer
 --- @param hi integer|nil
-function M.sync_inline_line_carriers(bufnr, lo, hi)
+function M.reconcile_cursor_line_runs(bufnr, lo, hi)
   if type(lo) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
     return
   end
@@ -1260,15 +1270,25 @@ function M.sync_inline_line_carriers(bufnr, lo, hi)
   end
 end
 
+--- Back-compat alias for older callers.
+--- @param bufnr integer
+--- @param lo integer
+--- @param hi integer|nil
+function M.sync_inline_line_carriers(bufnr, lo, hi)
+  return M.reconcile_cursor_line_runs(bufnr, lo, hi)
+end
+
 --- Update the virt_text/virt_lines on an existing extmark.
 --- @param bufnr           integer
 --- @param extmark_id      integer
 --- @param virt_text_data  table
 --- @param skip_hide_check boolean|nil
-function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_check)
+--- @param opts table|nil
+function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_check, opts)
   if type(extmark_id) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
     return
   end
+  local update_opts = opts or {}
   local bs = state.get_buf_state(bufnr)
   if (skip_hide_check ~= true) and bs.currently_hidden_extmark_ids[extmark_id] ~= nil then
     return
@@ -1280,7 +1300,7 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
   if #m == 0 then
     return
   end
-  local row, col, opts = m[1], m[2], m[3]
+  local row, col, mark_opts = m[1], m[2], m[3]
   local single_line = normalize_virt_text_line(virt_text_data)
 
   local mm = bs.multiline_marks[extmark_id]
@@ -1300,11 +1320,13 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
     local display_lines = normalize_virt_text_lines(virt_text_data)
     mm.line_run_display_lines = display_lines
     mm.line_run_start_row = row
-    mm.line_run_end_row = opts.end_row
-    refresh_line_run_for_row(bufnr, row)
+    mm.line_run_end_row = mark_opts.end_row
+    if update_opts.defer_line_run_reconcile ~= true then
+      refresh_line_run_for_row(bufnr, row)
+    end
     return
   else
-    local height = opts.end_row - row + 1
+    local height = mark_opts.end_row - row + 1
     if height ~= 1 then
       if mm then
         if mm.line_run_id ~= nil then
@@ -1324,13 +1346,13 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
       bs.line_run_by_row = bs.line_run_by_row or {}
       bs.line_run_by_extmark = bs.line_run_by_extmark or {}
 
-      local lines = vim.api.nvim_buf_get_lines(bufnr, row, opts.end_row + 1, false)
+      local lines = vim.api.nvim_buf_get_lines(bufnr, row, mark_opts.end_row + 1, false)
       local sub_ids = {}
       local rows = {}
       for i = 1, height do
         local source_row = row + i - 1
         local conceal = nil
-        if opts.virt_text_pos ~= "right_align" then
+        if mark_opts.virt_text_pos ~= "right_align" then
           conceal = ""
         end
         local virt_text_line = virt_text_data[i]
@@ -1343,7 +1365,7 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
         local new_id = vim.api.nvim_buf_set_extmark(bufnr, state.ns_id2, row + i - 1, 0, {
           virt_text = virt_text_line,
           conceal = conceal,
-          virt_text_pos = opts.virt_text_pos,
+          virt_text_pos = mark_opts.virt_text_pos,
           end_col = #(lines[i] or ""),
           end_row = row + i - 1,
         })
@@ -1355,7 +1377,7 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
       bs.line_run_marks[run_id] = {
         mode = "row_overlay",
         start_row = row,
-        end_row = opts.end_row,
+        end_row = mark_opts.end_row,
         rows = rows,
         sub_ids = sub_ids,
         extmark_ids = {
@@ -1367,16 +1389,18 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
         is_multiline_overlay = true,
         line_run_id = run_id,
         sub_ids = sub_ids,
-        conceals_source = opts.virt_text_pos ~= "right_align",
+        conceals_source = mark_opts.virt_text_pos ~= "right_align",
       }
-    elseif opts.virt_text_pos == "inline" or (opts.virt_text_pos == "overlay" and opts.conceal == "") then
+    elseif
+      mark_opts.virt_text_pos == "inline" or (mark_opts.virt_text_pos == "overlay" and mark_opts.conceal == "")
+    then
       vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
         id = extmark_id,
         virt_text = single_line,
-        virt_text_pos = opts.virt_text_pos,
-        invalidate = opts.invalidate,
-        end_col = opts.end_col,
-        end_row = opts.end_row,
+        virt_text_pos = mark_opts.virt_text_pos,
+        invalidate = mark_opts.invalidate,
+        end_col = mark_opts.end_col,
+        end_row = mark_opts.end_row,
         --- @diagnostic disable-next-line nvim type is wrong
         conceal = "",
       })
@@ -1384,12 +1408,12 @@ function M.update_extmark_text(bufnr, extmark_id, virt_text_data, skip_hide_chec
       vim.api.nvim_buf_set_extmark(bufnr, state.ns_id, row, col, {
         id = extmark_id,
         virt_lines = { single_line },
-        virt_text_pos = opts.virt_text_pos,
-        invalidate = opts.invalidate,
-        end_col = opts.end_col,
-        end_row = opts.end_row,
+        virt_text_pos = mark_opts.virt_text_pos,
+        invalidate = mark_opts.invalidate,
+        end_col = mark_opts.end_col,
+        end_row = mark_opts.end_row,
         --- @diagnostic disable-next-line nvim type is wrong
-        conceal = opts.conceal,
+        conceal = mark_opts.conceal,
       })
     end
   end
@@ -1403,7 +1427,18 @@ end
 --- @param natural_rows integer
 --- @param source_rows integer
 --- @param item table|nil
-conceal_extmark_with_image = function(bufnr, extmark_id, render_image_id, natural_cols, natural_rows, source_rows, item)
+--- @param opts table|nil
+conceal_extmark_with_image = function(
+  bufnr,
+  extmark_id,
+  render_image_id,
+  natural_cols,
+  natural_rows,
+  source_rows,
+  item,
+  opts
+)
+  opts = opts or {}
   local bs = state.get_buf_state(bufnr)
   if type(extmark_id) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
     return
@@ -1515,9 +1550,9 @@ conceal_extmark_with_image = function(bufnr, extmark_id, render_image_id, natura
   end
 
   if multiline_extmark_ids == nil then
-    M.update_extmark_text(bufnr, extmark_id, make_row_list(1))
+    M.update_extmark_text(bufnr, extmark_id, make_row_list(1), nil, opts)
   elseif multiline_extmark_ids.is_block_carrier then
-    M.update_extmark_text(bufnr, extmark_id, build_block_display_lines())
+    M.update_extmark_text(bufnr, extmark_id, build_block_display_lines(), nil, opts)
   else
     -- Non-block multiline: existing centering logic
     local lines = {}
@@ -1542,7 +1577,7 @@ conceal_extmark_with_image = function(bufnr, extmark_id, render_image_id, natura
         end
       end
     end
-    M.update_extmark_text(bufnr, extmark_id, lines)
+    M.update_extmark_text(bufnr, extmark_id, lines, nil, opts)
   end
 
   if
@@ -1551,6 +1586,7 @@ conceal_extmark_with_image = function(bufnr, extmark_id, render_image_id, natura
     and item.semantics.display_kind == "inline"
     and item.range ~= nil
     and item.range[1] == item.range[3]
+    and opts.defer_line_run_reconcile ~= true
   then
     refresh_inline_line(bufnr, item.range[1])
   end
@@ -1566,7 +1602,9 @@ end
 --- @param natural_cols integer
 --- @param natural_rows integer
 --- @param source_rows  integer
-function M.conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, source_rows)
+--- @param opts table|nil
+function M.conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, source_rows, opts)
+  opts = opts or {}
   local extmark_id = state.image_id_to_extmark[image_id]
   local bs = state.get_buf_state(bufnr)
   local item = state.get_item_by_image_id(image_id)
@@ -1575,7 +1613,7 @@ function M.conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, sou
     return
   end
   if extmark_id ~= nil and cursor_visibility.should_preserve_source_at_cursor(bufnr, item) then
-    if M.unconceal_extmark(bufnr, extmark_id) ~= nil then
+    if M.unconceal_extmark(bufnr, extmark_id, opts) ~= nil then
       bs.currently_hidden_extmark_ids[extmark_id] = true
     end
     return
@@ -1583,7 +1621,7 @@ function M.conceal_for_image_id(bufnr, image_id, natural_cols, natural_rows, sou
   if extmark_id ~= nil and bs.currently_hidden_extmark_ids[extmark_id] then
     return
   end
-  conceal_extmark_with_image(bufnr, extmark_id, image_id, natural_cols, natural_rows, source_rows, item)
+  conceal_extmark_with_image(bufnr, extmark_id, image_id, natural_cols, natural_rows, source_rows, item, opts)
 end
 
 --- Render an existing kitty image into an arbitrary extmark.

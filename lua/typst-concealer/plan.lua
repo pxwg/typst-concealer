@@ -839,14 +839,16 @@ end
 --- @param bufnr integer
 --- @param bs table  per-buffer state
 --- @param extmark_id integer
-local function hide_one_extmark(bufnr, _bs, extmark_id)
-  return require("typst-concealer.extmark").unconceal_extmark(bufnr, extmark_id)
+--- @param opts table|nil
+local function hide_one_extmark(bufnr, _bs, extmark_id, opts)
+  return require("typst-concealer.extmark").unconceal_extmark(bufnr, extmark_id, opts)
 end
 
 --- Restore a previously hidden extmark from the current rendered item state.
 --- @param bufnr integer
 --- @param extmark_id integer
-local function restore_one_extmark(bufnr, extmark_id)
+--- @param opts table|nil
+local function restore_one_extmark(bufnr, extmark_id, opts)
   local bs = state.get_buf_state(bufnr)
   local brs = state.buffer_render_state[bufnr]
   if brs == nil or brs.extmark_to_item == nil then
@@ -867,7 +869,8 @@ local function restore_one_extmark(bufnr, extmark_id)
     item.image_id,
     item.natural_cols,
     item.natural_rows,
-    item.source_rows or (effective_range[3] - effective_range[1] + 1)
+    item.source_rows or (effective_range[3] - effective_range[1] + 1),
+    opts
   )
 end
 
@@ -943,8 +946,6 @@ function M.hide_extmarks_at_cursor(bufnr)
     return
   end
 
-  require("typst-concealer.extmark").sync_inline_line_carriers(bufnr, lo, hi)
-
   -- Collect items to hide from line index (no nvim_buf_get_extmarks call)
   local brs = state.buffer_render_state[bufnr]
   local line_to_items = (brs and brs.line_to_items) or {}
@@ -968,14 +969,14 @@ function M.hide_extmarks_at_cursor(bufnr)
     if should_hide[extmark_id] then
       new_hidden[extmark_id] = true -- still under cursor, keep hidden
     else
-      restore_one_extmark(bufnr, extmark_id)
+      restore_one_extmark(bufnr, extmark_id, { defer_line_run_reconcile = true })
     end
   end
 
   -- Hide newly entered extmarks
   for extmark_id, _ in pairs(should_hide) do
     if not bs.currently_hidden_extmark_ids[extmark_id] then
-      local hidden = hide_one_extmark(bufnr, bs, extmark_id)
+      local hidden = hide_one_extmark(bufnr, bs, extmark_id, { defer_line_run_reconcile = true })
       if hidden ~= nil then
         new_hidden[extmark_id] = true
       end
@@ -983,6 +984,7 @@ function M.hide_extmarks_at_cursor(bufnr)
   end
 
   bs.currently_hidden_extmark_ids = new_hidden
+  require("typst-concealer.extmark").reconcile_cursor_line_runs(bufnr, lo, hi)
   hover.last_cursor_row = cursor_row
   hover.last_cursor_col = cursor_col
   hover.last_mode = mode

@@ -81,7 +81,7 @@ function M:upload(opts)
   return true
 end
 
-function M:conceal(bufnr, source_rows)
+function M:conceal(bufnr, source_rows, opts)
   if not self:is_ready() then
     return false
   end
@@ -90,7 +90,8 @@ function M:conceal(bufnr, source_rows)
     self.image_id,
     self.natural_cols,
     self.natural_rows,
-    source_rows or self.source_rows or 1
+    source_rows or self.source_rows or 1,
+    opts
   )
   return true
 end
