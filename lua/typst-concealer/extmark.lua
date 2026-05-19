@@ -390,7 +390,17 @@ local function build_inline_line_replacements(bufnr, row, items)
   return replacements
 end
 
-local function line_run_block_for_row(bufnr, row)
+local function extmark_suppressed(bufnr, extmark_id, opts)
+  if type(extmark_id) ~= "number" then
+    return false
+  end
+  if opts and opts.suppressed_extmark_ids and opts.suppressed_extmark_ids[extmark_id] then
+    return true
+  end
+  return state.get_buf_state(bufnr).currently_hidden_extmark_ids[extmark_id] ~= nil
+end
+
+local function line_run_block_for_row(bufnr, row, opts)
   local bs = state.get_buf_state(bufnr)
   for _, item in pairs(state.item_by_image_id) do
     local semantics = item and item.semantics or nil
@@ -403,7 +413,7 @@ local function line_run_block_for_row(bufnr, row)
       and mm
       and mm.is_block_carrier == true
       and type(mm.line_run_display_lines) == "table"
-      and bs.currently_hidden_extmark_ids[extmark_id] == nil
+      and not extmark_suppressed(bufnr, extmark_id, opts)
     then
       local start_row = mm.line_run_start_row or extmark_row(bufnr, state.ns_id, extmark_id)
       local end_row = mm.line_run_end_row or start_row
@@ -416,12 +426,12 @@ end
 
 local function line_run_row_ready(bufnr, row, opts)
   opts = opts or {}
-  if line_run_block_for_row(bufnr, row) ~= nil then
-    return true
-  end
   local suppressed_rows = opts.suppressed_rows or state.get_buf_state(bufnr).inline_line_suppressed_rows
   if suppressed_rows and suppressed_rows[row] then
     return false
+  end
+  if line_run_block_for_row(bufnr, row, opts) ~= nil then
+    return true
   end
   if opts.ignore_cursor ~= true and cursor_row_for_buf(bufnr) == row then
     return false
@@ -431,8 +441,8 @@ local function line_run_row_ready(bufnr, row, opts)
   return #items > 0 and build_inline_line_replacements(bufnr, row, items) ~= nil
 end
 
-local function build_line_run_row(bufnr, row)
-  local _, extmark_id, mm, is_block_start = line_run_block_for_row(bufnr, row)
+local function build_line_run_row(bufnr, row, opts)
+  local _, extmark_id, mm, is_block_start = line_run_block_for_row(bufnr, row, opts)
   if mm ~= nil then
     return is_block_start and mm.line_run_display_lines or {}, {
       block_extmark_id = extmark_id,
@@ -525,10 +535,11 @@ local function clear_line_runs_in_range(bufnr, start_row, end_row)
   return cleared
 end
 
-local function choose_line_run_anchor(bufnr, start_row, end_row)
+local function choose_line_run_anchor(bufnr, start_row, end_row, opts)
   local line_count = vim.api.nvim_buf_line_count(bufnr)
+  local anchor_rows = opts and opts.anchor_rows or nil
 
-  local function scan(anchor_row, direction)
+  local function scan_safe(anchor_row, direction)
     while anchor_row >= 0 and anchor_row < line_count do
       if row_has_render_item(bufnr, anchor_row) then
         return nil, nil
@@ -541,12 +552,28 @@ local function choose_line_run_anchor(bufnr, start_row, end_row)
     return nil, nil
   end
 
-  local previous_row, previous_above = scan(start_row - 1, -1)
+  local function boundary_anchor(row, direction)
+    if anchor_rows and anchor_rows[row] and row >= 0 and row < line_count then
+      return row, direction > 0
+    end
+  end
+
+  local previous_row, previous_above = scan_safe(start_row - 1, -1)
   if previous_row ~= nil then
     return previous_row, previous_above
   end
 
-  return scan(end_row + 1, 1)
+  local next_row, next_above = scan_safe(end_row + 1, 1)
+  if next_row ~= nil then
+    return next_row, next_above
+  end
+
+  previous_row, previous_above = boundary_anchor(start_row - 1, -1)
+  if previous_row ~= nil then
+    return previous_row, previous_above
+  end
+
+  return boundary_anchor(end_row + 1, 1)
 end
 
 refresh_line_run_for_row = function(bufnr, row, opts)
@@ -573,7 +600,7 @@ refresh_line_run_for_row = function(bufnr, row, opts)
 
   clear_line_runs_in_range(bufnr, start_row, end_row)
 
-  local anchor_row, virt_lines_above = choose_line_run_anchor(bufnr, start_row, end_row)
+  local anchor_row, virt_lines_above = choose_line_run_anchor(bufnr, start_row, end_row, opts)
   if anchor_row == nil then
     return false
   end
@@ -582,7 +609,7 @@ refresh_line_run_for_row = function(bufnr, row, opts)
   local inline_rows = {}
   local block_extmark_ids = {}
   for run_row = start_row, end_row do
-    local row_lines, meta = build_line_run_row(bufnr, run_row)
+    local row_lines, meta = build_line_run_row(bufnr, run_row, opts)
     if row_lines == nil then
       return false
     end
@@ -673,6 +700,38 @@ end
 
 refresh_inline_line = function(bufnr, row, opts)
   return refresh_line_run_for_row(bufnr, row, opts)
+end
+
+local function row_set(start_row, end_row)
+  local rows = {}
+  if type(start_row) ~= "number" or type(end_row) ~= "number" then
+    return rows
+  end
+  for row = start_row, end_row do
+    rows[row] = true
+  end
+  return rows
+end
+
+local function refresh_line_runs_around_range(bufnr, start_row, end_row, opts)
+  opts = opts or {}
+  if type(start_row) ~= "number" or type(end_row) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  clear_line_runs_in_range(bufnr, start_row, end_row)
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+  local boundary_rows = opts.anchor_rows or row_set(start_row, end_row)
+  local refresh_opts = vim.tbl_extend("force", opts, {
+    anchor_rows = boundary_rows,
+  })
+
+  if start_row > 0 then
+    refresh_line_run_for_row(bufnr, start_row - 1, refresh_opts)
+  end
+  if end_row + 1 < line_count then
+    refresh_line_run_for_row(bufnr, end_row + 1, refresh_opts)
+  end
 end
 
 local place_image_extmark
@@ -888,19 +947,32 @@ end
 --- @return boolean|nil
 function M.unconceal_extmark(bufnr, extmark_id)
   local bs = state.get_buf_state(bufnr)
-  local ok_mark, current_mark = pcall(vim.api.nvim_buf_get_extmark_by_id, bufnr, state.ns_id, extmark_id, {})
+  local ok_mark, current_mark =
+    pcall(vim.api.nvim_buf_get_extmark_by_id, bufnr, state.ns_id, extmark_id, { details = true })
+  local source_start_row = nil
+  local source_end_row = nil
   if ok_mark and current_mark ~= nil and #current_mark > 0 then
-    clear_inline_line_mark(bufnr, current_mark[1])
+    source_start_row = current_mark[1]
+    source_end_row = (current_mark[3] and current_mark[3].end_row) or source_start_row
+    clear_inline_line_mark(bufnr, source_start_row)
   end
 
   local mm = bs.multiline_marks[extmark_id]
   if mm ~= nil then
     if mm.is_block_carrier then
+      local start_row = mm.line_run_start_row or source_start_row
+      local end_row = mm.line_run_end_row or source_end_row or start_row
       if mm.line_run_id ~= nil and clear_line_run ~= nil then
         clear_line_run(bufnr, mm.line_run_id)
         mm.line_run_display_lines = nil
         mm.line_run_start_row = nil
         mm.line_run_end_row = nil
+        refresh_line_runs_around_range(bufnr, start_row, end_row, {
+          anchor_rows = row_set(start_row, end_row),
+          suppressed_extmark_ids = {
+            [extmark_id] = true,
+          },
+        })
         return true
       end
       if mm.carrier_id then
@@ -944,6 +1016,13 @@ function M.unconceal_extmark(bufnr, extmark_id)
     virt_text_pos = opts.virt_text_pos,
     invalidate = opts.invalidate,
   })
+  refresh_line_runs_around_range(bufnr, row, opts.end_row or row, {
+    anchor_rows = row_set(row, opts.end_row or row),
+    suppressed_extmark_ids = {
+      [extmark_id] = true,
+    },
+    suppressed_rows = row_set(row, opts.end_row or row),
+  })
   return true
 end
 
@@ -975,6 +1054,7 @@ function M.sync_inline_line_carriers(bufnr, lo, hi)
     if not next_rows[row] then
       refresh_line_run_for_row(bufnr, row, {
         ignore_cursor = true,
+        anchor_rows = next_rows,
         suppressed_rows = next_rows,
       })
     end
@@ -984,6 +1064,7 @@ function M.sync_inline_line_carriers(bufnr, lo, hi)
   for row = math.max(0, lo - 1), math.min(line_count - 1, hi + 1) do
     if not next_rows[row] then
       refresh_line_run_for_row(bufnr, row, {
+        anchor_rows = next_rows,
         suppressed_rows = next_rows,
       })
     end

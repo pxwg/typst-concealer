@@ -6048,6 +6048,114 @@ local function test_extmark_nonblock_multiline_uses_line_run_lifecycle()
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end
 
+local function test_extmark_line_run_progressively_expands_active_block()
+  local state = fresh_state()
+  package.loaded["typst-concealer"] = {
+    config = {
+      conceal_in_normal = false,
+      block_padding_cols = 0,
+    },
+  }
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
+    "A $a$",
+    "$ b $",
+    "C $c$",
+    "after",
+  })
+  vim.api.nvim_win_set_cursor(0, { 4, 0 })
+
+  local extmark = require("typst-concealer.extmark")
+  local inline_semantics = { display_kind = "inline", constraint_kind = "intrinsic", source_kind = "math" }
+  local block_semantics = { display_kind = "block", constraint_kind = "intrinsic", source_kind = "math" }
+
+  local first_id = 1310
+  local first_range = { 0, 2, 0, 5 }
+  local first_extmark = extmark.place_render_extmark(bufnr, first_id, first_range, nil, true, inline_semantics)
+  state.item_by_image_id[first_id] = {
+    bufnr = bufnr,
+    image_id = first_id,
+    extmark_id = first_extmark,
+    range = first_range,
+    display_range = first_range,
+    node_type = "math",
+    semantics = inline_semantics,
+    natural_cols = 1,
+    natural_rows = 1,
+  }
+
+  local block_id = 1311
+  local block_range = { 1, 0, 1, 5 }
+  local block_extmark = extmark.place_render_extmark(bufnr, block_id, block_range, nil, true, block_semantics)
+  state.item_by_image_id[block_id] = {
+    bufnr = bufnr,
+    image_id = block_id,
+    extmark_id = block_extmark,
+    range = block_range,
+    display_range = block_range,
+    node_type = "math",
+    semantics = block_semantics,
+    natural_cols = 2,
+    natural_rows = 1,
+  }
+
+  local last_id = 1312
+  local last_range = { 2, 2, 2, 5 }
+  local last_extmark = extmark.place_render_extmark(bufnr, last_id, last_range, nil, true, inline_semantics)
+  state.item_by_image_id[last_id] = {
+    bufnr = bufnr,
+    image_id = last_id,
+    extmark_id = last_extmark,
+    range = last_range,
+    display_range = last_range,
+    node_type = "math",
+    semantics = inline_semantics,
+    natural_cols = 1,
+    natural_rows = 1,
+  }
+
+  extmark.conceal_for_image_id(bufnr, first_id, 1, 1, 1)
+  extmark.conceal_for_image_id(bufnr, block_id, 2, 1, 1)
+  extmark.conceal_for_image_id(bufnr, last_id, 1, 1, 1)
+
+  local bs = state.get_buf_state(bufnr)
+  local block_mm = bs.multiline_marks[block_extmark]
+  assert_truthy(block_mm ~= nil and block_mm.line_run_id ~= nil, "block should join the initial collapsed run")
+  assert_eq(
+    bs.inline_line_marks[0].line_run_id,
+    block_mm.line_run_id,
+    "prefix inline row should share the initial collapsed run"
+  )
+  assert_eq(
+    bs.inline_line_marks[2].line_run_id,
+    block_mm.line_run_id,
+    "suffix inline row should share the initial collapsed run"
+  )
+
+  assert_eq(extmark.unconceal_extmark(bufnr, block_extmark), true, "active block should expand")
+  assert_eq(block_mm.line_run_id, nil, "active block should leave the collapsed run")
+  assert_eq(block_mm.line_run_display_lines, nil, "active block display lines should be suppressed while expanded")
+  assert_eq(bs.line_run_by_row[1], nil, "active block source row should not be concealed by a line run")
+
+  local prefix = bs.inline_line_marks[0]
+  local suffix = bs.inline_line_marks[2]
+  assert_truthy(prefix ~= nil, "rows above the active block should remain collapsed")
+  assert_truthy(suffix ~= nil, "rows below the active block should remain collapsed")
+  assert_truthy(prefix.line_run_id ~= suffix.line_run_id, "prefix and suffix should become separate runs")
+
+  local prefix_carrier = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, prefix.carrier_id, { details = true })
+  assert_eq(prefix_carrier[1], 1, "prefix run should anchor on the active row when no safe row exists above")
+  assert_eq(prefix_carrier[3].virt_lines_above, true, "prefix run should render above the active row")
+
+  local suffix_carrier = vim.api.nvim_buf_get_extmark_by_id(bufnr, state.ns_id2, suffix.carrier_id, { details = true })
+  assert_eq(suffix_carrier[1], 3, "suffix run should use the following safe row when one exists")
+  assert_eq(suffix_carrier[3].virt_lines_above, true, "suffix run should render before the following safe row")
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
 local function virt_line_text(line)
   local parts = {}
   for _, chunk in ipairs(line or {}) do
@@ -8219,6 +8327,10 @@ local tests = {
   {
     test_extmark_nonblock_multiline_uses_line_run_lifecycle,
     "ok extmark non-block multiline uses line-run lifecycle",
+  },
+  {
+    test_extmark_line_run_progressively_expands_active_block,
+    "ok extmark line-run progressively expands active block",
   },
   {
     test_extmark_scales_wide_block_images_to_window_width,
