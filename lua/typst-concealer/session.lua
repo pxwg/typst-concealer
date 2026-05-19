@@ -564,6 +564,7 @@ local on_service_response
 local finish_service_response
 local get_compiler_service
 local send_next_service_payload
+local send_or_queue_service_payload
 local service_cache_key
 
 --- @param bufnr integer
@@ -1140,6 +1141,68 @@ local function build_latex_formula_service_spec(request, project_scope, config)
   }
 end
 
+local function latex_mitex_fast_path_enabled(config)
+  local latex_config = (config.backends and config.backends.latex) or {}
+  return latex_config.mitex_fast_path ~= false
+end
+
+local function latex_job_source(job)
+  return job.source_str or job.source_text or job.str or ""
+end
+
+local function latex_job_backend_node_type(job)
+  return job.backend_node_type or (job.semantics and job.semantics.backend_node_type) or "inline_formula"
+end
+
+local function build_latex_mitex_item(item, mitex_prelude)
+  local next_item = vim.deepcopy(item)
+  local source = latex_job_source(item)
+  local backend_node_type = latex_job_backend_node_type(item)
+  local render_text =
+    require("typst-concealer.latex-wrapper").build_mitex_render_text(source, backend_node_type, mitex_prelude)
+  next_item.source_str = source
+  next_item.source_text = render_text
+  next_item.str = render_text
+  next_item.source_text_hash =
+    stable_hash(table.concat({ "latex-mitex", mitex_prelude, source, backend_node_type }, "\0"))
+  next_item.prelude_count = 0
+  next_item.requires_mitex = true
+  next_item.node_type = next_item.node_type or "math"
+  next_item.backend_node_type = backend_node_type
+  next_item.semantics = vim.deepcopy(next_item.semantics or {})
+  next_item.semantics.backend_id = "latex"
+  next_item.semantics.backend_node_type = backend_node_type
+  next_item.semantics.source_kind = "latex"
+  next_item.semantics.latex_mitex_fast_path = true
+  return next_item
+end
+
+local function latex_mitex_prelude(project_scope, config)
+  local latex_config = (config.backends and config.backends.latex) or {}
+  return require("typst-concealer.latex-wrapper").build_mitex_prelude(project_scope, latex_config)
+end
+
+local function build_latex_mitex_request(request, project_scope, config)
+  local mitex_prelude = latex_mitex_prelude(project_scope, config)
+  local mitex_request = vim.deepcopy(request)
+  mitex_request.jobs = {}
+
+  for _, job in ipairs(request.jobs or {}) do
+    local next_job = vim.deepcopy(job)
+    if not (next_job.is_stub or next_job.is_tombstone or next_job.overlay_id == nil) then
+      next_job = build_latex_mitex_item(job, mitex_prelude)
+    end
+    mitex_request.jobs[#mitex_request.jobs + 1] = next_job
+  end
+
+  return mitex_request
+end
+
+local function build_latex_mitex_formula_service_spec(request, project_scope, config)
+  local mitex_request = build_latex_mitex_request(request, project_scope, config)
+  return build_formula_service_spec(mitex_request, project_scope, {}, nil, config), mitex_request
+end
+
 --- @param bufnr integer
 --- @param item table
 --- @param project_scope table
@@ -1545,6 +1608,11 @@ local function handle_formula_diagnostics(bufnr, meta, resp, job)
   local formula_map = meta.formula_line_maps and meta.formula_line_maps[node_id] or nil
   local line_offset = (meta.formula_line_offsets and meta.formula_line_offsets[node_id]) or 0
   local generated_node_path = meta.generated_node_paths and meta.generated_node_paths[node_id] or nil
+  local generated_context_path = (meta.node_generated_context_paths and meta.node_generated_context_paths[node_id])
+    or meta.generated_context_path
+  local generated_input_path = (meta.node_generated_input_paths and meta.node_generated_input_paths[node_id])
+    or meta.generated_input_path
+  local engine = (meta.node_service_engines and meta.node_service_engines[node_id]) or meta.service_engine
 
   if type(resp.diagnostics) ~= "table" or #resp.diagnostics == 0 then
     rebuild_full_diagnostics_bucket(bufnr)
@@ -1556,8 +1624,7 @@ local function handle_formula_diagnostics(bufnr, meta, resp, job)
     local line = tonumber(diag.line) or 1
     local column = tonumber(diag.column) or 1
     local filename = diag.file
-    local engine = meta and meta.service_engine == "latex" and "latex" or "formula"
-    local prefix = "[service/" .. engine .. "]"
+    local prefix = "[service/" .. (engine == "latex" and "latex" or "formula") .. "]"
 
     if filename == nil or filename == "" then
       if formula_map ~= nil and line > line_offset then
@@ -1571,7 +1638,7 @@ local function handle_formula_diagnostics(bufnr, meta, resp, job)
           prefix = "[service/generated]"
         end
       else
-        filename = meta.generated_context_path or meta.generated_input_path or vim.api.nvim_buf_get_name(bufnr)
+        filename = generated_context_path or generated_input_path or vim.api.nvim_buf_get_name(bufnr)
         prefix = "[service/generated]"
       end
     else
@@ -1612,6 +1679,104 @@ local function handle_formula_diagnostics(bufnr, meta, resp, job)
   bucket.formula_by_node[node_id] = items
   rebuild_full_diagnostics_bucket(bufnr)
   rebuild_quickfix(bufnr)
+end
+
+local function find_formula_node(nodes, node_id)
+  for _, node in ipairs(nodes or {}) do
+    if node.node_id == node_id then
+      return node
+    end
+  end
+  return nil
+end
+
+local function install_latex_fallback_maps(meta, node_id)
+  local spec = meta and meta.latex_fallback_spec or nil
+  if spec == nil or node_id == nil then
+    return
+  end
+  meta.formula_line_maps = meta.formula_line_maps or {}
+  meta.formula_line_offsets = meta.formula_line_offsets or {}
+  meta.generated_node_paths = meta.generated_node_paths or {}
+  meta.generated_slot_paths = meta.generated_slot_paths or {}
+  if spec.formula_line_maps and spec.formula_line_maps[node_id] ~= nil then
+    meta.formula_line_maps[node_id] = spec.formula_line_maps[node_id]
+  end
+  if spec.formula_line_offsets and spec.formula_line_offsets[node_id] ~= nil then
+    meta.formula_line_offsets[node_id] = spec.formula_line_offsets[node_id]
+  end
+  if spec.generated_node_paths and spec.generated_node_paths[node_id] ~= nil then
+    meta.generated_node_paths[node_id] = spec.generated_node_paths[node_id]
+  end
+  for slot_id, path in pairs(spec.generated_slot_paths or {}) do
+    meta.generated_slot_paths[slot_id] = path
+  end
+  meta.node_generated_context_paths = meta.node_generated_context_paths or {}
+  meta.node_generated_input_paths = meta.node_generated_input_paths or {}
+  meta.node_generated_context_paths[node_id] = spec.generated_context_path
+  meta.node_generated_input_paths[node_id] = spec.generated_input_path
+  meta.node_service_engines = meta.node_service_engines or {}
+  meta.node_service_engines[node_id] = "latex"
+end
+
+local function queue_latex_formula_fallback(bufnr, service_kind, meta, resp)
+  if meta == nil or meta.latex_mitex_fallback ~= true or resp == nil or resp.node_id == nil then
+    return false, "fallback unavailable"
+  end
+  meta.latex_fallback_node_state = meta.latex_fallback_node_state or {}
+  if meta.latex_fallback_node_state[resp.node_id] ~= nil then
+    return false, "fallback already attempted"
+  end
+
+  local spec = meta.latex_fallback_spec
+  local node = spec and find_formula_node(spec.nodes, resp.node_id) or nil
+  local job = meta.node_to_job and meta.node_to_job[resp.node_id] or nil
+  if spec == nil or node == nil or job == nil then
+    return false, "fallback node missing"
+  end
+
+  local latex_config = meta.latex_config or {}
+  local ok, msg = pcall(vim.json.encode, {
+    type = "render_formulas",
+    backend = "latex",
+    request_id = meta.request_id,
+    cache_key = spec.cache_key,
+    context_id = spec.context_id,
+    context_rev = spec.context_rev,
+    context_source = spec.context_source,
+    root = meta.effective_root,
+    inputs = vim.empty_dict(),
+    output_dir = spec.output_dir,
+    ppi = meta.render_ppi or state._render_ppi or (require("typst-concealer").config or {}).ppi,
+    worker_count = 1,
+    compiler = latex_config.compiler,
+    converter = latex_config.converter,
+    compiler_args = meta.latex_compiler_args or latex_config.compiler_args or {},
+    nodes = { node },
+  })
+  if not ok then
+    return false, "failed to encode LaTeX fallback request: " .. tostring(msg)
+  end
+
+  install_latex_fallback_maps(meta, resp.node_id)
+  meta.latex_fallback_node_state[resp.node_id] = "queued"
+
+  local service = get_compiler_service(bufnr, service_kind)
+  local sent = send_or_queue_service_payload(bufnr, service, {
+    kind = "formula",
+    request_id = meta.request_id,
+    message = msg,
+    meta = meta,
+    formula_count = 1,
+    formula_jobs = { job },
+  })
+  if not sent or meta.status ~= "active" then
+    meta.latex_fallback_node_state[resp.node_id] = nil
+    return false, "failed to queue LaTeX fallback request"
+  end
+
+  meta.pending_formula_count = (meta.pending_formula_count or 0) + 1
+  return true, nil
 end
 
 local function reconcile_formula_diagnostics_for_request(bufnr)
@@ -1898,9 +2063,19 @@ local function try_handle_formula_service_response(bufnr, service_kind, resp)
     return true
   end
 
-  handle_formula_diagnostics(bufnr, meta, resp, job)
   if resp.status ~= "ok" or type(resp.path) ~= "string" or resp.path == "" then
     cleanup_formula_artifact(resp)
+    if meta.latex_mitex_fallback == true and not (meta.latex_fallback_node_state or {})[resp.node_id] then
+      local queued, reason = queue_latex_formula_fallback(bufnr, service_kind, meta, resp)
+      if queued then
+        complete(bufnr, service_kind, meta, resp.request_id)
+        return true
+      end
+      vim.schedule(function()
+        vim.notify("[typst-concealer] LaTeX MiTeX fallback was not queued: " .. tostring(reason), vim.log.levels.WARN)
+      end)
+    end
+    handle_formula_diagnostics(bufnr, meta, resp, job)
     meta.formula_failed = (meta.formula_failed or 0) + 1
     require("typst-concealer.formula.manager").render_failed(bufnr, {
       request_id = resp.request_id,
@@ -1914,6 +2089,7 @@ local function try_handle_formula_service_response(bufnr, service_kind, resp)
     return true
   end
 
+  handle_formula_diagnostics(bufnr, meta, resp, job)
   local width_px = tonumber(resp.width_px) or 1
   local height_px = tonumber(resp.height_px) or 1
   meta.formula_dispatched = (meta.formula_dispatched or 0) + 1
@@ -1943,6 +2119,36 @@ local function try_handle_formula_service_response(bufnr, service_kind, resp)
   return true
 end
 
+local function queue_latex_preview_fallback(bufnr, service_kind, pmeta)
+  local fallback = pmeta and pmeta.latex_preview_fallback or nil
+  if fallback == nil then
+    return false
+  end
+  pmeta.latex_preview_fallback = nil
+  local service = get_compiler_service(bufnr, service_kind)
+  if service == nil then
+    return false
+  end
+  service.cache_dir = fallback.output_dir
+  state.service_cache_dirs = state.service_cache_dirs or {}
+  state.service_cache_dirs[bufnr] = fallback.output_dir
+  state.active_preview_service_requests = state.active_preview_service_requests or {}
+  state.active_preview_service_requests[bufnr] = pmeta
+  return send_or_queue_service_payload(bufnr, service, {
+    kind = "preview",
+    request_id = pmeta.request_id,
+    message = fallback.message,
+    meta = pmeta,
+    formula_count = fallback.formula_count,
+    on_prepare_failed = function()
+      local active = state.active_preview_service_requests and state.active_preview_service_requests[bufnr]
+      if active ~= nil and active.request_id == pmeta.request_id then
+        state.active_preview_service_requests[bufnr] = nil
+      end
+    end,
+  })
+end
+
 --- Handle a preview compile response from the service.
 --- @param bufnr integer
 --- @param service_kind '"full"'|'"preview"'
@@ -1958,7 +2164,6 @@ local function try_handle_preview_service_response(bufnr, service_kind, resp)
   end
 
   -- Matched a preview request — consume it regardless of status.
-  state.active_preview_service_requests[bufnr] = nil
   state._last_preview_service_bench = {
     request_id = resp.request_id,
     total_pages = #(resp.pages or {}),
@@ -1967,16 +2172,25 @@ local function try_handle_preview_service_response(bufnr, service_kind, resp)
     rendered_pages = resp.rendered_pages,
     request_sent_at = pmeta.sent_at,
     response_at = vim.uv.hrtime(),
+    service_engine = pmeta.latex_preview_fallback ~= nil and "latex-mitex" or nil,
   }
 
   if resp.status ~= "ok" or not resp.pages or #resp.pages == 0 then
     cleanup_request_artifacts(resp)
+    if queue_latex_preview_fallback(bufnr, service_kind, pmeta) then
+      return true
+    end
+    state.active_preview_service_requests[bufnr] = nil
     return true
   end
 
   local page, leading_pages = select_last_service_page(resp)
   if type(page.path) ~= "string" then
     cleanup_request_artifacts(resp)
+    if queue_latex_preview_fallback(bufnr, service_kind, pmeta) then
+      return true
+    end
+    state.active_preview_service_requests[bufnr] = nil
     return true
   end
 
@@ -1984,6 +2198,7 @@ local function try_handle_preview_service_response(bufnr, service_kind, resp)
   local update = build_page_update(bufnr, page.path, item, item.range, nil)
   if update == nil then
     cleanup_request_artifacts(resp)
+    state.active_preview_service_requests[bufnr] = nil
     return true
   end
 
@@ -1993,6 +2208,7 @@ local function try_handle_preview_service_response(bufnr, service_kind, resp)
   if not accepted then
     safe_unlink_service_artifact(page.path)
   end
+  state.active_preview_service_requests[bufnr] = nil
   return true
 end
 
@@ -2502,7 +2718,17 @@ mark_service_payload_failed = function(bufnr, payload, reason)
     end
     fail_full_service_request(bufnr, meta, reason)
   elseif payload.kind == "formula" then
-    fail_formula_batch(bufnr, payload.meta or get_formula_batch_meta(bufnr, payload.request_id), reason)
+    local meta = payload.meta or get_formula_batch_meta(bufnr, payload.request_id)
+    if
+      meta ~= nil
+      and meta.formula_transport_only ~= true
+      and state.active_service_requests
+      and state.active_service_requests[bufnr] == meta
+    then
+      fail_full_service_request(bufnr, meta, reason)
+    else
+      fail_formula_batch(bufnr, meta, reason)
+    end
   elseif payload.kind == "preview" and payload.is_prewarm ~= true then
     local active = state.active_preview_service_requests and state.active_preview_service_requests[bufnr]
     if active ~= nil and active.request_id == payload.request_id then
@@ -2558,7 +2784,8 @@ local function formula_payload_has_current_jobs(bufnr, payload)
   if meta == nil or meta.node_to_job == nil then
     return false
   end
-  for _, job in pairs(meta.node_to_job) do
+  local jobs = payload.formula_jobs or meta.node_to_job
+  for _, job in pairs(jobs) do
     if formula_job_is_current(bufnr, job, payload.request_id or meta.request_id) then
       return true
     end
@@ -2690,7 +2917,7 @@ end
 --- @param bufnr integer
 --- @param service typst_compiler_service
 --- @param payload table
-local function send_or_queue_service_payload(bufnr, service, payload)
+send_or_queue_service_payload = function(bufnr, service, payload)
   if service.inflight ~= nil then
     if payload.is_prewarm == true then
       service.preview_warmed_signatures = service.preview_warmed_signatures or {}
@@ -2957,8 +3184,17 @@ function M.render_formula_batch_via_service(bufnr, request)
   local prelude_chunks = snapshot_full_context_preludes(bufnr)
   local preamble_include_line = resolve_preamble_include_line(bufnr, project_scope.effective_root, "full")
   local is_latex = project_scope.backend_id == "latex"
-  local spec = is_latex and build_latex_formula_service_spec(request, project_scope, config)
-    or build_formula_service_spec(request, project_scope, prelude_chunks, preamble_include_line, config)
+  local latex_fast_path = is_latex and latex_mitex_fast_path_enabled(config)
+  local latex_fallback_spec = nil
+  local spec
+  if latex_fast_path then
+    latex_fallback_spec = build_latex_formula_service_spec(request, project_scope, config)
+    spec = build_latex_mitex_formula_service_spec(request, project_scope, config)
+  elseif is_latex then
+    spec = build_latex_formula_service_spec(request, project_scope, config)
+  else
+    spec = build_formula_service_spec(request, project_scope, prelude_chunks, preamble_include_line, config)
+  end
   local preview_service = nil
   if not is_latex then
     preview_service = M.ensure_compiler_service(bufnr, "preview")
@@ -2983,7 +3219,19 @@ function M.render_formula_batch_via_service(bufnr, request)
   meta.generated_context_path = spec.generated_context_path
   meta.context_id = spec.context_id
   meta.context_rev = spec.context_rev
-  meta.service_engine = is_latex and "latex" or "formula"
+  meta.service_engine = latex_fast_path and "latex-mitex" or (is_latex and "latex" or "formula")
+  meta.render_ppi = state._render_ppi or config.ppi
+  if latex_fast_path then
+    local latex_config = (config.backends and config.backends.latex) or {}
+    meta.latex_mitex_fallback = true
+    meta.latex_fallback_spec = latex_fallback_spec
+    meta.latex_config = {
+      compiler = latex_config.compiler,
+      converter = latex_config.converter,
+      compiler_args = latex_config.compiler_args or {},
+    }
+    meta.latex_compiler_args = project_scope.compiler_args or latex_config.compiler_args or {}
+  end
   meta.pending_formula_count = #(spec.nodes or {})
 
   active_formula_batches(bufnr)[request.request_id] = meta
@@ -3004,12 +3252,13 @@ function M.render_formula_batch_via_service(bufnr, request)
     return
   end
 
-  local inputs = is_latex and vim.empty_dict() or extract_service_inputs(config, project_scope)
+  local inputs = (is_latex and not latex_fast_path) and vim.empty_dict()
+    or extract_service_inputs(config, project_scope)
   local latex_config = (config.backends and config.backends.latex) or {}
   local formula_worker_count = math.max(1, math.floor(tonumber(config.formula_worker_count) or 1))
   local ok, msg = pcall(vim.json.encode, {
     type = "render_formulas",
-    backend = is_latex and "latex" or "typst",
+    backend = (is_latex and not latex_fast_path) and "latex" or "typst",
     request_id = request.request_id,
     cache_key = spec.cache_key,
     context_id = spec.context_id,
@@ -3020,9 +3269,11 @@ function M.render_formula_batch_via_service(bufnr, request)
     output_dir = spec.output_dir,
     ppi = state._render_ppi or config.ppi,
     worker_count = formula_worker_count,
-    compiler = is_latex and latex_config.compiler or nil,
-    converter = is_latex and latex_config.converter or nil,
-    compiler_args = is_latex and (project_scope.compiler_args or latex_config.compiler_args or {}) or nil,
+    compiler = (is_latex and not latex_fast_path) and latex_config.compiler or nil,
+    converter = (is_latex and not latex_fast_path) and latex_config.converter or nil,
+    compiler_args = (is_latex and not latex_fast_path)
+        and (project_scope.compiler_args or latex_config.compiler_args or {})
+      or nil,
     nodes = spec.nodes,
   })
   if not ok then
@@ -3076,19 +3327,23 @@ function M.render_request_via_service(bufnr, request)
   local prelude_chunks = snapshot_full_context_preludes(bufnr)
   local preamble_include_line = resolve_preamble_include_line(bufnr, project_scope.effective_root, "full")
   local is_latex = project_scope.backend_id == "latex"
+  local latex_fast_path = is_latex and latex_mitex_fast_path_enabled(config)
   local use_formula_service = is_latex or config.use_formula_service ~= false
   if use_formula_service then
     reconcile_formula_diagnostics_for_request(bufnr)
   end
-  local spec = use_formula_service
-      and (is_latex and build_latex_formula_service_spec(request, project_scope, config) or build_formula_service_spec(
-        request,
-        project_scope,
-        prelude_chunks,
-        preamble_include_line,
-        config
-      ))
-    or build_full_service_spec(request, project_scope, prelude_chunks, preamble_include_line, config)
+  local latex_fallback_spec = nil
+  local spec
+  if use_formula_service and latex_fast_path then
+    latex_fallback_spec = build_latex_formula_service_spec(request, project_scope, config)
+    spec = build_latex_mitex_formula_service_spec(request, project_scope, config)
+  elseif use_formula_service and is_latex then
+    spec = build_latex_formula_service_spec(request, project_scope, config)
+  elseif use_formula_service then
+    spec = build_formula_service_spec(request, project_scope, prelude_chunks, preamble_include_line, config)
+  else
+    spec = build_full_service_spec(request, project_scope, prelude_chunks, preamble_include_line, config)
+  end
   -- Start the preview backend with the same buffer/project lifetime so the
   -- first cursor preview does not pay process startup while full rendering is
   -- busy. It compiles only preview requests, so it cannot block full updates.
@@ -3114,13 +3369,26 @@ function M.render_request_via_service(bufnr, request)
   current_request.effective_root = project_scope.effective_root
   current_request.generated_input_path = spec.generated_input_path
   current_request.generated_context_path = spec.generated_context_path
-  current_request.service_engine = is_latex and "latex" or (use_formula_service and "formula" or "typst")
+  current_request.service_engine = latex_fast_path and "latex-mitex"
+    or (is_latex and "latex" or (use_formula_service and "formula" or "typst"))
+  current_request.render_ppi = state._render_ppi or config.ppi
   if use_formula_service then
     current_request.pending_formula_count = #(spec.nodes or {})
     current_request.formula_response_count = 0
     current_request.formula_dispatched = 0
     current_request.formula_failed = 0
     current_request.formula_cached = 0
+    if latex_fast_path then
+      local latex_config = (config.backends and config.backends.latex) or {}
+      current_request.latex_mitex_fallback = true
+      current_request.latex_fallback_spec = latex_fallback_spec
+      current_request.latex_config = {
+        compiler = latex_config.compiler,
+        converter = latex_config.converter,
+        compiler_args = latex_config.compiler_args or {},
+      }
+      current_request.latex_compiler_args = project_scope.compiler_args or latex_config.compiler_args or {}
+    end
   end
 
   local old = state.active_service_requests and state.active_service_requests[bufnr]
@@ -3161,11 +3429,12 @@ function M.render_request_via_service(bufnr, request)
 
   local formula_worker_count = math.max(1, math.floor(tonumber(config.formula_worker_count) or 1))
   local latex_config = (config.backends and config.backends.latex) or {}
-  local inputs = is_latex and vim.empty_dict() or extract_service_inputs(config, project_scope)
+  local inputs = (is_latex and not latex_fast_path) and vim.empty_dict()
+    or extract_service_inputs(config, project_scope)
   local message = use_formula_service
       and {
         type = "render_formulas",
-        backend = is_latex and "latex" or "typst",
+        backend = (is_latex and not latex_fast_path) and "latex" or "typst",
         request_id = request.request_id,
         cache_key = spec.cache_key,
         context_id = spec.context_id,
@@ -3176,9 +3445,11 @@ function M.render_request_via_service(bufnr, request)
         output_dir = spec.output_dir,
         ppi = state._render_ppi or config.ppi,
         worker_count = formula_worker_count,
-        compiler = is_latex and latex_config.compiler or nil,
-        converter = is_latex and latex_config.converter or nil,
-        compiler_args = is_latex and (project_scope.compiler_args or latex_config.compiler_args or {}) or nil,
+        compiler = (is_latex and not latex_fast_path) and latex_config.compiler or nil,
+        converter = (is_latex and not latex_fast_path) and latex_config.converter or nil,
+        compiler_args = (is_latex and not latex_fast_path)
+            and (project_scope.compiler_args or latex_config.compiler_args or {})
+          or nil,
         nodes = spec.nodes,
       }
     or {
@@ -3243,57 +3514,119 @@ function M.render_preview_tail_via_service(bufnr, item)
   if project_scope.backend_id == "latex" then
     local main = require("typst-concealer")
     local config = main.config
-    local spec = build_latex_preview_service_spec(bufnr, item, project_scope, config)
     local request_id = item.preview_request_id
     if request_id == nil then
       return
     end
 
-    state.active_preview_service_requests = state.active_preview_service_requests or {}
+    local latex_config = (config.backends and config.backends.latex) or {}
     local preview_meta = {
       request_id = request_id,
       item = item,
       queued_at = vim.uv.hrtime(),
     }
-    state.active_preview_service_requests[bufnr] = preview_meta
+    local cache_dir = nil
+    local formula_count = nil
+    local prepare = nil
+    local ok, msg
 
-    service.cache_dir = spec.output_dir
-    state.service_cache_dirs = state.service_cache_dirs or {}
-    state.service_cache_dirs[bufnr] = spec.output_dir
+    if latex_mitex_fast_path_enabled(config) then
+      local fast_item = build_latex_mitex_item(item, latex_mitex_prelude(project_scope, config))
+      local spec = build_preview_service_spec(bufnr, service, fast_item, project_scope, {}, nil)
+      if spec == nil then
+        return
+      end
 
-    local latex_config = (config.backends and config.backends.latex) or {}
-    local ok, msg = pcall(vim.json.encode, {
-      type = "render_formulas",
-      backend = "latex",
-      request_id = request_id,
-      cache_key = spec.cache_key,
-      context_id = spec.context_id,
-      context_rev = spec.context_rev,
-      context_source = spec.context_source,
-      root = project_scope.effective_root,
-      inputs = vim.empty_dict(),
-      output_dir = spec.output_dir,
-      ppi = state._render_ppi or config.ppi,
-      worker_count = 1,
-      compiler = latex_config.compiler,
-      converter = latex_config.converter,
-      compiler_args = project_scope.compiler_args or latex_config.compiler_args or {},
-      nodes = spec.nodes,
-    })
+      local fallback_spec = build_latex_preview_service_spec(bufnr, item, project_scope, config)
+      local fallback_ok, fallback_msg = pcall(vim.json.encode, {
+        type = "render_formulas",
+        backend = "latex",
+        request_id = request_id,
+        cache_key = fallback_spec.cache_key,
+        context_id = fallback_spec.context_id,
+        context_rev = fallback_spec.context_rev,
+        context_source = fallback_spec.context_source,
+        root = project_scope.effective_root,
+        inputs = vim.empty_dict(),
+        output_dir = fallback_spec.output_dir,
+        ppi = state._render_ppi or config.ppi,
+        worker_count = 1,
+        compiler = latex_config.compiler,
+        converter = latex_config.converter,
+        compiler_args = project_scope.compiler_args or latex_config.compiler_args or {},
+        nodes = fallback_spec.nodes,
+      })
+      if not fallback_ok then
+        vim.schedule(function()
+          vim.notify(
+            "[typst-concealer] failed to encode LaTeX preview fallback request: " .. tostring(fallback_msg),
+            vim.log.levels.ERROR
+          )
+        end)
+        return
+      end
+      preview_meta.latex_preview_fallback = {
+        message = fallback_msg,
+        output_dir = fallback_spec.output_dir,
+        formula_count = #(fallback_spec.nodes or {}),
+      }
+
+      ok, msg = pcall(vim.json.encode, {
+        type = "compile",
+        request_id = request_id,
+        cache_key = spec.cache_key,
+        source_text = spec.source_text,
+        root = project_scope.effective_root,
+        inputs = extract_service_inputs(config, project_scope),
+        output_dir = spec.cache_dir,
+        ppi = state._render_ppi or config.ppi,
+      })
+      cache_dir = spec.cache_dir
+      prepare = make_preview_sidecar_prepare(service, spec.sidecar_path, spec.sidecar_text)
+    else
+      local spec = build_latex_preview_service_spec(bufnr, item, project_scope, config)
+      ok, msg = pcall(vim.json.encode, {
+        type = "render_formulas",
+        backend = "latex",
+        request_id = request_id,
+        cache_key = spec.cache_key,
+        context_id = spec.context_id,
+        context_rev = spec.context_rev,
+        context_source = spec.context_source,
+        root = project_scope.effective_root,
+        inputs = vim.empty_dict(),
+        output_dir = spec.output_dir,
+        ppi = state._render_ppi or config.ppi,
+        worker_count = 1,
+        compiler = latex_config.compiler,
+        converter = latex_config.converter,
+        compiler_args = project_scope.compiler_args or latex_config.compiler_args or {},
+        nodes = spec.nodes,
+      })
+      cache_dir = spec.output_dir
+      formula_count = #(spec.nodes or {})
+    end
     if not ok then
-      state.active_preview_service_requests[bufnr] = nil
       vim.schedule(function()
         vim.notify("[typst-concealer] failed to encode LaTeX preview request: " .. tostring(msg), vim.log.levels.ERROR)
       end)
       return
     end
 
+    state.active_preview_service_requests = state.active_preview_service_requests or {}
+    state.active_preview_service_requests[bufnr] = preview_meta
+
+    service.cache_dir = cache_dir
+    state.service_cache_dirs = state.service_cache_dirs or {}
+    state.service_cache_dirs[bufnr] = cache_dir
+
     local sent = send_or_queue_service_payload(bufnr, service, {
       kind = "preview",
       request_id = request_id,
       message = msg,
       meta = preview_meta,
-      formula_count = #(spec.nodes or {}),
+      formula_count = formula_count,
+      prepare = prepare,
       on_prepare_failed = function()
         local active = state.active_preview_service_requests and state.active_preview_service_requests[bufnr]
         if active ~= nil and active.request_id == request_id then

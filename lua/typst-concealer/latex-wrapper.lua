@@ -22,6 +22,14 @@ local function ensure_trailing_newline(text)
   return text .. "\n"
 end
 
+local function typst_string_literal(value)
+  value = value or ""
+  value = value:gsub("\\", "\\\\")
+  value = value:gsub('"', '\\"')
+  value = value:gsub("\n", "\\n")
+  return '"' .. value .. '"'
+end
+
 local function normal_hex_color()
   local ok, hl = pcall(vim.api.nvim_get_hl, 0, { name = "Normal" })
   if not ok or type(hl) ~= "table" or hl.fg == nil then
@@ -68,6 +76,77 @@ local function default_packages(config)
   return table.concat(parts)
 end
 
+local macro_commands = {
+  "\\newcommand",
+  "\\renewcommand",
+  "\\providecommand",
+  "\\DeclareRobustCommand",
+  "\\DeclareMathOperator",
+  "\\DeclarePairedDelimiter",
+}
+
+local function balanced_macro_end(text, start_idx)
+  local depth = 0
+  local idx = start_idx
+  local saw_arg = false
+  while idx <= #text do
+    local ch = text:sub(idx, idx)
+    if ch == "\\" then
+      idx = idx + 2
+    elseif ch == "{" or ch == "[" then
+      depth = depth + 1
+      saw_arg = true
+      idx = idx + 1
+    elseif ch == "}" or ch == "]" then
+      depth = math.max(0, depth - 1)
+      idx = idx + 1
+    elseif ch == "\n" and depth == 0 and saw_arg then
+      return idx
+    else
+      idx = idx + 1
+    end
+  end
+  return #text + 1
+end
+
+local function find_next_macro(text, start_idx)
+  local best_start = nil
+  local best_command = nil
+  for _, command in ipairs(macro_commands) do
+    local found = text:find(command, start_idx, true)
+    if found ~= nil and (best_start == nil or found < best_start) then
+      best_start = found
+      best_command = command
+    end
+  end
+  return best_start, best_command
+end
+
+local function extract_mitex_macros(text)
+  text = text or ""
+  local out = {}
+  local idx = 1
+  while idx <= #text do
+    local start_idx, command = find_next_macro(text, idx)
+    if start_idx == nil then
+      break
+    end
+    local after = start_idx + #command
+    local next_ch = text:sub(after, after)
+    if next_ch ~= "" and next_ch:match("[%a@]") then
+      idx = after
+    else
+      local end_idx = balanced_macro_end(text, start_idx)
+      local chunk = text:sub(start_idx, end_idx - 1):gsub("%s+$", "")
+      if chunk ~= "" then
+        out[#out + 1] = chunk
+      end
+      idx = math.max(end_idx, after)
+    end
+  end
+  return out
+end
+
 --- @param project_scope table
 --- @param config table
 --- @return string
@@ -84,6 +163,28 @@ function M.build_context_document(project_scope, config)
     parts[#parts + 1] = ensure_trailing_newline(config.header)
   end
   return table.concat(parts)
+end
+
+--- Build the LaTeX macro prelude that is safe to pass through MiTeX.
+--- Package loading and document setup stay in the full LaTeX context.
+--- @param project_scope table
+--- @param config table
+--- @return string
+function M.build_mitex_prelude(project_scope, config)
+  config = config or {}
+  local chunks = {}
+  for _, source in ipairs({
+    project_scope and project_scope.preamble_source or "",
+    config.header or "",
+  }) do
+    for _, macro in ipairs(extract_mitex_macros(source)) do
+      chunks[#chunks + 1] = macro
+    end
+  end
+  if #chunks == 0 then
+    return ""
+  end
+  return table.concat(chunks, "\n") .. "\n"
 end
 
 --- @param source string
@@ -113,6 +214,44 @@ function M.unwrap_math(source, backend_node_type)
     return "\\[" .. source .. "\\]"
   end
   return source
+end
+
+--- @param source string
+--- @param backend_node_type string
+--- @return string
+function M.mitex_math_content(source, backend_node_type)
+  source = source or ""
+  if backend_node_type == "math_environment" then
+    return source
+  end
+  if backend_node_type == "displayed_equation" then
+    if source:sub(1, 2) == "$$" and source:sub(-2) == "$$" then
+      return source:sub(3, -3)
+    end
+    if source:sub(1, 2) == "\\[" and source:sub(-2) == "\\]" then
+      return source:sub(3, -3)
+    end
+    return source
+  end
+  if source:sub(1, 2) == "\\(" and source:sub(-2) == "\\)" then
+    return source:sub(3, -3)
+  end
+  if source:sub(1, 1) == "$" and source:sub(-1) == "$" and source:sub(1, 2) ~= "$$" then
+    return source:sub(2, -2)
+  end
+  return source
+end
+
+--- @param source string
+--- @param backend_node_type string
+--- @param prelude string
+--- @return string
+function M.build_mitex_render_text(source, backend_node_type, prelude)
+  local content = (prelude or "") .. M.mitex_math_content(source, backend_node_type)
+  if backend_node_type == "inline_formula" then
+    return "#mi(" .. typst_string_literal(content) .. ")"
+  end
+  return "#mitex(" .. typst_string_literal(content) .. ")"
 end
 
 --- @param job table

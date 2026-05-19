@@ -539,6 +539,34 @@ local function test_latex_wrapper_applies_configured_color_to_math_modes()
   )
 end
 
+local function test_latex_wrapper_builds_mitex_macro_prelude()
+  reset_modules()
+  local wrapper = require("typst-concealer.latex-wrapper")
+  local prelude = wrapper.build_mitex_prelude({
+    preamble_source = table.concat({
+      "\\documentclass{article}",
+      "\\usepackage{amsmath}",
+      "\\newcommand{\\RR}{\\mathbb{R}}",
+      "\\DeclareMathOperator{\\rank}{rank}",
+    }, "\n"),
+  }, {
+    header = "\\usepackage{bm}\n\\renewcommand{\\vec}[1]{\\boldsymbol{#1}}\n",
+  })
+
+  assert_truthy(prelude:find("\\newcommand{\\RR}", 1, true) ~= nil, "MiTeX prelude should keep newcommand macros")
+  assert_truthy(
+    prelude:find("\\DeclareMathOperator{\\rank}", 1, true) ~= nil,
+    "MiTeX prelude should keep math operator macros"
+  )
+  assert_truthy(prelude:find("\\renewcommand{\\vec}", 1, true) ~= nil, "MiTeX prelude should include header macros")
+  assert_truthy(prelude:find("\\usepackage", 1, true) == nil, "MiTeX prelude should not include packages")
+
+  local render_text = wrapper.build_mitex_render_text("$x \\in \\RR$", "inline_formula", prelude)
+  assert_truthy(render_text:find("#mi(", 1, true) == 1, "inline formulas should use MiTeX mi")
+  assert_truthy(render_text:find("\\\\newcommand{\\\\RR}", 1, true) ~= nil, "render text should embed macro prelude")
+  assert_truthy(render_text:find("\\\\usepackage", 1, true) == nil, "render text should not embed usepackage")
+end
+
 local function test_latex_scope_uses_empty_preamble_without_document_boundary()
   local root =
     vim.fs.normalize(vim.fn.fnamemodify(vim.fn.tempname() .. "-latex-body-only-preamble", ":p")):gsub("/$", "")
@@ -1638,14 +1666,15 @@ end
 local function test_latex_service_request_writes_backend_json()
   local root = make_temp_tree("latex-service-request")
   local main_path = vim.fs.joinpath(root, "main.tex")
-  write_file(main_path, "\\begin{document}\n$x$\n\\end{document}\n")
+  write_file(main_path, "\\newcommand{\\RR}{\\mathbb{R}}\n\\begin{document}\n$x \\in \\RR$\n\\end{document}\n")
 
   local bufnr = vim.api.nvim_create_buf(true, false)
   vim.api.nvim_buf_set_name(bufnr, main_path)
   vim.bo[bufnr].filetype = "tex"
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
+    "\\newcommand{\\RR}{\\mathbb{R}}",
     "\\begin{document}",
-    "$x$",
+    "$x \\in \\RR$",
     "\\end{document}",
   })
   local state = fresh_state()
@@ -1667,7 +1696,7 @@ local function test_latex_service_request_writes_backend_json()
             compiler = "pdflatex",
             converter = "pdftocairo",
             compiler_args = { "-shell-escape" },
-            header = "\\usepackage{bm}",
+            header = "\\usepackage{bm}\n\\newcommand{\\vect}[1]{\\bm{#1}}",
             get_root = function()
               return root
             end,
@@ -1704,11 +1733,11 @@ local function test_latex_service_request_writes_backend_json()
           buffer_version = 1,
           layout_version = 1,
           item_idx = 1,
-          range = { 1, 0, 1, 3 },
-          display_range = { 1, 0, 1, 3 },
-          source_text = "$x$",
-          source_str = "$x$",
-          str = "$x$",
+          range = { 2, 0, 2, 11 },
+          display_range = { 2, 0, 2, 11 },
+          source_text = "$x \\in \\RR$",
+          source_str = "$x \\in \\RR$",
+          str = "$x \\in \\RR$",
           source_text_hash = "hash:x",
           backend_node_type = "inline_formula",
           prelude_count = 0,
@@ -1730,17 +1759,223 @@ local function test_latex_service_request_writes_backend_json()
     assert_eq(#stdin.writes, 1, "latex service request should be written to stdin")
     local msg = vim.json.decode(vim.trim(stdin.writes[1]))
     assert_eq(msg.type, "render_formulas", "latex should still use formula batch transport")
-    assert_eq(msg.backend, "latex", "latex service message should carry backend id")
-    assert_eq(msg.compiler, "pdflatex", "latex service message should carry compiler")
-    assert_eq(msg.converter, "pdftocairo", "latex service message should carry converter")
-    assert_eq(msg.compiler_args[1], "-shell-escape", "latex service message should carry compiler args")
+    assert_eq(msg.backend, "typst", "latex should first try the Typst/MiTeX formula path")
+    assert_eq(msg.compiler, nil, "MiTeX request should not carry a LaTeX compiler")
+    assert_eq(msg.converter, nil, "MiTeX request should not carry a LaTeX converter")
+    assert_eq(msg.compiler_args, nil, "MiTeX request should not carry LaTeX compiler args")
     assert_eq(msg.root, root, "latex service message should carry effective root")
-    assert_truthy(msg.context_source:find("\\usepackage{bm}", 1, true) ~= nil, "latex context should include header")
-    assert_truthy(msg.context_source:find("$x$", 1, true) == nil, "latex context should not inline formula source")
+    assert_truthy(msg.context_source:find("\\usepackage{bm}", 1, true) == nil, "MiTeX context should be Typst source")
+    assert_truthy(msg.context_source:find("$x", 1, true) == nil, "MiTeX context should not inline formula source")
     assert_eq(#msg.nodes, 1, "latex request should include one formula node")
-    assert_eq(msg.nodes[1].source, "$x$", "latex node source should stay raw LaTeX")
-    assert_eq(msg.nodes[1].kind, "inline_formula", "latex node kind should preserve backend node type")
-    assert_eq(state.active_service_requests[bufnr].service_engine, "latex", "latex request meta should record engine")
+    assert_truthy(msg.nodes[1].source:find("#mi(", 1, true) ~= nil, "fast node source should render through MiTeX")
+    assert_truthy(
+      msg.nodes[1].source:find("\\\\newcommand{\\\\RR}", 1, true) ~= nil,
+      "fast node source should include project macros"
+    )
+    assert_truthy(
+      msg.nodes[1].source:find("\\\\newcommand{\\\\vect}", 1, true) ~= nil,
+      "fast node source should include configured header macros"
+    )
+    assert_truthy(
+      msg.nodes[1].source:find("\\\\usepackage", 1, true) == nil,
+      "fast node source should omit package imports"
+    )
+    assert_eq(msg.nodes[1].kind, "math", "MiTeX node kind should use the Typst formula shape")
+    assert_eq(
+      state.active_service_requests[bufnr].service_engine,
+      "latex-mitex",
+      "latex request meta should record the fast engine"
+    )
+    assert_truthy(
+      state.active_service_requests[bufnr].latex_fallback_spec.context_source:find("\\usepackage{bm}", 1, true) ~= nil,
+      "fallback context should keep the full LaTeX header"
+    )
+    assert_eq(
+      state.active_service_requests[bufnr].latex_fallback_spec.nodes[1].source,
+      "$x \\in \\RR$",
+      "fallback node source should stay raw LaTeX"
+    )
+  end)
+
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end
+
+local function test_latex_mitex_failure_queues_latex_fallback()
+  local root = make_temp_tree("latex-mitex-fallback")
+  local main_path = vim.fs.joinpath(root, "main.tex")
+  write_file(main_path, "\\newcommand{\\RR}{\\mathbb{R}}\n\\begin{document}\n$x \\in \\RR$\n\\end{document}\n")
+
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(bufnr, main_path)
+  vim.bo[bufnr].filetype = "tex"
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
+    "\\newcommand{\\RR}{\\mathbb{R}}",
+    "\\begin{document}",
+    "$x \\in \\RR$",
+    "\\end{document}",
+  })
+  local state = fresh_state()
+  state.buffer_render_state[bufnr] = { runtime_preludes = {} }
+  local tick = vim.api.nvim_buf_get_changedtick(bufnr)
+
+  with_stubbed_uv(function(spawned)
+    package.loaded["typst-concealer"] = {
+      config = {
+        use_formula_service = false,
+        formula_worker_count = 2,
+        service_binary = "typst-concealer-service-test",
+        ppi = 300,
+        compiler_args = {},
+        do_diagnostics = false,
+        header = "",
+        math_baseline_pt = 11,
+        backends = {
+          latex = {
+            enabled = true,
+            compiler = "pdflatex",
+            converter = "pdftocairo",
+            compiler_args = { "-shell-escape" },
+            header = "",
+            get_root = function()
+              return root
+            end,
+          },
+        },
+      },
+      _styling_prelude = "",
+      source_kind_for_bufnr = function()
+        return "latex"
+      end,
+    }
+
+    local request = {
+      request_id = "request:latex:fallback",
+      bufnr = bufnr,
+      project_scope_id = "project:latex",
+      render_epoch = 1,
+      buffer_version = tick,
+      layout_version = 1,
+      jobs = {
+        {
+          request_page_index = 1,
+          overlay_id = "overlay:latex:fallback",
+          slot_id = "slot:latex:fallback",
+          node_id = "node:latex:fallback",
+          bufnr = bufnr,
+          project_scope_id = "project:latex",
+          render_epoch = 1,
+          node_rev = 1,
+          context_id = "project:latex",
+          context_rev = 1,
+          buffer_version = tick,
+          layout_version = 1,
+          item_idx = 1,
+          range = { 2, 0, 2, 11 },
+          display_range = { 2, 0, 2, 11 },
+          source_text = "$x \\in \\RR$",
+          source_str = "$x \\in \\RR$",
+          str = "$x \\in \\RR$",
+          source_text_hash = "hash:latex",
+          backend_node_type = "inline_formula",
+          prelude_count = 0,
+          semantics = {
+            backend_id = "latex",
+            backend_node_type = "inline_formula",
+            display_kind = "inline",
+            constraint_kind = "intrinsic",
+            source_kind = "latex",
+          },
+          image_id = 101,
+        },
+      },
+    }
+
+    state.machine_state.buffers[bufnr] = {
+      bufnr = bufnr,
+      project_scope_id = "project:latex",
+      buffer_version = tick,
+      layout_version = 1,
+      render_epoch = 1,
+      context_id = "project:latex",
+      context_rev = 1,
+      active_request_id = request.request_id,
+      nodes = {
+        ["node:latex:fallback"] = {
+          node_id = "node:latex:fallback",
+          slot_id = "slot:latex:fallback",
+          bufnr = bufnr,
+          project_scope_id = "project:latex",
+          item_idx = 1,
+          node_type = "math",
+          backend_node_type = "inline_formula",
+          source_range = { 2, 0, 2, 11 },
+          display_range = { 2, 0, 2, 11 },
+          source_text = "$x \\in \\RR$",
+          source_str = "$x \\in \\RR$",
+          source_text_hash = "hash:latex",
+          node_rev = 1,
+          context_hash = "ctx:latex",
+          prelude_count = 0,
+          semantics = request.jobs[1].semantics,
+          status = "pending",
+          candidate_overlay_id = "overlay:latex:fallback",
+        },
+      },
+      node_order = { "node:latex:fallback" },
+    }
+    state.machine_state.overlays["overlay:latex:fallback"] = {
+      overlay_id = "overlay:latex:fallback",
+      slot_id = "slot:latex:fallback",
+      owner_node_id = "node:latex:fallback",
+      owner_bufnr = bufnr,
+      owner_project_scope_id = "project:latex",
+      request_id = request.request_id,
+      page_index = 1,
+      render_epoch = 1,
+      node_rev = 1,
+      context_id = "project:latex",
+      context_rev = 1,
+      source_text_hash = "hash:latex",
+      buffer_version = tick,
+      layout_version = 1,
+      status = "rendering",
+    }
+
+    local session_mod = require("typst-concealer.session")
+    session_mod.render_request_via_service(bufnr, request)
+    local stdin = spawned[1].stdio[1]
+    local stdout = spawned[1].stdio[2]
+    local fast_msg = vim.json.decode(vim.trim(stdin.writes[1]))
+    assert_eq(fast_msg.backend, "typst", "initial LaTeX render should use MiTeX")
+
+    stdout:feed(vim.json.encode({
+      type = "formula_rendered",
+      request_id = request.request_id,
+      context_id = fast_msg.context_id,
+      context_rev = fast_msg.context_rev,
+      node_id = fast_msg.nodes[1].node_id,
+      node_rev = fast_msg.nodes[1].node_rev,
+      status = "error",
+      diagnostics = {
+        { message = "MiTeX unsupported macro", severity = "error", line = 1, column = 1 },
+      },
+    }) .. "\n")
+
+    vim.wait(100, function()
+      return #stdin.writes >= 2
+    end)
+    assert_eq(#stdin.writes, 2, "MiTeX failure should queue one fallback request")
+    local fallback_msg = vim.json.decode(vim.trim(stdin.writes[2]))
+    assert_eq(fallback_msg.backend, "latex", "fallback request should use the existing LaTeX backend")
+    assert_eq(fallback_msg.compiler, "pdflatex", "fallback request should carry the LaTeX compiler")
+    assert_eq(fallback_msg.converter, "pdftocairo", "fallback request should carry the converter")
+    assert_eq(fallback_msg.compiler_args[1], "-shell-escape", "fallback request should preserve compiler args")
+    assert_eq(fallback_msg.nodes[1].source, "$x \\in \\RR$", "fallback should render the raw LaTeX source")
+    assert_truthy(
+      state.active_service_requests[bufnr] ~= nil,
+      "full request should stay active while fallback is pending"
+    )
+    session_mod.stop_compiler_service(bufnr)
   end)
 
   vim.api.nvim_buf_delete(bufnr, { force = true })
@@ -1829,23 +2064,31 @@ local function test_latex_preview_uses_preview_service_and_accepts_formula_respo
     local stdout = spawned[1].stdio[2]
     assert_eq(#stdin.writes, 1, "latex preview request should be written")
     local msg = vim.json.decode(vim.trim(stdin.writes[1]))
-    assert_eq(msg.type, "render_formulas", "latex preview should use formula transport")
-    assert_eq(msg.backend, "latex", "latex preview request should carry backend id")
+    assert_eq(msg.type, "compile", "latex preview should first use the Typst/MiTeX preview path")
     assert_eq(msg.request_id, "preview:latex:1", "latex preview request should carry preview id")
-    assert_eq(msg.nodes[1].source, "$x$", "latex preview node should use raw source")
+    assert_truthy(msg.source_text:find("$x$", 1, true) == nil, "latex preview main source should not inline raw source")
+    local include_path = msg.source_text:match('#include%s+"([^"]+)"')
+    assert_truthy(include_path ~= nil, "latex MiTeX preview should include a sidecar")
+    local sidecar_path = include_path:sub(1, 1) == "/" and (root .. include_path) or vim.fs.joinpath(root, include_path)
+    local sidecar_text = table.concat(vim.fn.readfile(sidecar_path), "\n")
+    assert_truthy(sidecar_text:find("#mi(", 1, true) ~= nil, "latex preview sidecar should render through MiTeX")
 
     stdout:feed(vim.json.encode({
-      type = "formula_rendered",
+      type = "compile_result",
       request_id = "preview:latex:1",
-      context_id = msg.context_id,
-      context_rev = msg.context_rev,
-      node_id = msg.nodes[1].node_id,
-      node_rev = msg.nodes[1].node_rev,
       status = "ok",
-      path = vim.fs.joinpath(root, "preview.png"),
-      width_px = 24,
-      height_px = 12,
+      pages = {
+        {
+          page_index = 0,
+          path = vim.fs.joinpath(root, "preview.png"),
+          width_px = 24,
+          height_px = 12,
+        },
+      },
       diagnostics = {},
+      compile_us = 1,
+      render_us = 1,
+      rendered_pages = 1,
     }) .. "\n")
 
     vim.wait(10, function()
@@ -8372,6 +8615,7 @@ local tests = {
   { test_custom_markdown_filetypes_are_supported, "ok custom markdown filetypes are supported" },
   { test_latex_buffers_require_enabled_backend, "ok latex buffers require enabled backend" },
   { test_latex_wrapper_applies_configured_color_to_math_modes, "ok latex wrapper applies color to math modes" },
+  { test_latex_wrapper_builds_mitex_macro_prelude, "ok latex wrapper builds MiTeX macro prelude" },
   {
     test_latex_scope_uses_empty_preamble_without_document_boundary,
     "ok latex body-only files use empty preamble",
@@ -8396,6 +8640,7 @@ local tests = {
   { test_session_render_request_tracks_active_service_request, "ok session tracks machine render requests" },
   { test_session_render_request_via_service_writes_json, "ok session writes compiler service requests" },
   { test_latex_service_request_writes_backend_json, "ok session writes latex backend requests" },
+  { test_latex_mitex_failure_queues_latex_fallback, "ok latex MiTeX failures queue LaTeX fallback" },
   {
     test_latex_preview_uses_preview_service_and_accepts_formula_response,
     "ok latex preview uses preview service",

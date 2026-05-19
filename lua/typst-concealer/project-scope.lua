@@ -137,6 +137,7 @@ local function resolve_latex_scope(bufnr, kind, main, config)
     latex_config.compiler or "",
     latex_config.converter or "",
     latex_config.header or "",
+    tostring(latex_config.mitex_fast_path ~= false),
     main._styling_prelude or "",
     tostring(state._cell_px_w or ""),
     tostring(state._cell_px_h or ""),

@@ -150,6 +150,7 @@ end
 --- @field converter?             string    PDF-to-PNG converter executable. Default "pdftocairo".
 --- @field compiler_args?         string[]  Extra compiler arguments.
 --- @field header?                string    Custom LaTeX preamble inserted before project preamble.
+--- @field mitex_fast_path?       boolean   Try Typst/MiTeX rendering before falling back to full LaTeX. Default true.
 --- @field viewport_margin?       integer   Extra screen rows around visible windows rendered by LaTeX. Default 0.
 --- @field get_root?              fun(bufnr: integer, path: string, cwd: string, kind: "full"): string|nil
 --- @field get_main_file?         fun(bufnr: integer, path: string, cwd: string, kind: "full"): string|nil
@@ -479,6 +480,7 @@ function M.setup(cfg)
         converter = default(latex_cfg.converter, "pdftocairo"),
         compiler_args = default(latex_cfg.compiler_args, {}),
         header = default(latex_cfg.header, ""),
+        mitex_fast_path = default(latex_cfg.mitex_fast_path, true),
         viewport_margin = default(latex_cfg.viewport_margin, 0),
         get_root = latex_cfg.get_root,
         get_main_file = latex_cfg.get_main_file,
@@ -510,6 +512,9 @@ function M.setup(cfg)
   end
   if type(latex_backend_cfg.viewport_margin) ~= "number" or latex_backend_cfg.viewport_margin < 0 then
     error("backends.latex.viewport_margin must be a non-negative number")
+  end
+  if type(latex_backend_cfg.mitex_fast_path) ~= "boolean" then
+    error("backends.latex.mitex_fast_path must be a boolean")
   end
   for _, key in ipairs({ "get_root", "get_main_file", "get_preamble_file" }) do
     if latex_backend_cfg[key] ~= nil and type(latex_backend_cfg[key]) ~= "function" then
